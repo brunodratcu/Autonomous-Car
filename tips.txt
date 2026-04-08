@@ -1,0 +1,8 @@
+# 1. Instalar
+pip install opencv-python numpy pyserial
+
+# 2. Calibrar as cores da pista no seu ambiente
+python carro-autonomo.py --calibrar
+
+# 3. Confirmar câmera e Arduino funcionando
+python carro-autonomo.py
