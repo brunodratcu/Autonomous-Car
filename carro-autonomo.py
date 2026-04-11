@@ -80,6 +80,13 @@ IA_CONF_MIN = 0.82
 ROTA_PONTOS = ["STRAIGHT", "LEFT", "DELIVERY", "RIGHT", "STOP"]
 # Exemplo: vai reto, vira esquerda, entrega, vira direita, para na base
 
+# ── ROIs como fração da altura do frame ─────────────────────────
+# Pista  : trapézio na metade inferior (definido em processar_pista)
+# Placa  : faixa horizontal onde placas aparecem fisicamente
+#          15% = abaixo do céu  |  55% = acima da pista
+ROI_PLACA_Y0 = 0.15
+ROI_PLACA_Y1 = 0.55
+
 # ── Kernels morfológicos pré-alocados ────────────────────────────
 _K3 = np.ones((3, 3), np.uint8)
 _K5 = np.ones((5, 5), np.uint8)
@@ -396,6 +403,54 @@ def processar_pista(frame):
 
 
 # ================================================================
+#  [8b] ROI + TRATAMENTO VISUAL DE PLACAS
+#  Espelho da lógica de pista, mas na faixa ROI_PLACA_Y0–Y1.
+#  Retorna imagem tratada BGR para o concat do console.
+# ================================================================
+
+def processar_placa_roi(frame, gray):
+    """
+    Aplica o mesmo pipeline de tratamento da pista na faixa de placas.
+    ROI: ROI_PLACA_Y0 (15%) a ROI_PLACA_Y1 (55%) da altura do frame.
+
+    Passos: Blur → Otsu → Morfologia → Canny → desenha contornos candidatos
+    Retorna: vis_bgr (mesma dimensão do frame, fundo preto fora da ROI)
+    """
+    h, w = frame.shape[:2]
+    y0 = int(h * ROI_PLACA_Y0)
+    y1 = int(h * ROI_PLACA_Y1)
+
+    roi_gray = gray[y0:y1, :]
+    blur     = cv2.GaussianBlur(roi_gray, (5, 5), 0)
+    _, bin_  = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    bin_     = cv2.morphologyEx(bin_, cv2.MORPH_OPEN,  _K3)
+    bin_     = cv2.morphologyEx(bin_, cv2.MORPH_CLOSE, _K3)
+    bordas   = cv2.Canny(bin_, 50, 150)
+
+    # Monta frame completo: preto fora da ROI, bordas dentro
+    canvas = np.zeros((h, w), dtype=np.uint8)
+    canvas[y0:y1, :] = bordas
+    vis = cv2.cvtColor(canvas, cv2.COLOR_GRAY2BGR)
+
+    # Linhas-guia da ROI
+    cv2.line(vis, (0, y0), (w, y0), (0, 140, 255), 1)
+    cv2.line(vis, (0, y1), (w, y1), (0, 140, 255), 1)
+    cv2.putText(vis, f"ROI placa {int(ROI_PLACA_Y0*100)}-{int(ROI_PLACA_Y1*100)}%",
+                (4, y0 + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 140, 255), 1)
+
+    # Retângulos dos contornos candidatos (proporção de placa)
+    cnts, _ = cv2.findContours(bin_, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in cnts:
+        if cv2.contourArea(cnt) < 200:
+            continue
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        if 0.5 < bw / max(bh, 1) < 1.8:
+            cv2.rectangle(vis, (x, y + y0), (x + bw, y + y0 + bh), (0, 220, 180), 1)
+
+    return vis
+
+
+# ================================================================
 #  [9] DETECÇÃO DE MARCADOR NO CHÃO
 #  Faixa escura horizontal transversal → dispara manobra pendente
 # ================================================================
@@ -443,11 +498,14 @@ def detectar_marcador_chao(frame):
 
 def _localizar_candidatas(frame):
     """
-    Segmenta regiões de cor placa (vermelho/azul) na metade superior.
-    Retorna lista de (x, y, w, h) já no frame original.
+    Segmenta regiões de cor placa (vermelho/azul) na ROI de placas.
+    Usa ROI_PLACA_Y0–Y1: mesma faixa do processar_placa_roi.
+    Retorna lista de (x, y, w, h) em coordenadas do frame completo.
     """
     h, w = frame.shape[:2]
-    roi  = frame[:h // 2, :]
+    y0   = int(h * ROI_PLACA_Y0)
+    y1   = int(h * ROI_PLACA_Y1)
+    roi  = frame[y0:y1, :]
     hsv  = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     hsv  = cv2.GaussianBlur(hsv, (5, 5), 0)
 
@@ -468,7 +526,8 @@ def _localizar_candidatas(frame):
             continue
         x, y, ww, hh = cv2.boundingRect(cnt)
         if 0.6 < ww / max(hh, 1) < 1.4:
-            boxes.append((x, y, ww, hh))
+            # y relativo à ROI → converter para coordenadas do frame
+            boxes.append((x, y + y0, ww, hh))
     return boxes
 
 
@@ -744,44 +803,42 @@ def decidir(pista_ok, erro):
 #  [15] DEBUG VISUAL (leve — sem hconcat no loop crítico)
 # ================================================================
 
-def desenhar_debug(frame, pista_vis, marcador_vis, bbox_ia, label_ia, conf_ia, fps):
+def desenhar_debug(frame, gray, pista_vis, placa_vis,
+                   bbox_ia, label_ia, conf_ia, fps):
     """
-    Exibe frame principal com overlay.
-    Janelas separadas para pista e marcador (atualizadas a cada 3 frames).
-    Sem hconcat — 3x menos memória de buffer de vídeo.
+    Console concatenado: [GRAY | PISTA TRATADA | PLACA TRATADA]
+    Uma única janela — mostra os três painéis lado a lado.
+    Overlay de status no painel esquerdo (gray).
     """
-    dbg = frame   # sem .copy() — overlay direto (mais rápido)
+    # ── Painel 1: escala de cinza com status ──────────────────────
+    p1 = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
-    # Status linha 1
-    cor1 = (0, 220, 50) if _pista["ok"] else (0, 40, 255)
-    cv2.putText(dbg, f"mot:{CMD['mot']} srv:{CMD['srv']:+d} err:{_pista['erro']:+.2f} fps:{fps}",
-                (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, cor1, 1)
+    cor = (0, 220, 50) if _pista["ok"] else (0, 40, 255)
+    cv2.putText(p1, f"mot:{CMD['mot']} srv:{CMD['srv']:+d} err:{_pista['erro']:+.2f} fps:{fps}",
+                (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.40, cor, 1)
+    cv2.putText(p1, f"modo:{NAV['modo']}",
+                (4, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 220, 0), 1)
+    cv2.putText(p1, f"placa:{label_ia or '-'} {conf_ia:.2f}",
+                (4, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 255), 1)
 
-    # Status linha 2
-    rota_info = f"{NAV['rota_idx']}/{len(NAV['rota'])}"
-    cv2.putText(dbg, f"modo:{NAV['modo']}  rota:{rota_info}  pend:{NAV['acao_pendente']}",
-                (8, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 220, 0), 1)
-
-    # Status linha 3
-    cv2.putText(dbg, f"placa_ia:{label_ia or '-'} conf:{conf_ia:.2f}",
-                (8, 54), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 255), 1)
-
-    # Bounding box da placa detectada
+    # Bounding box da placa no painel gray
     if bbox_ia:
-        x, y, ww, hh = bbox_ia
-        cv2.rectangle(dbg, (x, y), (x + ww, y + hh), (255, 220, 0), 2)
-        if label_ia:
-            cv2.putText(dbg, f"{label_ia} {conf_ia:.2f}",
-                        (x, max(14, y - 6)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 220, 0), 1)
+        x, y, bw, bh = bbox_ia
+        cv2.rectangle(p1, (x, y), (x + bw, y + bh), (0, 220, 180), 1)
 
-    cv2.imshow("Carro — Principal", dbg)
+    # ── Painel 2: pista tratada (já é BGR) ────────────────────────
+    p2 = pista_vis if pista_vis is not None else np.zeros_like(p1)
+    cv2.putText(p2, "PISTA", (4, 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 80), 1)
 
-    # Janelas auxiliares (menor custo — frames pequenos)
-    if pista_vis is not None:
-        cv2.imshow("Pista", pista_vis)
-    if marcador_vis is not None:
-        cv2.imshow("Marcador", marcador_vis)
+    # ── Painel 3: placa tratada (já é BGR) ────────────────────────
+    p3 = placa_vis if placa_vis is not None else np.zeros_like(p1)
+    cv2.putText(p3, "PLACAS", (4, 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 140, 255), 1)
+
+    # ── Concat horizontal dos 3 painéis ──────────────────────────
+    console = cv2.hconcat([p1, p2, p3])
+    cv2.imshow("Carro Autonomo", console)
 
 
 # ================================================================
@@ -808,6 +865,7 @@ def main(usar_camera=False):
     conf_ia   = 0.0
     bbox_ia   = None
     pista_vis = None
+    placa_vis = None
     marc_vis  = None
 
     print("[OK] Rodando — Q para encerrar\n", flush=True)
@@ -828,6 +886,9 @@ def main(usar_camera=False):
 
         # ── Pista ────────────────────────────────────────────────
         gray, pista_vis, erro, pista_ok, centro = processar_pista(frame)
+
+        # ── ROI de Placas (tratamento visual) ────────────────────
+        placa_vis = processar_placa_roi(frame, gray)
 
         # ── Marcador no chão (a cada 2 frames) ───────────────────
         if frame_id % 2 == 0:
@@ -866,7 +927,7 @@ def main(usar_camera=False):
             fps_timer = time.monotonic()
 
         # ── Debug ────────────────────────────────────────────────
-        desenhar_debug(frame, pista_vis, marc_vis,
+        desenhar_debug(frame, gray, pista_vis, placa_vis,
                        bbox_ia, label_ia, conf_ia, fps)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
