@@ -46,7 +46,7 @@ import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"          # silencia logs TF
 os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"   # não reserva tudo
 
-from infer_sign_cnn import load_model_and_labels, classify_sign_crop
+from INFER_SIGN_CNN import load_model_and_labels, classify_sign_crop
 
 # ================================================================
 #  [1] CONFIGURAÇÃO — edite aqui
@@ -98,7 +98,7 @@ _K5 = np.ones((5, 5), np.uint8)
 # Comando enviado ao Arduino
 CMD = {
     "mot": 0,   # motor 0-100 %PWM
-    "srv": 0,   # servo -40..+40 graus
+    "srv": 127,   # servo -40..+40 graus
     "buz": 0,   # buzina 0/1
     "led": 0,   # LED 0/1
     "mode": 0,  # modo operação
@@ -713,7 +713,7 @@ def controle_modo():
 
     # ── STOP: para 2s ──────────────────────────────────────────
     if modo == "EXEC_STOP":
-        CMD.update({"mot": 0, "srv": 0, "buz": 0, "led": 1, "brk": 1})
+        CMD.update({"mot": 0, "srv": servo_to_254(0), "buz": 0, "led": 1, "brk": 1})
         if dt > 2.0:
             CMD["led"] = 0
             CMD["brk"] = 0
@@ -722,7 +722,7 @@ def controle_modo():
 
     # ── YIELD: devagar 1s ──────────────────────────────────────
     if modo == "EXEC_YIELD":
-        CMD.update({"mot": VEL["devagar"], "srv": 0, "buz": 0, "led": 0, "brk": 0})
+        CMD.update({"mot": VEL["devagar"], "srv": servo_to_254(0), "buz": 0, "led": 0, "brk": 0})
         if dt > 1.0:
             _voltar()
         return True
@@ -730,11 +730,11 @@ def controle_modo():
     # ── LEFT: 3 fases ──────────────────────────────────────────
     if modo == "EXEC_LEFT":
         if dt < 0.35:
-            CMD.update({"mot": 40, "srv": 0,   "dir": 1})
+            CMD.update({"mot": 40, "srv": servo_to_254(0),   "dir": 1})
         elif dt < 1.15:
-            CMD.update({"mot": 38, "srv": -32, "dir": 1})
+            CMD.update({"mot": 38, "srv": servo_to_254(-32), "dir": 1})
         elif dt < 1.45:
-            CMD.update({"mot": 35, "srv": 0,   "dir": 1})
+            CMD.update({"mot": 35, "srv": servo_to_254(0),   "dir": 1})
         else:
             CMD["dir"] = 0
             _voltar()
@@ -744,11 +744,11 @@ def controle_modo():
     # ── RIGHT: 3 fases ─────────────────────────────────────────
     if modo == "EXEC_RIGHT":
         if dt < 0.35:
-            CMD.update({"mot": 40, "srv": 0,   "dir": 2})
+            CMD.update({"mot": 40, "srv": servo_to_254(0),   "dir": 2})
         elif dt < 1.15:
-            CMD.update({"mot": 38, "srv": 32,  "dir": 2})
+            CMD.update({"mot": 38, "srv":servo_to_254(-32),  "dir": 2})
         elif dt < 1.45:
-            CMD.update({"mot": 35, "srv": 0,   "dir": 2})
+            CMD.update({"mot": 35, "srv": servo_to_254(0),   "dir": 2})
         else:
             CMD["dir"] = 0
             _voltar()
@@ -757,7 +757,7 @@ def controle_modo():
 
     # ── STRAIGHT: vai reto 0.9s ────────────────────────────────
     if modo == "EXEC_STRAIGHT":
-        CMD.update({"mot": 45, "srv": 0, "buz": 0, "led": 0,
+        CMD.update({"mot": 45, "srv": servo_to_254(0), "buz": 0, "led": 0,
                     "brk": 0, "dir": 3})
         if dt > 0.9:
             CMD["dir"] = 0
@@ -766,7 +766,7 @@ def controle_modo():
 
     # ── DELIVERY: para 3s, buzina + LED ────────────────────────
     if modo == "EXEC_DELIVERY":
-        CMD.update({"mot": 0, "srv": 0, "buz": 1, "led": 1, "brk": 1})
+        CMD.update({"mot": 0, "srv": servo_to_254(0), "buz": 1, "led": 1, "brk": 1})
         if dt > 3.0:
             CMD.update({"buz": 0, "led": 0, "brk": 0})
             _voltar()
@@ -783,6 +783,17 @@ def atualizar_cooldowns():
 
 
 # ================================================================
+# [17] FUNÇÃO DE CONVERSÃO
+# ================================================================
+def servo_to_254(valor, in_min=-40, in_max=40):
+    """
+    Converte direção de servo da faixa -40..+40 para 0..254.
+    Centro ~= 127.
+    """
+    valor = float(np.clip(valor, in_min, in_max))
+    escala = (valor - in_min) / (in_max - in_min)
+    return int(round(escala * 254))
+# ================================================================
 #  [14] DECISÃO PRINCIPAL
 # ================================================================
 
@@ -790,8 +801,10 @@ def decidir(pista_ok, erro):
     """Seguimento de pista via PID."""
     if pista_ok:
         ang = int(np.clip(pid_calc(erro) * 40, -40, 40))
-        CMD.update({"mot": VEL["normal"], "srv": ang,
-                    "buz": 0, "led": 0, "brk": 0,
+        srv_254 = servo_to_254(ang)
+
+        CMD.update({"mot": VEL["normal"], "srv": srv_254,   
+                    "buz": 0, "led": 0, "brk": 0, 
                     "spd": 2, "dir": 0})
     else:
         CMD.update({"mot": VEL["parado"], "srv": 0,
