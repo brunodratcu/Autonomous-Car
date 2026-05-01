@@ -1,35 +1,28 @@
 """
 ================================================================
-  CARRO AUTÔNOMO — PISTA + PLACAS  (CPU, sem GPU)
-  Otimizações vs versão anterior:
+  CARRO AUTÔNOMO — SPRINT 1 — PERCEPÇÃO + NAVEGAÇÃO BÁSICA
   ─────────────────────────────────────────────────────────────
-  1. TFLite em vez de TensorFlow completo  → -750MB RAM
-  2. Inferência a cada 6 frames            → -40% CPU de IA
-  3. Thread de captura isolada             → sem acúmulo de frames
-  4. Sem cv2.hconcat no loop crítico       → -50% uso de buffer de vídeo
-  5. Memória limitada no TF (fallback)     → sem reserva excessiva
-  6. Buffer de inferência pré-alocado      → zero alocações no loop
-  7. IA após decisão (não após waitKey)    → sem frames desperdiçados
-  8. Morfologia com kernel pré-alocado     → sem realocações
-  9. Janela de debug resize INTER_NEAREST  → mais rápido que INTER_LINEAR
-  10. Rota multi-ponto com lista de IDs    → entrega em ordem definida
-================================================================
-
+  Arquitetura:
+    • ROI dupla: pista (trapézio inferior) + placas (faixa central)
+    • Pipeline visual com 8 filtros por canal
+    • Análise lateral (esq/dir) independente → fusão central
+    • Detecção de cantos (Harris + Shi-Tomasi) em ambas as ROIs
+    • CNN TFLite para classificação de placas
+    • PID suave para seguimento de pista
+    • Máquina de estados + rota multi-ponto
+    • Envio serial JSON ao Arduino
+  ─────────────────────────────────────────────────────────────
   INSTALAÇÃO:
     pip install opencv-python numpy pyserial
-    pip install tflite-runtime             ← mais leve que tensorflow
-    # OU se tflite-runtime não funcionar:
-    pip install tensorflow                 ← fallback (mais pesado)
+    pip install tflite-runtime   (ou tensorflow como fallback)
 
   USO:
-    python pista_video.py          ← vídeo (pista_01.mov)
-    python pista_video.py --cam    ← câmera USB
-    python pista_video.py --cal    ← calibrar HSV
-    python pista_video.py --rota   ← definir rota de entrega
-
-  ROTA DE ENTREGA:
-    Edite ROTA_PONTOS abaixo com os IDs das placas em ordem.
-    O carro executa cada ação quando vê a placa correspondente.
+    python pista_video.py           → vídeo (pista_01.mov)
+    python pista_video.py --cam     → câmera USB
+    python pista_video.py --cal     → calibrar HSV
+    python pista_video.py --rota    → listar rota
+    python pista_video.py --debug   → janela de debug expandida
+================================================================
 """
 
 import cv2
@@ -42,150 +35,154 @@ import time
 import sys
 import os
 
-# Limita TF a usar no máximo 512MB de RAM (se TF for usado como fallback)
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"          # silencia logs TF
-os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"   # não reserva tudo
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
 
-from INFER_SIGN_CNN import load_model_and_labels, classify_sign_crop
+# Tenta importar módulo de inferência
+try:
+    from INFER_SIGN_CNN import load_model_and_labels, classify_sign_crop
+    _modulo_ia_ok = True
+except ImportError:
+    _modulo_ia_ok = False
 
 # ================================================================
-#  [1] CONFIGURAÇÃO — edite aqui
+#  [1] CONFIGURAÇÃO GLOBAL
 # ================================================================
 
-PROP     = 2        # divisor de resolução (2 = metade)
-VIDEO    = "./pista_01.mov"
-CAM_IDX  = 0
+PROP      = 2          # divisor de resolução (2 = metade)
+VIDEO     = "./pista_01.mov"
+CAM_IDX   = 0
 
 SERIAL_PORT = "COM3"
 BAUD        = 115200
 
-# PID
+# ── PID ──────────────────────────────────────────────────────────
 KP, KI, KD = 0.55, 0.005, 0.12
 
-# Velocidades (% PWM)
+# ── Velocidades (%PWM) ────────────────────────────────────────────
 VEL = {"normal": 62, "devagar": 35, "parado": 0}
 
-# Threshold de binarização da pista (0=auto Otsu)
-THRESH_PISTA = 0      # 0 = Otsu automático
+# ── Thresholds ────────────────────────────────────────────────────
+THRESH_PISTA    = 0     # 0 = Otsu automático
+IA_EVERY        = 6     # inferência a cada N frames
+IA_CONF_MIN     = 0.82  # confiança mínima CNN
 
-# Frequência de inferência de IA (a cada N frames)
-IA_EVERY = 6          # 6 = ~5fps de IA em 30fps de câmera
+# ── ROIs (frações da altura do frame) ────────────────────────────
+#   Pista  : 60%–100% (trapézio, definido em pts abaixo)
+#   Placas : 15%–55%  (faixa retangular)
+ROI_PISTA_Y0    = 0.60
+ROI_PLACA_Y0    = 0.15
+ROI_PLACA_Y1    = 0.55
 
-# Confiança mínima para aceitar classificação
-IA_CONF_MIN = 0.82
+# ── Cantos (Harris) ───────────────────────────────────────────────
+HARRIS_K        = 0.04
+HARRIS_THRESH   = 0.01   # fração do máximo
+CORNER_DILATE   = 3      # pixels de dilatação para visualização
 
-# ── Rota de entrega (lista de ações em ordem) ────────────────────
-# O carro executa cada ação na sequência, quando detectar a placa
-# Opções: "STOP", "YIELD", "LEFT", "RIGHT", "STRAIGHT", "DELIVERY"
-ROTA_PONTOS = ["STRAIGHT", "LEFT", "DELIVERY", "RIGHT", "STOP"]
-# Exemplo: vai reto, vira esquerda, entrega, vira direita, para na base
-
-# ── ROIs como fração da altura do frame ─────────────────────────
-# Pista  : trapézio na metade inferior (definido em processar_pista)
-# Placa  : faixa horizontal onde placas aparecem fisicamente
-#          15% = abaixo do céu  |  55% = acima da pista
-ROI_PLACA_Y0 = 0.15
-ROI_PLACA_Y1 = 0.55
-
-# ── Kernels morfológicos pré-alocados ────────────────────────────
+# ── Kernels pré-alocados ─────────────────────────────────────────
 _K3 = np.ones((3, 3), np.uint8)
 _K5 = np.ones((5, 5), np.uint8)
+_K7 = np.ones((7, 7), np.uint8)
+
+# ── Rota multi-ponto ─────────────────────────────────────────────
+ROTA_PONTOS = ["STRAIGHT", "LEFT", "DELIVERY", "RIGHT", "STOP"]
 
 # ================================================================
 #  [2] ESTADO GLOBAL
 # ================================================================
 
-# Comando enviado ao Arduino
 CMD = {
-    "mot": 0,   # motor 0-100 %PWM
-    "srv": 127,   # servo -40..+40 graus
-    "buz": 0,   # buzina 0/1
-    "led": 0,   # LED 0/1
-    "mode": 0,  # modo operação
-    "brk": 0,   # freio
-    "dir": 0,   # direção lógica (0=neutro,1=esq,2=dir,3=frente)
-    "spd": 0,   # perfil velocidade (0=parado,1=lento,2=normal,3=rápido)
-    "err": 0,   # erro lateral escalado para int
+    "mot": 0,    # motor 0–100 %PWM
+    "srv": 127,  # servo 0–254 (127 = centro)
+    "buz": 0,
+    "led": 0,
+    "mode": 0,
+    "brk": 0,
+    "dir": 0,    # 0=neutro 1=esq 2=dir 3=frente
+    "spd": 0,
+    "err": 0,
 }
 
-# Resultados de visão
-_pista = {"ok": False, "erro": 0.0, "centro": 0}
+# Resultados da pipeline de pista
+_pista = {
+    "ok":       False,
+    "erro":     0.0,
+    "centro":   0,
+    # análise lateral separada
+    "x_esq":    None,   # posição X da borda esquerda
+    "x_dir":    None,   # posição X da borda direita
+    "ang_esq":  0.0,    # inclinação média (linhas esq)
+    "ang_dir":  0.0,    # inclinação média (linhas dir)
+    "cantos_pista": 0,  # qtd cantos Harris detectados na ROI pista
+}
 
-# PID state
-_pid = {"i": 0.0, "e_ant": 0.0, "t_ant": time.monotonic()}
+# Resultados de placas
+_placa = {
+    "label":    None,
+    "conf":     0.0,
+    "bbox":     None,
+    "cantos":   0,      # qtd cantos na ROI placa
+}
+
+# PID
+_pid  = {"i": 0.0, "e_ant": 0.0, "t_ant": time.monotonic()}
 _hist = []   # média móvel do centro
 
-# Navegação
+# Navegação / máquina de estados
 NAV = {
-    "modo":             "SEGUIR_PISTA",
-    "t_inicio":         time.monotonic(),
-    "acao_pendente":    None,
-    "frames_placa":     0,
-    "ultimo_tipo":      None,
-    "cooldown_placa":   0,
-    "cooldown_marcador":0,
-    "placa_confirmada": False,
-
-    # Rota multi-ponto
-    "rota":             list(ROTA_PONTOS),   # cópia da rota configurada
-    "rota_idx":         0,                   # índice atual na rota
-    "missao_completa":  False,
+    "modo":              "SEGUIR_PISTA",
+    "t_inicio":          time.monotonic(),
+    "acao_pendente":     None,
+    "cooldown_placa":    0,
+    "cooldown_marcador": 0,
+    "rota":              list(ROTA_PONTOS),
+    "rota_idx":          0,
+    "missao_completa":   False,
 }
 
-# Memória de confirmação da IA
+# Memória de confirmação IA
 _mem_ai = {"ultima": None, "cnt": 0, "conf": 0.0}
-
-# Resultado IA (atualizado pela thread de IA)
-_ia_resultado = {"label": None, "conf": 0.0, "bbox": None}
-_ia_lock      = threading.Lock()
 
 # Filas e flags de controle
 _q_frames  = queue.Queue(maxsize=2)
-_q_serial  = queue.Queue(maxsize=4)
 _stop_flag = threading.Event()
-
-# Contador global de frames
-frame_id = 0
-
+frame_id   = 0
 
 # ================================================================
-#  [3] INICIALIZAÇÃO DO MODELO (TFLite — leve)
+#  [3] CARGA DO MODELO
 # ================================================================
 
 print("[IA] Carregando modelo TFLite...", flush=True)
-try:
-    _sign_interp, _sign_labels, _in_idx, _out_idx = load_model_and_labels()
-    _ia_disponivel = True
-    print(f"[IA] Modelo OK — {len(_sign_labels)} classes: {_sign_labels}", flush=True)
-except Exception as e:
-    print(f"[IA] Modelo não disponível ({e}) — usando fallback cor+forma", flush=True)
+if _modulo_ia_ok:
+    try:
+        _sign_interp, _sign_labels, _in_idx, _out_idx = load_model_and_labels()
+        _ia_disponivel = True
+        print(f"[IA] OK — {len(_sign_labels)} classes: {_sign_labels}", flush=True)
+    except Exception as e:
+        print(f"[IA] Falha ({e}) — fallback cor+forma", flush=True)
+        _ia_disponivel = False
+        _sign_interp = _sign_labels = _in_idx = _out_idx = None
+else:
+    print("[IA] INFER_SIGN_CNN não encontrado — fallback ativo", flush=True)
     _ia_disponivel = False
     _sign_interp = _sign_labels = _in_idx = _out_idx = None
-
 
 # ================================================================
 #  [4] CÂMERA / VÍDEO
 # ================================================================
 
 def abrir_fonte(usar_camera=False):
-    if usar_camera:
-        src = CAM_IDX
-        print(f"[CAM] Câmera USB idx={CAM_IDX}", flush=True)
-    else:
-        src = VIDEO
-        print(f"[CAM] Vídeo: {VIDEO}", flush=True)
-
+    src = CAM_IDX if usar_camera else VIDEO
+    print(f"[CAM] {'Câmera' if usar_camera else 'Vídeo'}: {src}", flush=True)
     cap = cv2.VideoCapture(src, cv2.CAP_DSHOW if usar_camera else cv2.CAP_ANY)
     if not cap.isOpened():
         print("[CAM] Falha ao abrir fonte de vídeo!")
         sys.exit(1)
-
     if usar_camera:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         cap.set(cv2.CAP_PROP_FPS,          30)
         cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
-
     return cap
 
 
@@ -214,9 +211,8 @@ def conectar_serial():
 
 
 def enviar(ser):
-    """Monta JSON, imprime no terminal e envia ao Arduino."""
+    """Monta JSON e envia ao Arduino."""
     CMD["err"] = int(np.clip(_pista["erro"] * 100, -100, 100))
-
     linha = (
         f'{{"mot":{CMD["mot"]},'
         f'"srv":{CMD["srv"]},'
@@ -236,26 +232,11 @@ def enviar(ser):
             pass
 
 
-def thread_serial(ser):
-    """Thread dedicada: drena fila serial sem bloquear loop principal."""
-    while not _stop_flag.is_set():
-        try:
-            data = _q_serial.get(timeout=0.05)
-            if ser:
-                try:
-                    ser.write(data)
-                except Exception:
-                    pass
-        except queue.Empty:
-            pass
-
-
 # ================================================================
 #  [6] THREAD DE CAPTURA
 # ================================================================
 
 def thread_captura(cap):
-    """Lê frames continuamente. Descarta o mais antigo se fila cheia."""
     while not _stop_flag.is_set():
         ret, frame = cap.read()
         if not ret:
@@ -283,198 +264,387 @@ def pid_calc(erro: float) -> float:
 
 
 # ================================================================
-#  [8] DETECÇÃO DE PISTA
-#  Gray → Blur → Otsu/Threshold → Morfologia → ROI → Canny → Hough
+#  [8] UTILITÁRIO DE FILTROS
+#  Aplica sequência de aprimoramento sobre uma imagem grayscale.
+#  Retorna (filtrada, canny, binaria)
+# ================================================================
+
+def pipeline_filtros(gray_roi, nome=""):
+    """
+    8 estágios de filtragem:
+      1. CLAHE         — equalização adaptativa de contraste
+      2. Gauss 5×5     — suavização (remove ruído de alta frequência)
+      3. Otsu/Fixed    — binarização global adaptativa
+      4. Morph Open    — remove pequenas manchas
+      5. Morph Close   — fecha buracos na linha
+      6. Dilatação     — engrossa bordas para Canny
+      7. Canny         — extração de bordas
+      8. Sobel X+Y     — gradiente de intensidade (auxiliar)
+    """
+    # 1. CLAHE
+    clahe  = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    eq     = clahe.apply(gray_roi)
+
+    # 2. Gaussian Blur
+    blur   = cv2.GaussianBlur(eq, (5, 5), 0)
+
+    # 3. Binarização Otsu
+    _, bin_ = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # 4 + 5. Morfologia
+    aberto = cv2.morphologyEx(bin_, cv2.MORPH_OPEN,  _K3)
+    fechado = cv2.morphologyEx(aberto, cv2.MORPH_CLOSE, _K3)
+
+    # 6. Dilatação leve
+    dil   = cv2.dilate(fechado, _K3, iterations=1)
+
+    # 7. Canny
+    canny  = cv2.Canny(dil, 40, 120)
+
+    # 8. Sobel (combinado)
+    sx    = cv2.Sobel(blur, cv2.CV_64F, 1, 0, ksize=3)
+    sy    = cv2.Sobel(blur, cv2.CV_64F, 0, 1, ksize=3)
+    sob   = np.uint8(np.clip(np.sqrt(sx**2 + sy**2) / 4, 0, 255))
+
+    return fechado, canny, sob
+
+
+# ================================================================
+#  [9] DETECÇÃO DE CANTOS
+#  Harris Corner Detector aplicado sobre a ROI.
+#  Retorna (lista de pontos (x,y) em coords do frame, visualização)
+# ================================================================
+
+def detectar_cantos(gray_roi, y_offset=0, x_offset=0,
+                    max_cantos=80, metodo="harris"):
+    """
+    metodo: 'harris' ou 'shi'
+    Retorna (pts_frame, vis_roi_bgr)
+    """
+    vis = cv2.cvtColor(gray_roi, cv2.COLOR_GRAY2BGR)
+
+    if metodo == "shi":
+        # Shi-Tomasi (mais estável, menos sensível)
+        pts = cv2.goodFeaturesToTrack(
+            gray_roi, maxCorners=max_cantos,
+            qualityLevel=0.01, minDistance=5
+        )
+        corners = []
+        if pts is not None:
+            for p in pts:
+                x, y = int(p[0][0]), int(p[0][1])
+                corners.append((x + x_offset, y + y_offset))
+                cv2.circle(vis, (x, y), 3, (0, 255, 255), -1)
+        return corners, vis
+
+    # Harris
+    gray_f = np.float32(gray_roi)
+    dst    = cv2.cornerHarris(gray_f, blockSize=2, ksize=3, k=HARRIS_K)
+    dst    = cv2.dilate(dst, None)
+
+    thresh_val = HARRIS_THRESH * dst.max() if dst.max() > 0 else 1
+    corners    = []
+    ys, xs     = np.where(dst > thresh_val)
+
+    # Amostra até max_cantos
+    if len(xs) > max_cantos:
+        idx = np.random.choice(len(xs), max_cantos, replace=False)
+        xs, ys = xs[idx], ys[idx]
+
+    for x, y in zip(xs, ys):
+        corners.append((int(x) + x_offset, int(y) + y_offset))
+        cv2.circle(vis, (int(x), int(y)), 2, (0, 0, 255), -1)
+
+    # Marca hotspots (cantos de alta resposta)
+    strong = np.column_stack(np.where(dst > 0.1 * dst.max()))
+    for sy_c, sx_c in strong[:20]:
+        cv2.circle(vis, (int(sx_c), int(sy_c)), 4, (255, 50, 50), 1)
+
+    return corners, vis
+
+
+# ================================================================
+#  [10] PIPELINE ROI PISTA
+#  Análise bilateral (esq/dir) + fusão + PID
 # ================================================================
 
 def processar_pista(frame):
     """
-    Retorna (img_gray, filtrada_vis, erro, pista_ok, cp_suave)
+    Pipeline completo da pista:
+      • Aplica pipeline_filtros na ROI trapezoidal
+      • Separa linhas em esquerda e direita (inclinação)
+      • Calcula x_esq e x_dir independentemente
+      • Detecta cantos Harris nos dois lados
+      • Funde os dois lados para calcular o centro e o erro
+    Retorna (gray, vis_bgr, erro, pista_ok, centro_suave)
     """
     global _hist
 
     h, w   = frame.shape[:2]
     cx_ref = w // 2
 
-    # 1. Grayscale
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-    # 2. Gaussian Blur
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-
-    # 3. Binarização — Otsu automático ou valor fixo
-    if THRESH_PISTA == 0:
-        _, binaria = cv2.threshold(blur, 0, 255,
-                                   cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    else:
-        _, binaria = cv2.threshold(blur, THRESH_PISTA, 255,
-                                   cv2.THRESH_BINARY)
-
-    # 4. Morfologia com kernels pré-alocados (sem realocação)
-    binaria = cv2.morphologyEx(binaria, cv2.MORPH_OPEN,  _K3)
-    binaria = cv2.morphologyEx(binaria, cv2.MORPH_CLOSE, _K3)
-
-    # 5. ROI trapezoidal — foca na pista, ignora céu
-    roi_mask = np.zeros_like(binaria)
-    pts = np.array([[
-        (int(w * 0.10), h),
-        (int(w * 0.40), int(h * 0.60)),
-        (int(w * 0.60), int(h * 0.60)),
-        (int(w * 0.90), h),
+    # ── Região trapezoidal da pista ──────────────────────────────
+    pts_trap = np.array([[
+        (int(w * 0.05), h),
+        (int(w * 0.38), int(h * ROI_PISTA_Y0)),
+        (int(w * 0.62), int(h * ROI_PISTA_Y0)),
+        (int(w * 0.95), h),
     ]], dtype=np.int32)
-    cv2.fillPoly(roi_mask, pts, 255)
-    masked = cv2.bitwise_and(binaria, roi_mask)
 
-    # 6. Canny
-    bordas = cv2.Canny(masked, 50, 150)
+    gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    # 7. HoughLinesP
-    linhas = cv2.HoughLinesP(
-        bordas, rho=1, theta=np.pi / 180,
-        threshold=25, minLineLength=25, maxLineGap=30
-    )
+    # Máscara trapezoidal
+    trap_mask = np.zeros((h, w), np.uint8)
+    cv2.fillPoly(trap_mask, pts_trap, 255)
+    gray_roi  = cv2.bitwise_and(gray_full, trap_mask)
 
-    esq_params = []
-    dir_params = []
+    # ── 8 filtros ────────────────────────────────────────────────
+    binaria, canny, sobel = pipeline_filtros(gray_roi, nome="pista")
 
-    if linhas is not None:
+    # ── Separação esq/dir por metade vertical ────────────────────
+    esq_mask = np.zeros((h, w), np.uint8); esq_mask[:, :cx_ref] = 255
+    dir_mask  = np.zeros((h, w), np.uint8); dir_mask[:, cx_ref:] = 255
+
+    canny_esq = cv2.bitwise_and(canny, esq_mask)
+    canny_dir  = cv2.bitwise_and(canny, dir_mask)
+
+    # ── HoughLinesP bilateral ─────────────────────────────────────
+    def hough(img):
+        return cv2.HoughLinesP(
+            img, rho=1, theta=np.pi / 180,
+            threshold=20, minLineLength=20, maxLineGap=35
+        )
+
+    linhas_esq = hough(canny_esq)
+    linhas_dir  = hough(canny_dir)
+
+    def extrair_params(linhas, lado):
+        """Filtra e retorna lista de (m, b) para o lado dado."""
+        params = []
+        if linhas is None:
+            return params
         for seg in linhas:
             x1, y1, x2, y2 = seg[0]
             dx = x2 - x1
             if dx == 0:
                 continue
-            length = np.hypot(x2 - x1, y2 - y1)
-            if length < 25:
+            length = np.hypot(dx, y2 - y1)
+            if length < 20:
                 continue
             inc = (y2 - y1) / dx
-            if abs(inc) < 0.3 or abs(inc) > 3.5:
+            # Esquerda: inclinação negativa; Direita: positiva
+            if lado == "esq" and not (-3.5 < inc < -0.25):
+                continue
+            if lado == "dir" and not (0.25 < inc < 3.5):
                 continue
             m, b = np.polyfit([x1, x2], [y1, y2], 1)
-            (esq_params if inc < 0 else dir_params).append((m, b))
+            params.append((m, b))
+        return params
 
-    y_ref  = int(h * 0.85)
-    x_esq  = None
-    x_dir  = None
+    params_esq = extrair_params(linhas_esq, "esq")
+    params_dir  = extrair_params(linhas_dir,  "dir")
+
+    y_ref    = int(h * 0.88)
+    x_esq    = None
+    x_dir    = None
+    ang_esq  = 0.0
+    ang_dir  = 0.0
     pista_ok = False
 
-    if esq_params:
-        me = np.mean([p[0] for p in esq_params])
-        be = np.mean([p[1] for p in esq_params])
+    if params_esq:
+        me   = float(np.mean([p[0] for p in params_esq]))
+        be   = float(np.mean([p[1] for p in params_esq]))
+        ang_esq = float(np.degrees(np.arctan(me)))
         if abs(me) > 1e-6:
             x_esq = int(np.clip((y_ref - be) / me, 0, w - 1))
 
-    if dir_params:
-        md = np.mean([p[0] for p in dir_params])
-        bd = np.mean([p[1] for p in dir_params])
+    if params_dir:
+        md   = float(np.mean([p[0] for p in params_dir]))
+        bd   = float(np.mean([p[1] for p in params_dir]))
+        ang_dir = float(np.degrees(np.arctan(md)))
         if abs(md) > 1e-6:
             x_dir = int(np.clip((y_ref - bd) / md, 0, w - 1))
 
+    # ── Fusão bilateral → centro ──────────────────────────────────
     if x_esq is not None and x_dir is not None:
-        cp = (x_esq + x_dir) // 2
+        # Ambos os lados visíveis: centro real
+        cp       = (x_esq + x_dir) // 2
         pista_ok = True
     elif x_esq is not None:
-        cp = int(np.clip(x_esq + w // 4, 0, w - 1))
+        # Só borda esquerda: estima centro com deslocamento
+        cp       = int(np.clip(x_esq + int(w * 0.28), 0, w - 1))
         pista_ok = True
     elif x_dir is not None:
-        cp = int(np.clip(x_dir - w // 4, 0, w - 1))
+        # Só borda direita
+        cp       = int(np.clip(x_dir - int(w * 0.28), 0, w - 1))
         pista_ok = True
     else:
-        cp = cx_ref
+        cp = cx_ref   # fallback: sem pista → fica no centro
 
-    # 8. Média móvel
+    # ── Cantos Harris na ROI pista ────────────────────────────────
+    y_roi0 = int(h * ROI_PISTA_Y0)
+    gray_strip = gray_full[y_roi0:, :]
+    corners_pista, _ = detectar_cantos(gray_strip, y_offset=y_roi0, max_cantos=60)
+
+    # ── Média móvel ───────────────────────────────────────────────
     _hist.append(cp)
-    if len(_hist) > 5:
+    if len(_hist) > 6:
         _hist.pop(0)
     cp_suave = int(np.mean(_hist))
-    erro     = float(np.clip((cp_suave - cx_ref) / cx_ref, -1.0, 1.0))
+    erro     = float(np.clip((cp_suave - cx_ref) / (cx_ref + 1e-6), -1.0, 1.0))
 
-    _pista["ok"]     = pista_ok
-    _pista["erro"]   = erro
-    _pista["centro"] = cp_suave
+    # ── Atualiza estado global ────────────────────────────────────
+    _pista.update({
+        "ok":           pista_ok,
+        "erro":         erro,
+        "centro":       cp_suave,
+        "x_esq":        x_esq,
+        "x_dir":        x_dir,
+        "ang_esq":      ang_esq,
+        "ang_dir":      ang_dir,
+        "cantos_pista": len(corners_pista),
+    })
 
-    # 9. Visualização mínima (só o necessário)
-    vis = cv2.cvtColor(masked, cv2.COLOR_GRAY2BGR)
-    cv2.line(vis, (cx_ref, int(h * 0.6)), (cx_ref, h), (0, 0, 255), 1)
-    cv2.line(vis, (cp_suave, int(h * 0.6)), (cp_suave, h), (0, 255, 0), 2)
-    if x_esq: cv2.circle(vis, (x_esq, y_ref), 4, (255, 255, 0), -1)
-    if x_dir: cv2.circle(vis, (x_dir, y_ref), 4, (0, 255, 255), -1)
+    # ── Visualização ──────────────────────────────────────────────
+    vis = cv2.cvtColor(binaria, cv2.COLOR_GRAY2BGR)
 
-    return gray, vis, erro, pista_ok, cp_suave
+    # Trapézio da ROI
+    cv2.polylines(vis, pts_trap, isClosed=True, color=(80, 80, 80), thickness=1)
+
+    # Linha de referência central
+    cv2.line(vis, (cx_ref, int(h * 0.55)), (cx_ref, h), (0, 0, 180), 1)
+
+    # Centro calculado (linha verde)
+    cv2.line(vis, (cp_suave, int(h * 0.55)), (cp_suave, h), (0, 255, 60), 2)
+
+    # Pontos de interseção bilateral
+    if x_esq is not None:
+        cv2.circle(vis, (x_esq, y_ref), 7, (255, 220, 0), -1)
+        cv2.putText(vis, f"E:{x_esq}", (x_esq - 30, y_ref - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 220, 0), 1)
+    if x_dir is not None:
+        cv2.circle(vis, (x_dir, y_ref), 7, (0, 220, 255), -1)
+        cv2.putText(vis, f"D:{x_dir}", (x_dir + 4, y_ref - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 220, 255), 1)
+
+    # Linhas de Hough projetadas
+    for m, b in params_esq[:3]:
+        y1_l, y2_l = int(h * 0.55), h
+        x1_l = int(np.clip((y1_l - b) / (m + 1e-9), 0, w))
+        x2_l = int(np.clip((y2_l - b) / (m + 1e-9), 0, w))
+        cv2.line(vis, (x1_l, y1_l), (x2_l, y2_l), (255, 200, 0), 1)
+    for m, b in params_dir[:3]:
+        y1_l, y2_l = int(h * 0.55), h
+        x1_l = int(np.clip((y1_l - b) / (m + 1e-9), 0, w))
+        x2_l = int(np.clip((y2_l - b) / (m + 1e-9), 0, w))
+        cv2.line(vis, (x1_l, y1_l), (x2_l, y2_l), (0, 200, 255), 1)
+
+    # Cantos Harris na strip
+    for cx_c, cy_c in corners_pista[:40]:
+        cv2.circle(vis, (cx_c, cy_c), 2, (0, 0, 255), -1)
+
+    # Erro + ângulos
+    cv2.putText(vis, f"err:{erro:+.3f} esq:{ang_esq:+.1f}° dir:{ang_dir:+.1f}°",
+                (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (200, 255, 200), 1)
+    cv2.putText(vis, f"cantos:{len(corners_pista)}  {'OK' if pista_ok else 'SEM PISTA'}",
+                (4, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.36,
+                (0, 255, 80) if pista_ok else (0, 60, 255), 1)
+
+    return gray_full, vis, erro, pista_ok, cp_suave
 
 
 # ================================================================
-#  [8b] ROI + TRATAMENTO VISUAL DE PLACAS
-#  Espelho da lógica de pista, mas na faixa ROI_PLACA_Y0–Y1.
-#  Retorna imagem tratada BGR para o concat do console.
+#  [11] PIPELINE ROI PLACAS
+#  Mesmos 8 filtros aplicados na faixa 15%–55%.
+#  Detecção de cantos + contornos candidatos.
 # ================================================================
 
-def processar_placa_roi(frame, gray):
+def processar_placa_roi(frame, gray_full):
     """
-    Aplica o mesmo pipeline de tratamento da pista na faixa de placas.
-    ROI: ROI_PLACA_Y0 (15%) a ROI_PLACA_Y1 (55%) da altura do frame.
-
-    Passos: Blur → Otsu → Morfologia → Canny → desenha contornos candidatos
-    Retorna: vis_bgr (mesma dimensão do frame, fundo preto fora da ROI)
+    Aplica pipeline_filtros na faixa de placas (ROI_PLACA_Y0–Y1).
+    Detecta cantos (Shi-Tomasi, mais estável para placas).
+    Retorna vis_bgr (frame completo, preto fora da ROI).
     """
     h, w = frame.shape[:2]
     y0 = int(h * ROI_PLACA_Y0)
     y1 = int(h * ROI_PLACA_Y1)
 
-    roi_gray = gray[y0:y1, :]
-    blur     = cv2.GaussianBlur(roi_gray, (5, 5), 0)
-    _, bin_  = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    bin_     = cv2.morphologyEx(bin_, cv2.MORPH_OPEN,  _K3)
-    bin_     = cv2.morphologyEx(bin_, cv2.MORPH_CLOSE, _K3)
-    bordas   = cv2.Canny(bin_, 50, 150)
+    roi_gray = gray_full[y0:y1, :]
 
-    # Monta frame completo: preto fora da ROI, bordas dentro
-    canvas = np.zeros((h, w), dtype=np.uint8)
-    canvas[y0:y1, :] = bordas
-    vis = cv2.cvtColor(canvas, cv2.COLOR_GRAY2BGR)
+    # 8 filtros
+    binaria, canny, sobel = pipeline_filtros(roi_gray, nome="placa")
 
-    # Linhas-guia da ROI
-    cv2.line(vis, (0, y0), (w, y0), (0, 140, 255), 1)
-    cv2.line(vis, (0, y1), (w, y1), (0, 140, 255), 1)
+    # Cantos Shi-Tomasi (bom para contornos de placas quadradas)
+    corners_shi, vis_corners = detectar_cantos(
+        roi_gray, y_offset=0, metodo="shi", max_cantos=60
+    )
+
+    # Monta canvas completo
+    canvas_bin = np.zeros((h, w), dtype=np.uint8)
+    canvas_bin[y0:y1, :] = binaria
+    canvas_can = np.zeros((h, w), dtype=np.uint8)
+    canvas_can[y0:y1, :] = canny
+
+    vis = cv2.cvtColor(canvas_bin, cv2.COLOR_GRAY2BGR)
+
+    # Sobrepõe Canny em azul
+    canny_bgr = cv2.cvtColor(canvas_can, cv2.COLOR_GRAY2BGR)
+    canny_bgr[:, :, 1] = 0   # zera G
+    canny_bgr[:, :, 2] = 0   # zera R → só canal B
+    vis = cv2.addWeighted(vis, 0.7, canny_bgr, 0.5, 0)
+
+    # Cantos
+    for p in corners_shi:
+        cx_c, cy_c = p
+        cv2.circle(vis, (cx_c, cy_c + y0), 3, (0, 255, 255), -1)
+
+    # Linhas de limite da ROI
+    cv2.rectangle(vis, (0, y0), (w - 1, y1), (0, 140, 255), 1)
     cv2.putText(vis, f"ROI placa {int(ROI_PLACA_Y0*100)}-{int(ROI_PLACA_Y1*100)}%",
                 (4, y0 + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 140, 255), 1)
 
-    # Retângulos dos contornos candidatos (proporção de placa)
-    cnts, _ = cv2.findContours(bin_, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Contornos candidatos a placa
+    cnts, _ = cv2.findContours(binaria, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     for cnt in cnts:
-        if cv2.contourArea(cnt) < 200:
+        if cv2.contourArea(cnt) < 250:
             continue
         x, y, bw, bh = cv2.boundingRect(cnt)
-        if 0.5 < bw / max(bh, 1) < 1.8:
-            cv2.rectangle(vis, (x, y + y0), (x + bw, y + y0 + bh), (0, 220, 180), 1)
+        razao = bw / max(bh, 1)
+        if 0.5 < razao < 1.6:
+            cv2.rectangle(vis, (x, y + y0), (x + bw, y + y0 + bh),
+                          (0, 220, 140), 1)
+            # Indicativo de proporção
+            cv2.putText(vis, f"{razao:.1f}", (x, y + y0 - 3),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.28, (0, 220, 140), 1)
+
+    # Gradiente Sobel sobreposto (roxo)
+    sob_full = np.zeros((h, w), dtype=np.uint8)
+    sob_full[y0:y1, :] = sobel
+    vis[:, :, 0] = cv2.addWeighted(vis[:, :, 0], 1.0, sob_full, 0.4, 0)
+
+    _placa["cantos"] = len(corners_shi)
+    cv2.putText(vis, f"cantos:{len(corners_shi)}",
+                (4, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 140, 255), 1)
 
     return vis
 
 
 # ================================================================
-#  [9] DETECÇÃO DE MARCADOR NO CHÃO
-#  Faixa escura horizontal transversal → dispara manobra pendente
+#  [12] DETECÇÃO DE MARCADOR NO CHÃO
 # ================================================================
 
 def detectar_marcador_chao(frame):
-    """
-    Procura faixa escura horizontal na parte inferior do frame.
-    Retorna (marcador_ok: bool, vis: BGR)
-    """
     h, w = frame.shape[:2]
-    y1, y2 = int(h * 0.72), int(h * 0.95)
-    roi = frame[y1:y2, :]
+    y1_r, y2_r = int(h * 0.72), int(h * 0.95)
+    roi = frame[y1_r:y2_r, :]
 
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
-
-    # Threshold invertido: escuro → branco
     _, mask = cv2.threshold(gray, 70, 255, cv2.THRESH_BINARY_INV)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  _K5)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _K5)
 
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
-                               cv2.CHAIN_APPROX_SIMPLE)
-
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     marcador_ok = False
     vis = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
 
@@ -482,7 +652,7 @@ def detectar_marcador_chao(frame):
         if cv2.contourArea(cnt) < 500:
             continue
         x, y, ww, hh = cv2.boundingRect(cnt)
-        asp      = ww / max(hh, 1)
+        asp       = ww / max(hh, 1)
         cobertura = ww / w
         if asp > 3.0 and cobertura > 0.45 and hh > 8:
             marcador_ok = True
@@ -493,15 +663,11 @@ def detectar_marcador_chao(frame):
 
 
 # ================================================================
-#  [10] DETECÇÃO DE PLACAS — IA (TFLite) + fallback cor/forma
+#  [13] LOCALIZAÇÃO E CLASSIFICAÇÃO DE PLACAS
 # ================================================================
 
 def _localizar_candidatas(frame):
-    """
-    Segmenta regiões de cor placa (vermelho/azul) na ROI de placas.
-    Usa ROI_PLACA_Y0–Y1: mesma faixa do processar_placa_roi.
-    Retorna lista de (x, y, w, h) em coordenadas do frame completo.
-    """
+    """Segmenta regiões de cor placa (vermelho/azul) na ROI."""
     h, w = frame.shape[:2]
     y0   = int(h * ROI_PLACA_Y0)
     y1   = int(h * ROI_PLACA_Y1)
@@ -509,48 +675,41 @@ def _localizar_candidatas(frame):
     hsv  = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     hsv  = cv2.GaussianBlur(hsv, (5, 5), 0)
 
-    # Vermelho (dois ranges por wrap-around em HSV)
     m1 = cv2.inRange(hsv, np.array([0,  80, 70]), np.array([12, 255, 255]))
-    m2 = cv2.inRange(hsv, np.array([170,80, 70]), np.array([180,255, 255]))
-    mb = cv2.inRange(hsv, np.array([90, 70, 60]), np.array([130,255, 255]))
+    m2 = cv2.inRange(hsv, np.array([170, 80, 70]), np.array([180, 255, 255]))
+    mb = cv2.inRange(hsv, np.array([90, 70, 60]),  np.array([130, 255, 255]))
     mask = cv2.bitwise_or(cv2.bitwise_or(m1, m2), mb)
-
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _K5)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  _K5)
 
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
-                               cv2.CHAIN_APPROX_SIMPLE)
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     boxes = []
     for cnt in cnts:
         if cv2.contourArea(cnt) < 400:
             continue
         x, y, ww, hh = cv2.boundingRect(cnt)
-        if 0.6 < ww / max(hh, 1) < 1.4:
-            # y relativo à ROI → converter para coordenadas do frame
+        if 0.5 < ww / max(hh, 1) < 1.5:
             boxes.append((x, y + y0, ww, hh))
     return boxes
 
 
 def _fallback_cor_forma(crop, bbox):
-    """Classifica placa por cor dominante + número de vértices (sem IA)."""
     if crop is None or crop.size == 0:
         return None
     hsv_c = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
 
     def px(lo, hi): return int(np.count_nonzero(cv2.inRange(hsv_c, lo, hi)))
 
-    a_vm = px(np.array([0,  80, 70]), np.array([12, 255,255])) + \
-           px(np.array([170,80, 70]), np.array([180,255,255]))
-    a_az = px(np.array([90, 70, 60]), np.array([130,255,255]))
+    a_vm = px(np.array([0,  80, 70]), np.array([12, 255, 255])) + \
+           px(np.array([170, 80, 70]), np.array([180, 255, 255]))
+    a_az = px(np.array([90, 70, 60]), np.array([130, 255, 255]))
 
     gray_c = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    _, thr  = cv2.threshold(gray_c, 0, 255,
-                            cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    cnts, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL,
-                               cv2.CHAIN_APPROX_SIMPLE)
+    _, thr  = cv2.threshold(gray_c, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    cnts, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     lados = 4
     if cnts:
-        c = max(cnts, key=cv2.contourArea)
+        c  = max(cnts, key=cv2.contourArea)
         ap = cv2.approxPolyDP(c, 0.04 * cv2.arcLength(c, True), True)
         lados = len(ap)
 
@@ -562,15 +721,10 @@ def _fallback_cor_forma(crop, bbox):
 
 
 def detectar_placa_frame(frame):
-    """
-    Tenta IA (TFLite) primeiro; se não disponível, usa cor+forma.
-    Retorna (label_str_ou_None, conf, bbox_ou_None)
-    """
-    boxes   = _localizar_candidatas(frame)
+    boxes = _localizar_candidatas(frame)
     if not boxes:
         return None, 0.0, None
 
-    # Melhor candidata = maior área
     bbox = max(boxes, key=lambda b: b[2] * b[3])
     x, y, ww, hh = bbox
     crop = frame[y:y + hh, x:x + ww]
@@ -590,44 +744,33 @@ def detectar_placa_frame(frame):
 
 
 # ================================================================
-#  [11] SISTEMA DE CONFIRMAÇÃO DE PLACA
-#  Exige N frames consecutivos com a mesma classe antes de aceitar
+#  [14] CONFIRMAÇÃO DE PLACA
 # ================================================================
 
 def confirmar_placa(label, conf, min_frames=3):
-    """
-    Retorna o label confirmado ou None.
-    Evita aceitar detecções únicas (ruído, reflexo).
-    """
     if not label:
         _mem_ai["ultima"] = None
         _mem_ai["cnt"]    = 0
         return None
-
     if NAV["cooldown_placa"] > 0:
         return None
-
     if _mem_ai["ultima"] == label:
         _mem_ai["cnt"]  += 1
         _mem_ai["conf"]  = conf
     else:
         _mem_ai["ultima"] = label
         _mem_ai["cnt"]    = 1
-
     if _mem_ai["cnt"] >= min_frames:
-        _mem_ai["cnt"] = 0   # reset para não confirmar em loop
+        _mem_ai["cnt"] = 0
         return label
     return None
 
 
 # ================================================================
-#  [12] SISTEMA DE ROTA MULTI-PONTO
-#  O carro percorre ROTA_PONTOS na ordem. Cada ação é confirmada
-#  por placa + marcador no chão antes de executar.
+#  [15] ROTA MULTI-PONTO
 # ================================================================
 
 def proxima_acao_rota():
-    """Retorna a próxima ação esperada na rota, ou None se completa."""
     idx = NAV["rota_idx"]
     if NAV["missao_completa"] or idx >= len(NAV["rota"]):
         return None
@@ -635,54 +778,42 @@ def proxima_acao_rota():
 
 
 def avancar_rota():
-    """Avança para o próximo ponto da rota."""
     NAV["rota_idx"] += 1
     if NAV["rota_idx"] >= len(NAV["rota"]):
         NAV["missao_completa"] = True
         print("[ROTA] Missão completa!", flush=True)
     else:
-        print(f"[ROTA] Próxima ação: {NAV['rota'][NAV['rota_idx']]}", flush=True)
+        print(f"[ROTA] Próxima: {NAV['rota'][NAV['rota_idx']]}", flush=True)
 
 
 def registrar_placa(label_confirmado):
-    """
-    Registra ação pendente se o label bate com a próxima da rota.
-    Se ROTA_PONTOS estiver vazia, aceita qualquer placa.
-    """
     if not label_confirmado:
         return
-
     proxima = proxima_acao_rota()
-
-    # Sem rota definida: aceita qualquer placa detectada
-    if proxima is None and not NAV["rota"]:
-        NAV["acao_pendente"] = label_confirmado
-        NAV["cooldown_placa"] = 20
-        return
-
-    # Com rota: só aceita se bate com a esperada
     mapa = {
         "stop": "STOP", "yield": "YIELD",
         "left": "LEFT", "right": "RIGHT",
         "straight": "STRAIGHT", "delivery": "DELIVERY",
-        # fallback direto (maiúsculo)
         "STOP": "STOP", "LEFT": "LEFT", "RIGHT": "RIGHT",
         "STRAIGHT": "STRAIGHT", "DELIVERY": "DELIVERY",
     }
     acao = mapa.get(label_confirmado)
+    if not proxima:
+        if acao:
+            NAV["acao_pendente"]  = acao
+            NAV["cooldown_placa"] = 20
+        return
     if acao and acao == proxima:
-        NAV["acao_pendente"] = acao
+        NAV["acao_pendente"]  = acao
         NAV["cooldown_placa"] = 20
         print(f"[PLACA] Confirmada: {acao}", flush=True)
 
 
 def disparar_no_marcador(marcador_ok):
-    """Inicia manobra quando marcador no chão é detectado."""
     if NAV["cooldown_marcador"] > 0 or not marcador_ok:
         return
     if NAV["acao_pendente"] is None:
         return
-
     acao = NAV["acao_pendente"]
     NAV["t_inicio"]          = time.monotonic()
     NAV["cooldown_marcador"] = 25
@@ -691,15 +822,26 @@ def disparar_no_marcador(marcador_ok):
     print(f"[NAV] Executando: {acao}", flush=True)
 
 
+def atualizar_cooldowns():
+    if NAV["cooldown_placa"]    > 0: NAV["cooldown_placa"]    -= 1
+    if NAV["cooldown_marcador"] > 0: NAV["cooldown_marcador"] -= 1
+
+
 # ================================================================
-#  [13] CONTROLE DE MANOBRAS (máquina de estados temporizada)
+#  [16] CONVERSÃO SERVO
+# ================================================================
+
+def servo_to_254(valor, in_min=-40, in_max=40):
+    valor  = float(np.clip(valor, in_min, in_max))
+    escala = (valor - in_min) / (in_max - in_min)
+    return int(round(escala * 254))
+
+
+# ================================================================
+#  [17] MÁQUINA DE ESTADOS (MANOBRAS)
 # ================================================================
 
 def controle_modo():
-    """
-    Executa a manobra ativa.
-    Retorna True se assumiu o controle (não seguir pista).
-    """
     agora = time.monotonic()
     dt    = agora - NAV["t_inicio"]
     modo  = NAV["modo"]
@@ -711,151 +853,192 @@ def controle_modo():
         NAV["modo"] = "SEGUIR_PISTA"
         avancar_rota()
 
-    # ── STOP: para 2s ──────────────────────────────────────────
     if modo == "EXEC_STOP":
-        CMD.update({"mot": 0, "srv": servo_to_254(0), "buz": 0, "led": 1, "brk": 1})
+        CMD.update({"mot": 0, "srv": servo_to_254(0), "buz": 0, "led": 1, "brk": 1, "spd": 0})
         if dt > 2.0:
-            CMD["led"] = 0
-            CMD["brk"] = 0
+            CMD.update({"led": 0, "brk": 0})
             _voltar()
         return True
 
-    # ── YIELD: devagar 1s ──────────────────────────────────────
     if modo == "EXEC_YIELD":
-        CMD.update({"mot": VEL["devagar"], "srv": servo_to_254(0), "buz": 0, "led": 0, "brk": 0})
+        CMD.update({"mot": VEL["devagar"], "srv": servo_to_254(0),
+                    "buz": 0, "led": 0, "brk": 0, "spd": 1})
         if dt > 1.0:
             _voltar()
         return True
 
-    # ── LEFT: 3 fases ──────────────────────────────────────────
     if modo == "EXEC_LEFT":
-        if dt < 0.35:
-            CMD.update({"mot": 40, "srv": servo_to_254(0),   "dir": 1})
-        elif dt < 1.15:
-            CMD.update({"mot": 38, "srv": servo_to_254(-32), "dir": 1})
-        elif dt < 1.45:
-            CMD.update({"mot": 35, "srv": servo_to_254(0),   "dir": 1})
-        else:
-            CMD["dir"] = 0
-            _voltar()
-        CMD.update({"buz": 0, "led": 0, "brk": 0})
+        if   dt < 0.35: CMD.update({"mot": 40, "srv": servo_to_254(0),   "dir": 1})
+        elif dt < 1.15: CMD.update({"mot": 38, "srv": servo_to_254(-32), "dir": 1})
+        elif dt < 1.45: CMD.update({"mot": 35, "srv": servo_to_254(0),   "dir": 1})
+        else:           CMD["dir"] = 0; _voltar()
+        CMD.update({"buz": 0, "led": 0, "brk": 0, "spd": 1})
         return True
 
-    # ── RIGHT: 3 fases ─────────────────────────────────────────
     if modo == "EXEC_RIGHT":
-        if dt < 0.35:
-            CMD.update({"mot": 40, "srv": servo_to_254(0),   "dir": 2})
-        elif dt < 1.15:
-            CMD.update({"mot": 38, "srv":servo_to_254(-32),  "dir": 2})
-        elif dt < 1.45:
-            CMD.update({"mot": 35, "srv": servo_to_254(0),   "dir": 2})
-        else:
-            CMD["dir"] = 0
-            _voltar()
-        CMD.update({"buz": 0, "led": 0, "brk": 0})
+        if   dt < 0.35: CMD.update({"mot": 40, "srv": servo_to_254(0),   "dir": 2})
+        elif dt < 1.15: CMD.update({"mot": 38, "srv": servo_to_254(32),  "dir": 2})
+        elif dt < 1.45: CMD.update({"mot": 35, "srv": servo_to_254(0),   "dir": 2})
+        else:           CMD["dir"] = 0; _voltar()
+        CMD.update({"buz": 0, "led": 0, "brk": 0, "spd": 1})
         return True
 
-    # ── STRAIGHT: vai reto 0.9s ────────────────────────────────
     if modo == "EXEC_STRAIGHT":
-        CMD.update({"mot": 45, "srv": servo_to_254(0), "buz": 0, "led": 0,
-                    "brk": 0, "dir": 3})
+        CMD.update({"mot": 45, "srv": servo_to_254(0),
+                    "buz": 0, "led": 0, "brk": 0, "dir": 3, "spd": 2})
         if dt > 0.9:
             CMD["dir"] = 0
             _voltar()
         return True
 
-    # ── DELIVERY: para 3s, buzina + LED ────────────────────────
     if modo == "EXEC_DELIVERY":
-        CMD.update({"mot": 0, "srv": servo_to_254(0), "buz": 1, "led": 1, "brk": 1})
+        CMD.update({"mot": 0, "srv": servo_to_254(0),
+                    "buz": 1, "led": 1, "brk": 1, "spd": 0})
         if dt > 3.0:
             CMD.update({"buz": 0, "led": 0, "brk": 0})
             _voltar()
         return True
 
-    # Modo desconhecido: volta ao normal
     NAV["modo"] = "SEGUIR_PISTA"
     return False
 
 
-def atualizar_cooldowns():
-    if NAV["cooldown_placa"]    > 0: NAV["cooldown_placa"]    -= 1
-    if NAV["cooldown_marcador"] > 0: NAV["cooldown_marcador"] -= 1
-
-
 # ================================================================
-# [17] FUNÇÃO DE CONVERSÃO
-# ================================================================
-def servo_to_254(valor, in_min=-40, in_max=40):
-    """
-    Converte direção de servo da faixa -40..+40 para 0..254.
-    Centro ~= 127.
-    """
-    valor = float(np.clip(valor, in_min, in_max))
-    escala = (valor - in_min) / (in_max - in_min)
-    return int(round(escala * 254))
-# ================================================================
-#  [14] DECISÃO PRINCIPAL
+#  [18] DECISÃO PRINCIPAL (PID)
 # ================================================================
 
 def decidir(pista_ok, erro):
-    """Seguimento de pista via PID."""
     if pista_ok:
-        ang = int(np.clip(pid_calc(erro) * 40, -40, 40))
+        # Compensação assimétrica: se só um lado visível, reduz velocidade
+        vel = VEL["normal"]
+        if _pista["x_esq"] is None or _pista["x_dir"] is None:
+            vel = int(VEL["normal"] * 0.85)   # um lado ausente → mais devagar
+
+        ang     = int(np.clip(pid_calc(erro) * 40, -40, 40))
         srv_254 = servo_to_254(ang)
-
-        CMD.update({"mot": VEL["normal"], "srv": srv_254,   
-                    "buz": 0, "led": 0, "brk": 0, 
-                    "spd": 2, "dir": 0})
+        CMD.update({"mot": vel, "srv": srv_254,
+                    "buz": 0, "led": 0, "brk": 0, "spd": 2, "dir": 0})
     else:
-        CMD.update({"mot": VEL["parado"], "srv": 0,
-                    "buz": 0, "led": 1, "brk": 1,
-                    "spd": 0, "dir": 0})
+        CMD.update({"mot": VEL["parado"], "srv": servo_to_254(0),
+                    "buz": 0, "led": 1, "brk": 1, "spd": 0, "dir": 0})
 
 
 # ================================================================
-#  [15] DEBUG VISUAL (leve — sem hconcat no loop crítico)
+#  [19] DEBUG VISUAL
+#  4 painéis: Frame original | ROI Pista | ROI Placas | Status
 # ================================================================
 
-def desenhar_debug(frame, gray, pista_vis, placa_vis,
-                   bbox_ia, label_ia, conf_ia, fps):
-    """
-    Console concatenado: [GRAY | PISTA TRATADA | PLACA TRATADA]
-    Uma única janela — mostra os três painéis lado a lado.
-    Overlay de status no painel esquerdo (gray).
-    """
-    # ── Painel 1: escala de cinza com status ──────────────────────
-    p1 = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+def _make_status_panel(w, h, fps):
+    """Painel de telemetria (4º painel)."""
+    p = np.zeros((h, w, 3), dtype=np.uint8)
+    cv2.rectangle(p, (0, 0), (w - 1, h - 1), (40, 40, 40), 1)
 
-    cor = (0, 220, 50) if _pista["ok"] else (0, 40, 255)
-    cv2.putText(p1, f"mot:{CMD['mot']} srv:{CMD['srv']:+d} err:{_pista['erro']:+.2f} fps:{fps}",
-                (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.40, cor, 1)
-    cv2.putText(p1, f"modo:{NAV['modo']}",
-                (4, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 220, 0), 1)
-    cv2.putText(p1, f"placa:{label_ia or '-'} {conf_ia:.2f}",
-                (4, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 255), 1)
+    def txt(texto, linha, cor=(200, 200, 200), escala=0.38):
+        cv2.putText(p, texto, (6, 16 + linha * 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, escala, cor, 1)
 
-    # Bounding box da placa no painel gray
-    if bbox_ia:
-        x, y, bw, bh = bbox_ia
-        cv2.rectangle(p1, (x, y), (x + bw, y + bh), (0, 220, 180), 1)
+    cor_pista = (0, 255, 80) if _pista["ok"] else (0, 50, 255)
+    txt(f"FPS: {fps}", 0, (255, 255, 255), 0.42)
+    txt(f"MODO: {NAV['modo']}", 1, (255, 220, 50), 0.42)
+    txt("─── PISTA ───", 3, (120, 120, 120))
+    txt(f"ok: {'SIM' if _pista['ok'] else 'NAO'}", 4, cor_pista)
+    txt(f"erro: {_pista['erro']:+.3f}", 5)
+    txt(f"centro: {_pista['centro']}px", 6)
+    txt(f"x_esq: {_pista['x_esq'] or '-'}", 7, (255, 220, 0))
+    txt(f"x_dir:  {_pista['x_dir']  or '-'}", 8, (0, 220, 255))
+    txt(f"ang_e: {_pista['ang_esq']:+.1f}°", 9, (255, 200, 0))
+    txt(f"ang_d: {_pista['ang_dir']:+.1f}°",10, (0, 200, 255))
+    txt(f"cantos_pista: {_pista['cantos_pista']}",11)
+    txt("─── PLACA ───", 13, (120, 120, 120))
+    txt(f"label: {_placa['label'] or '-'}", 14, (0, 220, 180))
+    txt(f"conf:  {_placa['conf']:.2f}", 15)
+    txt(f"cantos: {_placa['cantos']}", 16)
+    txt("─── CMD ───", 18, (120, 120, 120))
+    txt(f"mot: {CMD['mot']}%", 19)
+    txt(f"srv: {CMD['srv']} ({CMD['srv']-127:+d})", 20)
+    txt(f"err: {CMD['err']:+d}", 21)
+    txt(f"brk: {CMD['brk']}  led: {CMD['led']}", 22)
+    txt(f"buz: {CMD['buz']}  dir: {CMD['dir']}", 23)
 
-    # ── Painel 2: pista tratada (já é BGR) ────────────────────────
+    # Barra de erro lateral
+    bw  = w - 12
+    cx  = w // 2
+    by  = h - 30
+    cv2.rectangle(p, (6, by), (w - 6, by + 14), (60, 60, 60), -1)
+    err_px = int(_pista["erro"] * bw / 2)
+    x0 = cx; x1 = cx + err_px
+    cor_bar = (0, 180, 255) if err_px >= 0 else (255, 80, 0)
+    cv2.rectangle(p, (min(x0, x1), by + 2), (max(x0, x1), by + 12), cor_bar, -1)
+    cv2.line(p, (cx, by), (cx, by + 14), (200, 200, 200), 1)
+    cv2.putText(p, "ERRO LATERAL", (6, by - 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.30, (160, 160, 160), 1)
+
+    # Rota
+    txt("─── ROTA ───", 25, (120, 120, 120))
+    for i, r in enumerate(NAV["rota"]):
+        ativo = (i == NAV["rota_idx"])
+        cor_r = (0, 255, 140) if ativo else (100, 100, 100)
+        prefixo = "▶ " if ativo else "  "
+        txt(f"{prefixo}{i+1}. {r}", 26 + i, cor_r)
+
+    return p
+
+
+def desenhar_debug(frame, pista_vis, placa_vis, fps):
+    h, w = frame.shape[:2]
+
+    # Painel 1: frame original com overlay
+    p1 = frame.copy()
+    cor_ov = (0, 220, 50) if _pista["ok"] else (0, 40, 255)
+    cv2.putText(p1, f"mot:{CMD['mot']} srv:{CMD['srv']} err:{_pista['erro']:+.2f}",
+                (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.40, cor_ov, 1)
+
+    # BBox placa no frame original
+    if _placa["bbox"]:
+        x, y, bw, bh = _placa["bbox"]
+        cv2.rectangle(p1, (x, y), (x + bw, y + bh), (0, 220, 180), 2)
+        cv2.putText(p1, f"{_placa['label']} {_placa['conf']:.2f}",
+                    (x, max(0, y - 5)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 220, 180), 1)
+
+    # Linhas de ROI no frame original
+    cv2.line(p1, (0, int(h * ROI_PLACA_Y0)), (w, int(h * ROI_PLACA_Y0)), (0, 100, 255), 1)
+    cv2.line(p1, (0, int(h * ROI_PLACA_Y1)), (w, int(h * ROI_PLACA_Y1)), (0, 100, 255), 1)
+    cv2.line(p1, (0, int(h * ROI_PISTA_Y0)), (w, int(h * ROI_PISTA_Y0)), (0, 255, 100), 1)
+    cv2.putText(p1, "ROI placa", (4, int(h * ROI_PLACA_Y0) + 12),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.32, (0, 120, 255), 1)
+    cv2.putText(p1, "ROI pista", (4, int(h * ROI_PISTA_Y0) + 12),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.32, (0, 255, 120), 1)
+
+    # Painel 2: ROI pista
     p2 = pista_vis if pista_vis is not None else np.zeros_like(p1)
-    cv2.putText(p2, "PISTA", (4, 14),
+    cv2.putText(p2, "ROI PISTA", (4, 14),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 80), 1)
 
-    # ── Painel 3: placa tratada (já é BGR) ────────────────────────
+    # Painel 3: ROI placas
     p3 = placa_vis if placa_vis is not None else np.zeros_like(p1)
-    cv2.putText(p3, "PLACAS", (4, 14),
+    cv2.putText(p3, "ROI PLACAS", (4, 14),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 140, 255), 1)
 
-    # ── Concat horizontal dos 3 painéis ──────────────────────────
-    console = cv2.hconcat([p1, p2, p3])
-    cv2.imshow("Carro Autonomo", console)
+    # Painel 4: telemetria
+    p4 = _make_status_panel(w, h, fps)
+
+    # Concat 2×2
+    row1 = np.hstack([p1, p2])
+    row2 = np.hstack([p3, p4])
+    console = np.vstack([row1, row2])
+
+    # Resize para caber na tela (máx 1280px de largura)
+    if console.shape[1] > 1280:
+        scale  = 1280 / console.shape[1]
+        nh     = int(console.shape[0] * scale)
+        console = cv2.resize(console, (1280, nh), interpolation=cv2.INTER_NEAREST)
+
+    cv2.imshow("Carro Autonomo — Sprint 1", console)
 
 
 # ================================================================
-#  [16] LOOP PRINCIPAL
+#  [20] LOOP PRINCIPAL
 # ================================================================
 
 def main(usar_camera=False):
@@ -864,22 +1047,15 @@ def main(usar_camera=False):
     cap = abrir_fonte(usar_camera)
     ser = conectar_serial()
 
-    # Inicia threads de captura e serial
     t_cap = threading.Thread(target=thread_captura, args=(cap,), daemon=True)
-    t_ser = threading.Thread(target=thread_serial,  args=(ser,), daemon=True)
     t_cap.start()
-    t_ser.start()
 
     fps_timer = time.monotonic()
     fps_cnt   = 0
     fps       = 0
 
-    label_ia  = None
-    conf_ia   = 0.0
-    bbox_ia   = None
     pista_vis = None
     placa_vis = None
-    marc_vis  = None
 
     print("[OK] Rodando — Q para encerrar\n", flush=True)
 
@@ -892,41 +1068,37 @@ def main(usar_camera=False):
         frame_id += 1
         atualizar_cooldowns()
 
-        # ── Redimensionar ────────────────────────────────────────
+        # Redimensionar
         h = round(frame_big.shape[0] / PROP)
         w = round(frame_big.shape[1] / PROP)
         frame = cv2.resize(frame_big, (w, h), interpolation=cv2.INTER_LINEAR)
 
-        # ── Pista ────────────────────────────────────────────────
-        gray, pista_vis, erro, pista_ok, centro = processar_pista(frame)
+        # ── Pipeline Pista (análise bilateral) ───────────────────
+        gray_full, pista_vis, erro, pista_ok, centro = processar_pista(frame)
 
-        # ── ROI de Placas (tratamento visual) ────────────────────
-        placa_vis = processar_placa_roi(frame, gray)
+        # ── Pipeline ROI Placas ───────────────────────────────────
+        placa_vis = processar_placa_roi(frame, gray_full)
 
         # ── Marcador no chão (a cada 2 frames) ───────────────────
         if frame_id % 2 == 0:
-            marcador_ok, marc_vis = detectar_marcador_chao(frame)
+            marcador_ok, _ = detectar_marcador_chao(frame)
         else:
             marcador_ok = False
 
         # ── IA de placas (a cada IA_EVERY frames) ────────────────
         if frame_id % IA_EVERY == 0 and NAV["cooldown_placa"] == 0:
-            raw_label, conf_ia, bbox_ia = detectar_placa_frame(frame)
-            confirmado = confirmar_placa(raw_label, conf_ia)
+            raw_label, conf, bbox = detectar_placa_frame(frame)
+            confirmado = confirmar_placa(raw_label, conf)
             registrar_placa(confirmado)
-            if confirmado:
-                label_ia = confirmado
-            elif raw_label:
-                label_ia = f"({raw_label})"   # em confirmação
-            else:
-                label_ia = None
+            _placa["label"] = confirmado or (f"({raw_label})" if raw_label else None)
+            _placa["conf"]  = conf
+            _placa["bbox"]  = bbox
 
-        # ── Disparo de manobra no marcador ───────────────────────
+        # ── Disparo no marcador ───────────────────────────────────
         disparar_no_marcador(marcador_ok)
 
         # ── Decisão ──────────────────────────────────────────────
-        ocupado = controle_modo()
-        if not ocupado:
+        if not controle_modo():
             decidir(pista_ok, erro)
 
         # ── Envio serial ─────────────────────────────────────────
@@ -940,17 +1112,15 @@ def main(usar_camera=False):
             fps_timer = time.monotonic()
 
         # ── Debug ────────────────────────────────────────────────
-        desenhar_debug(frame, gray, pista_vis, placa_vis,
-                       bbox_ia, label_ia, conf_ia, fps)
+        desenhar_debug(frame, pista_vis, placa_vis, fps)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
     # Encerramento seguro
     _stop_flag.set()
-    CMD.update({"mot": 0, "srv": 0, "buz": 0, "led": 0, "brk": 1})
+    CMD.update({"mot": 0, "srv": 127, "buz": 0, "led": 0, "brk": 1})
     enviar(ser)
-    t_ser.join(timeout=1.0)
     if ser: ser.close()
     cap.release()
     cv2.destroyAllWindows()
@@ -971,52 +1141,48 @@ def calibrar():
     win = "Calibrar HSV — S=salvar Q=sair"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win, 900, 520)
-    for n, v in [("H_min",0),("S_min",0),("V_min",160),
-                 ("H_max",180),("S_max",50),("V_max",255)]:
+    for n, v in [("H_min", 0), ("S_min", 0), ("V_min", 160),
+                 ("H_max", 180), ("S_max", 50), ("V_max", 255)]:
         cv2.createTrackbar(n, win, v, 180 if "H" in n else 255, lambda x: None)
 
-    print("[CAL] Aponte para a pista. S=salvar Q=sair")
+    print("[CAL] S=salvar Q=sair")
     while True:
         ret, f = cap.read()
         if not ret: break
-        h0 = round(f.shape[0] / PROP)
-        w0 = round(f.shape[1] / PROP)
-        f  = cv2.resize(f, (w0, h0))
+        f   = cv2.resize(f, (f.shape[1] // PROP, f.shape[0] // PROP))
         hsv = cv2.cvtColor(f, cv2.COLOR_BGR2HSV)
-        lo  = np.array([cv2.getTrackbarPos(n, win)
-                        for n in ("H_min","S_min","V_min")])
-        hi  = np.array([cv2.getTrackbarPos(n, win)
-                        for n in ("H_max","S_max","V_max")])
+        lo  = np.array([cv2.getTrackbarPos(n, win) for n in ("H_min", "S_min", "V_min")])
+        hi  = np.array([cv2.getTrackbarPos(n, win) for n in ("H_max", "S_max", "V_max")])
         mask   = cv2.inRange(hsv, lo, hi)
         result = cv2.bitwise_and(f, f, mask=mask)
         cv2.putText(result, f"lo={lo.tolist()} hi={hi.tolist()}",
-                    (6, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,180), 1)
+                    (6, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 180), 1)
         cv2.imshow(win, np.hstack([f, result]))
         k = cv2.waitKey(1) & 0xFF
         if k == ord('s'):
-            print(f"[CAL] branco: lo={lo.tolist()}, hi={hi.tolist()}")
-            print("[CAL] Cole esses valores em THRESH_PISTA ou HSV_PISTA no código")
+            print(f"[CAL] lo={lo.tolist()}, hi={hi.tolist()}")
         elif k == ord('q'):
             break
     cap.release(); cv2.destroyAllWindows()
 
 
 # ================================================================
-#  MODO ROTA (exibição e configuração)
+#  MODO ROTA
 # ================================================================
 
 def mostrar_rota():
     print("\n[ROTA] Rota configurada:")
     for i, acao in enumerate(ROTA_PONTOS):
-        print(f"  {i+1}. {acao}")
+        marcador = " ◀ PRÓXIMA" if i == NAV["rota_idx"] else ""
+        print(f"  {i+1}. {acao}{marcador}")
     print(f"\n  Total: {len(ROTA_PONTOS)} pontos")
-    print("  Para alterar: edite ROTA_PONTOS no topo do arquivo\n")
+    print("  Edite ROTA_PONTOS no topo do arquivo para alterar.\n")
 
 
 # ================================================================
 if __name__ == "__main__":
     arg = sys.argv[1] if len(sys.argv) > 1 else ""
-    if   arg == "--cam":   main(usar_camera=True)
-    elif arg == "--cal":   calibrar()
-    elif arg == "--rota":  mostrar_rota()
-    else:                  main(usar_camera=False)
+    if   arg == "--cam":  main(usar_camera=True)
+    elif arg == "--cal":  calibrar()
+    elif arg == "--rota": mostrar_rota()
+    else:                 main(usar_camera=False)
