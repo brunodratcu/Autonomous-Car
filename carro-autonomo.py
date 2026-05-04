@@ -50,7 +50,7 @@ except ImportError:
 # ================================================================
 
 PROP      = 2          # divisor de resolução (2 = metade)
-VIDEO     = "./pista_01.mov"
+VIDEO     = "videoplayback.mp4"
 CAM_IDX   = 0
 
 SERIAL_PORT = "COM3"
