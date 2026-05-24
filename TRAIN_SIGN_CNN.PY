@@ -1,44 +1,38 @@
 """
 ================================================================
-  TREINAR CNN DE PLACAS — SPRINT 2
+  TREINAR CNN DE PLACAS — TENSORFLOW / KERAS
   ─────────────────────────────────────────────────────────────
-  Treina uma CNN leve para classificar placas de trânsito.
+  Aceita duas fontes de dados:
+    --dataset ./dataset_tratado   ← pasta extraída (recomendado)
+    --zip ./arquivo.zip           ← zip direto do Roboflow
 
-  ESTRUTURA DO DATASET (crie antes de treinar):
-    dataset/
-      STOP/        → fotos da placa STOP
-      LEFT/        → fotos da placa VIRE À ESQUERDA
-      RIGHT/       → fotos da placa VIRE À DIREITA
-      STRAIGHT/    → fotos da placa SIGA EM FRENTE
-      DELIVERY/    → fotos da placa ENTREGA
-      YIELD/       → fotos da placa DÊ PREFERÊNCIA
-
-  RECOMENDADO: 150–300 imagens por classe
-  Formatos aceitos: .jpg .jpeg .png .bmp
-
-  INSTALAÇÃO:
-    pip install tensorflow opencv-python numpy scikit-learn
+  Estrutura esperada da pasta:
+    dataset_tratado/
+      train/
+        Stop/        ← imagens .jpg
+        Pedestrian/
+        Speed_Limit_40/
+        ... (uma pasta por classe)
+      valid/
+        Stop/
+        ...
+      test/          ← opcional
+        Stop/
+        ...
 
   USO:
-    python TRAIN_SIGN_CNN.py                  ← treina com defaults
-    python TRAIN_SIGN_CNN.py --epochs 60      ← mais épocas
-    python TRAIN_SIGN_CNN.py --dataset ./meu_dataset
-
-  SAÍDA:
-    sign_model.tflite   ← modelo leve para inferência no carro
-    sign_labels.txt     ← uma classe por linha
-    training_report.png ← curvas de loss e accuracy
+    python TRAIN_SIGN_CNN.py --dataset ./dataset_tratado
+    python TRAIN_SIGN_CNN.py --dataset ./dataset_tratado --epochs 80
+    python TRAIN_SIGN_CNN.py --dataset ./dataset_tratado --img 96
+    python TRAIN_SIGN_CNN.py --test ./foto_placa.jpg
 ================================================================
 """
 
-import os
-import sys
-import argparse
-import numpy as np
-import cv2
+import os, sys, argparse, csv, io, zipfile, glob
+import cv2, numpy as np
 
-# ── Silencia logs TF antes do import ──────────────────────────────
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"   # silencia warnings oneDNN
 
 try:
     import tensorflow as tf
@@ -46,210 +40,330 @@ try:
     from tensorflow.keras import layers, callbacks
     from sklearn.model_selection import train_test_split
     from sklearn.utils.class_weight import compute_class_weight
-    TF_OK = True
 except ImportError:
-    TF_OK = False
-    print("[ERRO] TensorFlow não encontrado.")
-    print("       pip install tensorflow scikit-learn")
+    print("Execute: pip install tensorflow scikit-learn")
     sys.exit(1)
 
-# ================================================================
 #  CONFIGURAÇÃO
-# ================================================================
+DATASET_DIR = "./dataset_tratado"   # pasta padrão
+MODEL_PATH  = "./sign_model.tflite"
+LABELS_PATH = "./sign_labels.txt"
+KERAS_PATH  = "./sign_model.keras"
+REPORT_PATH = "./training_report.png"
 
-IMG_SIZE   = 96          # pixels (96×96)
-BATCH_SIZE = 32
-EPOCHS     = 50
-LR         = 1e-3
-VAL_SPLIT  = 0.20
-SEED       = 42
+IMG_SIZE    = 96
+BATCH_SIZE  = 32
+EPOCHS      = 80
+LR          = 8e-4
+SEED        = 42
 
-DATASET_DIR  = "./dataset"
-MODEL_PATH   = "./sign_model.tflite"
-LABELS_PATH  = "./sign_labels.txt"
-REPORT_PATH  = "./training_report.png"
-KERAS_PATH   = "./sign_model.keras"   # salvo antes da conversão
+# ── Mapeamento classe → comando serial ───────────────────────────
+CLASS_TO_CMD = {
+    "Stop":            "S",
+    "Pedestrian":      "Y",
+    "Speed_Limit_40":  "W",
+    "Speed_Limit_90":  "F",
+    "Speed_Limit_120": "U",
+    "No_U-Turn":       "N",
+    "No_Stopping":     "K",
+    "No_Parking":      "P",
+    "Bump":            "B",
+    "Road_Work":       "W",
+}
 
-# ── Augmentação de dados ──────────────────────────────────────────
-AUG_BRIGHTNESS = 0.30   # ±30% brilho
-AUG_CONTRAST   = 0.25
-AUG_ROTATION   = 15     # graus
-AUG_ZOOM       = 0.15
+ESPERA_SINAL = {"S", "Y"}
 
 
-# ================================================================
-#  1. CARREGAR DATASET
-# ================================================================
-
-def carregar_dataset(dataset_dir):
+#  CARREGAR DE PASTA  (dataset_tratado já extraído)
+def carregar_de_pasta(dataset_dir: str, sz: int):
     """
-    Lê imagens de subpastas (uma por classe).
-    Retorna (X: float32 [0,1], y: int, classes: list[str])
+    Lê imagens de dataset_tratado/train/NomeClasse/*.jpg
+    As imagens já foram tratadas (CLAHE, bordas, sharp etc.)
+    Só faz resize para garantir tamanho uniforme.
     """
-    if not os.path.isdir(dataset_dir):
-        print(f"[ERRO] Dataset não encontrado: {dataset_dir}")
-        print("       Crie a estrutura: dataset/STOP/ dataset/LEFT/ ...")
+    print(f"\n[DATA] Lendo pasta: {dataset_dir}")
+
+    # Descobre classes presentes nas subpastas de train/
+    train_dir  = os.path.join(dataset_dir, "train")
+    if not os.path.isdir(train_dir):
+        print(f"[ERRO] Pasta não encontrada: {train_dir}")
+        print( "       Estrutura esperada: dataset_tratado/train/NomeClasse/*.jpg")
         sys.exit(1)
 
-    classes = sorted([
-        d for d in os.listdir(dataset_dir)
-        if os.path.isdir(os.path.join(dataset_dir, d))
+    classes_presentes = sorted([
+        d for d in os.listdir(train_dir)
+        if os.path.isdir(os.path.join(train_dir, d))
+        and d in CLASS_TO_CMD
     ])
 
-    if len(classes) < 2:
-        print(f"[ERRO] Precisa de ao menos 2 classes no dataset (encontrado: {classes})")
+    if not classes_presentes:
+        print(f"[ERRO] Nenhuma classe reconhecida em {train_dir}")
+        print(f"       Classes esperadas: {list(CLASS_TO_CMD.keys())}")
         sys.exit(1)
 
-    print(f"[DATA] Classes detectadas: {classes}")
+    # Monta lista de comandos únicos na ordem estável
+    cmds_unicos = sorted(set(CLASS_TO_CMD[c] for c in classes_presentes))
+    cmd_to_idx  = {c: i for i, c in enumerate(cmds_unicos)}
 
-    X, y = [], []
-    ext_validas = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    print(f"[DATA] Classes encontradas ({len(classes_presentes)}): {classes_presentes}")
+    print(f"[DATA] Comandos únicos ({len(cmds_unicos)}): {cmds_unicos}")
 
-    for idx, classe in enumerate(classes):
-        pasta = os.path.join(dataset_dir, classe)
-        arquivos = [
-            f for f in os.listdir(pasta)
-            if os.path.splitext(f)[1].lower() in ext_validas
-        ]
-        print(f"  [{idx}] {classe}: {len(arquivos)} imagens")
+    X_all, y_all = [], []
+    contagem     = {cls: 0 for cls in classes_presentes}
 
-        for fname in arquivos:
-            path = os.path.join(pasta, fname)
-            img  = cv2.imread(path)
-            if img is None:
+    for split in ["train", "valid", "test"]:
+        split_dir = os.path.join(dataset_dir, split)
+        if not os.path.isdir(split_dir):
+            continue
+
+        n_split = 0
+        for cls in classes_presentes:
+            cls_dir = os.path.join(split_dir, cls)
+            if not os.path.isdir(cls_dir):
                 continue
-            img = cv2.resize(img, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            X.append(img.astype(np.float32) / 255.0)
-            y.append(idx)
 
-    X = np.array(X, dtype=np.float32)
-    y = np.array(y, dtype=np.int32)
-    print(f"[DATA] Total: {len(X)} imagens  |  Shape: {X.shape}")
-    return X, y, classes
+            # Pega todos os .jpg e .png
+            arquivos = (
+                glob.glob(os.path.join(cls_dir, "*.jpg")) +
+                glob.glob(os.path.join(cls_dir, "*.png")) +
+                glob.glob(os.path.join(cls_dir, "*.jpeg"))
+            )
+
+            for caminho in arquivos:
+                img = cv2.imread(caminho)
+                if img is None:
+                    continue
+
+                # As imagens já foram tratadas — só garante tamanho
+                if img.shape[:2] != (sz, sz):
+                    img = cv2.resize(img, (sz, sz), interpolation=cv2.INTER_AREA)
+
+                # BGR → RGB, normaliza [0,1]
+                rgb    = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                tensor = rgb.astype(np.float32) / 255.0
+
+                X_all.append(tensor)
+                y_all.append(cmd_to_idx[CLASS_TO_CMD[cls]])
+                contagem[cls] += 1
+                n_split += 1
+
+        print(f"  [{split}] {n_split} imagens")
+
+    if not X_all:
+        print("[ERRO] Nenhuma imagem carregada.")
+        sys.exit(1)
+
+    X = np.array(X_all, np.float32)
+    y = np.array(y_all, np.int32)
+
+    print(f"\n[DATA] Total: {len(X)} imagens | {len(cmds_unicos)} comandos")
+    print(f"\n  {'Classe':<22} {'Cmd':>5}  {'Imagens':>8}  Tratamento")
+    print("  " + "-"*60)
+    tratamentos = {
+        "Stop":            "CLAHE forte + bordas + sharp",
+        "Pedestrian":      "Upscale CUBIC + denoise + CLAHE",
+        "Speed_Limit_40":  "CLAHE leve + normalização cor",
+        "Speed_Limit_90":  "CLAHE leve + normalização cor",
+        "Speed_Limit_120": "CLAHE leve + normalização cor",
+        "No_U-Turn":       "CLAHE forte + bordas + sharp",
+        "No_Stopping":     "CLAHE forte + bordas + sharp",
+        "No_Parking":      "CLAHE forte + bordas + sharp",
+        "Bump":            "CLAHE médio + sharp",
+        "Road_Work":       "CLAHE médio + sharp",
+    }
+    for cls in classes_presentes:
+        cmd = CLASS_TO_CMD[cls]
+        n   = contagem[cls]
+        trt = tratamentos.get(cls, "-")
+        print(f"  {cls:<22} '{cmd}'  {n:>8}   {trt}")
+
+    return X, y, cmds_unicos
 
 
-# ================================================================
-#  2. AUMENTAÇÃO (pipeline tf.data)
-# ================================================================
+#  CARREGAR DE ZIP  (compatibilidade com zip do Roboflow)
+def _preprocess_zip(crop_bgr, cls, sz):
+    """Pré-processamento inline para quando carrega direto do zip."""
+    def clahe(img, clip):
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        c   = cv2.createCLAHE(clipLimit=clip, tileGridSize=(4,4))
+        lab[:,:,0] = c.apply(lab[:,:,0])
+        return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+    def sharp(img):
+        b = cv2.GaussianBlur(img,(0,0),sigmaX=1.5)
+        return cv2.addWeighted(img,1.6,b,-0.6,0)
+    def normcor(img):
+        f  = img.astype(np.float32)
+        mx = f.max(axis=2,keepdims=True).clip(1)
+        return np.clip(f/mx*200,0,255).astype(np.uint8)
+    def edge(img):
+        g = cv2.Canny(cv2.cvtColor(img,cv2.COLOR_BGR2GRAY),40,120)
+        return cv2.addWeighted(img,.85,cv2.cvtColor(g,cv2.COLOR_GRAY2BGR),.20,0)
 
-def build_augmentation():
-    """Camada de data augmentation aplicada só no treino."""
-    return keras.Sequential([
+    if "Speed_Limit" in cls:
+        img = normcor(clahe(crop_bgr,1.5))
+        return cv2.resize(img,(sz,sz),interpolation=cv2.INTER_AREA)
+    elif cls in ("Stop","No_U-Turn","No_Stopping","No_Parking"):
+        img = sharp(edge(clahe(crop_bgr,3.0)))
+        return cv2.resize(img,(sz,sz),interpolation=cv2.INTER_AREA)
+    elif cls in ("Bump","Road_Work"):
+        return cv2.resize(sharp(clahe(crop_bgr,2.0)),(sz,sz),interpolation=cv2.INTER_AREA)
+    elif cls == "Pedestrian":
+        img = cv2.resize(crop_bgr,(sz,sz),interpolation=cv2.INTER_CUBIC)
+        img = cv2.fastNlMeansDenoisingColored(img,None,6,6,7,21)
+        return clahe(img,2.5)
+    return cv2.resize(clahe(crop_bgr,2.0),(sz,sz),interpolation=cv2.INTER_AREA)
+
+
+def carregar_de_zip(zip_path: str, sz: int):
+    print(f"\n[ZIP] Lendo: {zip_path}")
+    cmds_unicos = sorted(set(CLASS_TO_CMD.values()))
+    cmd_to_idx  = {c: i for i, c in enumerate(cmds_unicos)}
+    X_all, y_all = [], []
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        nomes = set(zf.namelist())
+        for split in ["train","valid","test"]:
+            csv_key = f"{split}/_annotations.csv"
+            if csv_key not in nomes:
+                continue
+            linhas = list(csv.DictReader(
+                io.StringIO(zf.read(csv_key).decode("utf-8"))
+            ))
+            ok = skip = 0
+            for row in linhas:
+                cls = row["class"].strip()
+                if cls in ("class","") or cls not in CLASS_TO_CMD:
+                    skip+=1; continue
+                img_key = f"{split}/{row['filename']}"
+                if img_key not in nomes:
+                    skip+=1; continue
+                arr = np.frombuffer(zf.read(img_key), np.uint8)
+                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if img is None:
+                    skip+=1; continue
+                H,W = img.shape[:2]
+                x1=max(0,int(row["xmin"])); y1=max(0,int(row["ymin"]))
+                x2=min(W,int(row["xmax"])); y2=min(H,int(row["ymax"]))
+                if x2<=x1 or y2<=y1:
+                    skip+=1; continue
+                crop   = img[y1:y2,x1:x2]
+                tensor = _preprocess_zip(crop,cls,sz)
+                rgb    = cv2.cvtColor(tensor,cv2.COLOR_BGR2RGB).astype(np.float32)/255.
+                X_all.append(rgb)
+                y_all.append(cmd_to_idx[CLASS_TO_CMD[cls]])
+                ok+=1
+            print(f"  [{split}] {ok} carregados ({skip} pulados)")
+
+    if not X_all:
+        print("[ERRO] Nenhum crop carregado."); sys.exit(1)
+
+    X = np.array(X_all, np.float32)
+    y = np.array(y_all, np.int32)
+    print(f"\n[DATA] Total: {len(X)} | Comandos: {cmds_unicos}")
+    return X, y, cmds_unicos
+
+
+#  ARQUITETURA CNN
+def construir_modelo(n_classes: int, sz: int) -> keras.Model:
+    inp = keras.Input(shape=(sz, sz, 3), name="imagem")
+    l2  = keras.regularizers.l2(1e-4)
+
+    # Augmentação — só ativa no treino
+    x = keras.Sequential([
         layers.RandomFlip("horizontal"),
-        layers.RandomRotation(AUG_ROTATION / 360.0),
-        layers.RandomZoom(AUG_ZOOM),
-        layers.RandomBrightness(AUG_BRIGHTNESS),
-        layers.RandomContrast(AUG_CONTRAST),
-    ], name="augmentation")
+        layers.RandomRotation(0.12),
+        layers.RandomZoom(0.15),
+        layers.RandomBrightness(0.30),
+        layers.RandomContrast(0.25),
+        layers.RandomTranslation(0.10, 0.10),
+    ], name="aug")(inp)
 
-
-# ================================================================
-#  3. ARQUITETURA CNN
-#  MobileNetV2-style com depthwise separable convolutions.
-#  ~800 K parâmetros → roda bem em CPU.
-# ================================================================
-
-def build_model(num_classes):
-    inp = keras.Input(shape=(IMG_SIZE, IMG_SIZE, 3), name="input")
-    aug = build_augmentation()(inp)   # só ativo no treino
-
-    # ── Bloco 1 ──────────────────────────────────────────────────
-    x = layers.Conv2D(32, 3, padding="same", use_bias=False)(aug)
+    # Bloco Conv inicial
+    x = layers.Conv2D(32, 3, padding="same", use_bias=False,
+                      kernel_regularizer=l2)(x)
     x = layers.BatchNormalization()(x)
-    x = layers.Activation("relu6")(x)
-    x = layers.MaxPooling2D(2)(x)       # 48×48
+    x = layers.ReLU(max_value=6.0)(x)
+    x = layers.MaxPooling2D(2)(x)
 
-    # ── Bloco 2: Depthwise Separable ─────────────────────────────
-    x = layers.DepthwiseConv2D(3, padding="same", use_bias=False)(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Activation("relu6")(x)
-    x = layers.Conv2D(64, 1, use_bias=False)(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Activation("relu6")(x)
-    x = layers.MaxPooling2D(2)(x)       # 24×24
+    # Blocos Depthwise Separable
+    for filtros, pool in [(64,True),(128,True),(256,True),(512,False)]:
+        x = layers.DepthwiseConv2D(3, padding="same", use_bias=False,
+                                   depthwise_regularizer=l2)(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.ReLU(max_value=6.0)(x)
+        x = layers.Conv2D(filtros, 1, use_bias=False,
+                          kernel_regularizer=l2)(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.ReLU(max_value=6.0)(x)
+        if pool:
+            x = layers.MaxPooling2D(2)(x)
 
-    # ── Bloco 3 ──────────────────────────────────────────────────
-    x = layers.DepthwiseConv2D(3, padding="same", use_bias=False)(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Activation("relu6")(x)
-    x = layers.Conv2D(128, 1, use_bias=False)(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Activation("relu6")(x)
-    x = layers.MaxPooling2D(2)(x)       # 12×12
+    x     = layers.GlobalAveragePooling2D()(x)
+    x     = layers.Dense(256, activation="relu", kernel_regularizer=l2)(x)
+    x     = layers.Dropout(0.45)(x)
+    x     = layers.Dense(128, activation="relu", kernel_regularizer=l2)(x)
+    x     = layers.Dropout(0.30)(x)
+    x     = layers.Dense(64,  activation="relu", kernel_regularizer=l2)(x)
+    x     = layers.Dropout(0.15)(x)
+    saida = layers.Dense(n_classes, activation="softmax", name="saida")(x)
 
-    # ── Bloco 4 ──────────────────────────────────────────────────
-    x = layers.DepthwiseConv2D(3, padding="same", use_bias=False)(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Activation("relu6")(x)
-    x = layers.Conv2D(256, 1, use_bias=False)(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Activation("relu6")(x)
-    x = layers.GlobalAveragePooling2D()(x)
-
-    # ── Classificador ────────────────────────────────────────────
-    x = layers.Dense(128, activation="relu")(x)
-    x = layers.Dropout(0.40)(x)
-    x = layers.Dense(64, activation="relu")(x)
-    x = layers.Dropout(0.20)(x)
-    out = layers.Dense(num_classes, activation="softmax", name="output")(x)
-
-    model = keras.Model(inputs=inp, outputs=out, name="SignCNN")
-    model.compile(
+    modelo = keras.Model(inp, saida, name="TrafficSign_CNN")
+    modelo.compile(
         optimizer=keras.optimizers.Adam(LR),
         loss="sparse_categorical_crossentropy",
         metrics=["accuracy"]
     )
-    return model
+    return modelo
 
 
-# ================================================================
-#  4. TREINO
-# ================================================================
+#  TREINO
+def treinar(source: str, epochs: int, sz: int):
+    print("=" * 60)
+    print("  CNN PLACAS — TENSORFLOW/KERAS")
+    print(f"  {source}")
+    print("=" * 60)
 
-def treinar(dataset_dir, epochs):
-    print("\n" + "=" * 56)
-    print("  TREINAMENTO CNN — CLASSIFICAÇÃO DE PLACAS")
-    print("=" * 56)
+    # Detecta se é pasta ou zip
+    if os.path.isdir(source):
+        X, y, cmds = carregar_de_pasta(source, sz)
+    elif os.path.isfile(source) and source.endswith(".zip"):
+        X, y, cmds = carregar_de_zip(source, sz)
+    else:
+        print(f"[ERRO] '{source}' não é uma pasta nem um .zip válido.")
+        print( "       Use --dataset ./dataset_tratado")
+        print( "       Ou  --zip ./traffic_signs_v3i_tensorflow.zip")
+        sys.exit(1)
 
-    # 4.1 Carregar dados
-    X, y, classes = carregar_dataset(dataset_dir)
-    num_classes = len(classes)
+    n = len(cmds)
 
-    # 4.2 Split treino/validação
-    X_tr, X_val, y_tr, y_val = train_test_split(
-        X, y, test_size=VAL_SPLIT, random_state=SEED, stratify=y
+    X_tr, X_v, y_tr, y_v = train_test_split(
+        X, y, test_size=0.18, stratify=y, random_state=SEED
     )
-    print(f"[SPLIT] Treino: {len(X_tr)}  |  Val: {len(X_val)}")
+    print(f"\n[SPLIT] Treino: {len(X_tr)}  |  Validação: {len(X_v)}")
 
-    # 4.3 Class weights (compensa desbalanceamento)
-    cw = compute_class_weight("balanced", classes=np.arange(num_classes), y=y_tr)
-    class_weight = dict(enumerate(cw))
-    print(f"[CW] {class_weight}")
+    pesos_vals = compute_class_weight(
+        "balanced", classes=np.arange(n), y=y_tr
+    )
+    pesos = dict(enumerate(pesos_vals))
+    print(f"[PESOS] { {cmds[k]: f'{v:.2f}' for k,v in pesos.items()} }")
 
-    # 4.4 tf.data pipeline
-    def make_ds(Xd, yd, shuffle=False):
-        ds = tf.data.Dataset.from_tensor_slices((Xd, yd))
-        if shuffle:
-            ds = ds.shuffle(buffer_size=len(Xd), seed=SEED)
-        return ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+    ds_tr = (tf.data.Dataset.from_tensor_slices((X_tr, y_tr))
+             .shuffle(len(X_tr), seed=SEED)
+             .batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE))
+    ds_v  = (tf.data.Dataset.from_tensor_slices((X_v, y_v))
+             .batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE))
 
-    ds_tr  = make_ds(X_tr, y_tr, shuffle=True)
-    ds_val = make_ds(X_val, y_val)
+    modelo = construir_modelo(n, sz)
+    modelo.summary()
 
-    # 4.5 Modelo
-    model = build_model(num_classes)
-    model.summary()
-
-    # 4.6 Callbacks
     cbs = [
         callbacks.EarlyStopping(
-            monitor="val_accuracy", patience=12,
+            monitor="val_accuracy", patience=18,
             restore_best_weights=True, verbose=1
         ),
         callbacks.ReduceLROnPlateau(
-            monitor="val_loss", factor=0.4, patience=6,
-            min_lr=1e-6, verbose=1
+            monitor="val_loss", factor=0.35,
+            patience=8, min_lr=5e-7, verbose=1
         ),
         callbacks.ModelCheckpoint(
             KERAS_PATH, monitor="val_accuracy",
@@ -257,158 +371,171 @@ def treinar(dataset_dir, epochs):
         ),
     ]
 
-    # 4.7 Treinar
-    print(f"\n[TRAIN] Iniciando — {epochs} épocas máx / batch {BATCH_SIZE}")
-    hist = model.fit(
-        ds_tr,
-        validation_data=ds_val,
-        epochs=epochs,
-        class_weight=class_weight,
-        callbacks=cbs,
-        verbose=1
+    print(f"\n[TREINO] {epochs} épocas | batch={BATCH_SIZE} | img={sz}×{sz}")
+    hist = modelo.fit(
+        ds_tr, validation_data=ds_v,
+        epochs=epochs, class_weight=pesos,
+        callbacks=cbs, verbose=1
     )
 
-    # 4.8 Relatório final
-    best_acc = max(hist.history["val_accuracy"])
-    print(f"\n[RESULT] Melhor val_accuracy: {best_acc:.4f} ({best_acc*100:.1f}%)")
+    best = max(hist.history["val_accuracy"])
+    print(f"\n[RESULTADO] Melhor acurácia de validação: {best*100:.1f}%")
 
-    # 4.9 Gráfico
-    _salvar_grafico(hist)
-
-    # 4.10 Converter para TFLite
-    converter = tf.lite.TFLiteConverter.from_keras_model(model)
-    converter.optimizations = [tf.lite.Optimize.DEFAULT]
-    tflite_model = converter.convert()
-    with open(MODEL_PATH, "wb") as f:
-        f.write(tflite_model)
-    print(f"[TFLITE] Salvo: {MODEL_PATH}  ({len(tflite_model)//1024} KB)")
-
-    # 4.11 Salvar labels
-    with open(LABELS_PATH, "w") as f:
-        f.write("\n".join(classes))
-    print(f"[LABELS] Salvo: {LABELS_PATH}")
-    print(f"[LABELS] Classes: {classes}")
-
-    print("\n[OK] Treinamento concluído!")
-    print(f"     Copie '{MODEL_PATH}' e '{LABELS_PATH}' para a pasta do carro.\n")
-
-    return model, classes
+    _grafico(hist, cmds)
+    _exportar(modelo, cmds)
 
 
-# ================================================================
-#  5. GRÁFICO DE TREINAMENTO
-# ================================================================
+#  EXPORT
+def _exportar(modelo, cmds):
+    print("\n[EXPORT] Convertendo para TFLite...")
+    conv = tf.lite.TFLiteConverter.from_keras_model(modelo)
+    conv.optimizations = [tf.lite.Optimize.DEFAULT]
+    conv.target_spec.supported_types = [tf.float16]
+    tfl = conv.convert()
+    with open(MODEL_PATH, "wb") as f: f.write(tfl)
+    with open(LABELS_PATH, "w")  as f: f.write("\n".join(cmds))
+    print(f"[OK] {MODEL_PATH}  ({len(tfl)//1024} KB)")
+    print(f"[OK] {LABELS_PATH} → {cmds}")
 
-def _salvar_grafico(hist):
+    rev = {}
+    for k, v in CLASS_TO_CMD.items():
+        rev.setdefault(v, []).append(k)
+    print("\n[MAPA] Comando → Classes:")
+    for cmd in sorted(rev):
+        esp = " ← aguarda sinal externo" if cmd in ESPERA_SINAL else ""
+        print(f"  '{cmd}'  {', '.join(rev[cmd])}{esp}")
+    print(f"\n  Copie {MODEL_PATH} e {LABELS_PATH} para a pasta do sign_detector_ai.py")
+
+
+#  GRÁFICO
+def _grafico(hist, cmds):
     try:
-        import matplotlib
-        matplotlib.use("Agg")
+        import matplotlib; matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-        fig.suptitle("CNN — Treinamento de Placas", fontsize=14, fontweight="bold")
+        fig, axes = plt.subplots(1, 2, figsize=(13, 4))
+        fig.suptitle(
+            f"CNN Placas — comandos: {cmds}",
+            fontsize=10, fontweight="bold"
+        )
+        best_ep = int(np.argmax(hist.history["val_accuracy"]))
+        best_ac = hist.history["val_accuracy"][best_ep]
 
-        # Accuracy
-        axes[0].plot(hist.history["accuracy"],     label="Treino",   color="#2E75B6", lw=2)
-        axes[0].plot(hist.history["val_accuracy"], label="Val",      color="#E74C3C", lw=2, linestyle="--")
-        axes[0].set_title("Acurácia"); axes[0].set_xlabel("Época")
-        axes[0].set_ylabel("Acurácia"); axes[0].legend(); axes[0].grid(alpha=0.3)
-
-        # Loss
-        axes[1].plot(hist.history["loss"],     label="Treino",  color="#2E75B6", lw=2)
-        axes[1].plot(hist.history["val_loss"], label="Val",     color="#E74C3C", lw=2, linestyle="--")
-        axes[1].set_title("Loss"); axes[1].set_xlabel("Época")
-        axes[1].set_ylabel("Loss"); axes[1].legend(); axes[1].grid(alpha=0.3)
+        for i, (m, t) in enumerate([("accuracy","Acurácia"),("loss","Loss")]):
+            ax = axes[i]
+            ax.plot(hist.history[m],           label="treino",    color="#2E75B6", lw=2)
+            ax.plot(hist.history[f"val_{m}"],  label="validação", color="#E74C3C", lw=2, ls="--")
+            ax.set_title(t); ax.set_xlabel("Época")
+            ax.legend(); ax.grid(alpha=0.3)
+            if m == "accuracy":
+                ax.set_ylim(0, 1)
+                ax.axvline(best_ep, color="green", alpha=0.4, ls=":")
+                ax.annotate(f"best {best_ac:.3f}",
+                            xy=(best_ep, best_ac),
+                            xytext=(best_ep+1, best_ac-0.08),
+                            fontsize=8, color="green")
 
         plt.tight_layout()
         plt.savefig(REPORT_PATH, dpi=120, bbox_inches="tight")
         plt.close()
-        print(f"[PLOT] Gráfico salvo: {REPORT_PATH}")
+        print(f"[GRAFICO] {REPORT_PATH}")
     except Exception as e:
-        print(f"[PLOT] Matplotlib não disponível ({e}) — gráfico ignorado")
+        print(f"[GRAFICO] {e}")
 
 
-# ================================================================
-#  6. UTILITÁRIO: GERAR DATASET SINTÉTICO PARA TESTES
-#  Cria imagens coloridas simples quando não há fotos reais.
-# ================================================================
+#  TESTE COM FOTO
+def testar(caminho: str):
+    for arq in [MODEL_PATH, LABELS_PATH]:
+        if not os.path.isfile(arq):
+            print(f"[ERRO] {arq} não encontrado — treine primeiro.")
+            sys.exit(1)
 
-def gerar_dataset_sintetico(dst="./dataset", n_por_classe=80):
-    """
-    Gera imagens sintéticas para permitir testar o treinamento
-    mesmo sem fotos reais. Substitua depois por imagens reais!
-    """
-    specs = {
-        "STOP":     {"cor": (50, 50, 200),  "forma": "octogono"},
-        "LEFT":     {"cor": (200, 100, 30), "forma": "seta_esq"},
-        "RIGHT":    {"cor": (30, 100, 200), "forma": "seta_dir"},
-        "STRAIGHT": {"cor": (30, 180, 80),  "forma": "seta_cima"},
-        "DELIVERY": {"cor": (180, 60, 180), "forma": "quadrado"},
-        "YIELD":    {"cor": (200, 200, 30), "forma": "triangulo"},
-    }
+    with open(LABELS_PATH) as f:
+        cmds = [l.strip() for l in f if l.strip()]
 
-    print(f"[SYN] Gerando dataset sintético em '{dst}' ...")
-    np.random.seed(42)
+    try:
+        import tflite_runtime.interpreter as tr
+        interp = tr.Interpreter(model_path=MODEL_PATH)
+    except ImportError:
+        interp = tf.lite.Interpreter(model_path=MODEL_PATH)
 
-    for classe, spec in specs.items():
-        pasta = os.path.join(dst, classe)
-        os.makedirs(pasta, exist_ok=True)
-        cor = spec["cor"]
+    interp.allocate_tensors()
+    ind  = interp.get_input_details()[0]
+    outd = interp.get_output_details()[0]
+    sz   = int(ind["shape"][1])
 
-        for i in range(n_por_classe):
-            img = np.ones((IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8) * 240
-            # ruído leve
-            img = img + np.random.randint(-20, 20, img.shape, dtype=np.int16).clip(0, 255).astype(np.uint8)
+    img = cv2.imread(caminho)
+    if img is None:
+        print(f"[ERRO] Imagem não encontrada: {caminho}"); sys.exit(1)
 
-            cx, cy = IMG_SIZE // 2, IMG_SIZE // 2
-            sz = IMG_SIZE // 3 + np.random.randint(-8, 8)
+    img_r  = cv2.resize(img, (sz, sz), interpolation=cv2.INTER_AREA)
+    rgb    = cv2.cvtColor(img_r, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    tensor = np.expand_dims(rgb, 0)
 
-            forma = spec["forma"]
-            if forma == "octogono":
-                pts = np.array([
-                    [cx - sz//2, cy - sz], [cx + sz//2, cy - sz],
-                    [cx + sz,    cy - sz//2], [cx + sz, cy + sz//2],
-                    [cx + sz//2, cy + sz], [cx - sz//2, cy + sz],
-                    [cx - sz,    cy + sz//2], [cx - sz, cy - sz//2],
-                ], dtype=np.int32)
-                cv2.fillPoly(img, [pts], cor)
-            elif forma in ("seta_esq", "seta_dir", "seta_cima"):
-                cv2.rectangle(img, (cx-sz, cy-sz), (cx+sz, cy+sz), cor, -1)
-                # seta branca simples
-                if forma == "seta_esq":
-                    cv2.arrowedLine(img, (cx+sz//2, cy), (cx-sz//2, cy), (255,255,255), 3, tipLength=0.4)
-                elif forma == "seta_dir":
-                    cv2.arrowedLine(img, (cx-sz//2, cy), (cx+sz//2, cy), (255,255,255), 3, tipLength=0.4)
-                else:
-                    cv2.arrowedLine(img, (cx, cy+sz//2), (cx, cy-sz//2), (255,255,255), 3, tipLength=0.4)
-            elif forma == "triangulo":
-                pts = np.array([[cx, cy-sz], [cx-sz, cy+sz], [cx+sz, cy+sz]], dtype=np.int32)
-                cv2.fillPoly(img, [pts], cor)
-            else:
-                cv2.rectangle(img, (cx-sz, cy-sz), (cx+sz, cy+sz), cor, -1)
+    interp.set_tensor(ind["index"], tensor)
+    interp.invoke()
+    p    = interp.get_tensor(outd["index"])[0]
+    top3 = np.argsort(p)[::-1][:3]
 
-            # variação de brilho
-            fator = 0.7 + np.random.rand() * 0.6
-            img = np.clip(img.astype(np.float32) * fator, 0, 255).astype(np.uint8)
+    rev = {}
+    for k, v in CLASS_TO_CMD.items():
+        rev.setdefault(v, []).append(k)
 
-            cv2.imwrite(os.path.join(pasta, f"{i:04d}.png"), img)
+    print(f"\n[TESTE] {caminho}")
+    print("-" * 50)
+    for i, idx in enumerate(top3):
+        cmd    = cmds[idx]
+        cls    = ", ".join(rev.get(cmd, [cmd]))
+        espera = " → aguarda sinal" if cmd in ESPERA_SINAL else ""
+        marca  = " ←" if i == 0 else "  "
+        print(f"  {marca} '{cmd}'  {p[idx]*100:5.1f}%  {cls}{espera}")
 
-    print(f"[SYN] Dataset sintético criado: {n_por_classe} imagens × {len(specs)} classes")
+    cv2.putText(img,
+                f"'{cmds[top3[0]]}' {p[top3[0]]*100:.0f}%",
+                (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 220, 80), 2)
+    cv2.imshow("Resultado", img)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
 
 
-# ================================================================
 #  ENTRY POINT
-# ================================================================
-
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="Treinar CNN de placas")
-    p.add_argument("--dataset", default=DATASET_DIR, help="Pasta do dataset")
-    p.add_argument("--epochs",  type=int, default=EPOCHS, help="Épocas máx")
-    p.add_argument("--sintetico", action="store_true",
-                   help="Gerar dataset sintético antes de treinar (para testes)")
-    args = p.parse_args()
+    ap = argparse.ArgumentParser(
+        description="Treina CNN de placas com TF/Keras",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    ap.add_argument(
+        "--dataset", default=None,
+        metavar="PASTA",
+        help="Pasta do dataset tratado (ex: ./dataset_tratado)\n"
+             "Estrutura: pasta/train/NomeClasse/*.jpg"
+    )
+    ap.add_argument(
+        "--zip", default=None,
+        metavar="ARQUIVO.ZIP",
+        help="Zip do Roboflow (ex: ./traffic_signs_v3i_tensorflow.zip)"
+    )
+    ap.add_argument("--epochs", type=int, default=EPOCHS,
+                    help=f"Épocas máximas (padrão: {EPOCHS})")
+    ap.add_argument("--img",    type=int, default=IMG_SIZE,
+                    help=f"Resolução de entrada px (padrão: {IMG_SIZE})")
+    ap.add_argument("--test",   type=str, default=None,
+                    metavar="FOTO.JPG",
+                    help="Testa uma foto com o modelo já treinado")
+    a = ap.parse_args()
 
-    if args.sintetico:
-        gerar_dataset_sintetico(args.dataset)
-
-    treinar(args.dataset, args.epochs)
+    if a.test:
+        testar(a.test)
+    elif a.dataset:
+        treinar(a.dataset, a.epochs, a.img)
+    elif a.zip:
+        treinar(a.zip, a.epochs, a.img)
+    else:
+        # Tenta o padrão automaticamente
+        if os.path.isdir(DATASET_DIR):
+            print(f"[AUTO] Usando pasta padrão: {DATASET_DIR}")
+            treinar(DATASET_DIR, a.epochs, a.img)
+        else:
+            ap.print_help()
+            print(f"\n[ERRO] Nenhuma fonte especificada e '{DATASET_DIR}' não existe.")
+            print("  Use: python TRAIN_SIGN_CNN.py --dataset ./dataset_tratado"

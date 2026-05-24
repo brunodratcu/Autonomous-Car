@@ -1,1 +1,26 @@
 videoplayback.mp4
+# Dataset — pode ser gigabyte, não sobe no git
+dataset_tratado/
+dataset/
+*.zip
+
+sign_model.tflite
+sign_model.keras
+sign_model.h5
+sign_labels.txt
+training_report.png
+
+
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+
+logs/
+checkpoints/
+
+
+.DS_Store
+Thumbs.db
