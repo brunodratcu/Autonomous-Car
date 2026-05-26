@@ -1,57 +1,24 @@
 """
 ================================================================
-  DETECTOR DE PLACAS — VISÃO COMPUTACIONAL  v2.1
+  SIGN_DETECTOR.py — Detector de placas completo
   ─────────────────────────────────────────────────────────────
-  NOVIDADES vs v2.0:
-  ─────────────────────────────────────────────────────────────
-  1. DETECÇÃO BILATERAL DA ROI
-     • A ROI horizontal é dividida em ZONA_ESQ e ZONA_DIR
-     • Cada zona rastreia sua própria placa independentemente
-     • Quando uma placa confirmada ALCANÇA A BORDA da zona
-       (x_centro < BORDA_X_ESQ  ou  x_centro > BORDA_X_DIR)
-       a ação dispara imediatamente — sem esperar mais frames
+  Um único arquivo. Três modos:
 
-  2. CONFIRMAÇÃO POR ZONA
-     • _conf_esq / _conf_dir: estado separado por lado
-     • Evita que uma placa grande do lado esquerdo mascare
-       uma placa pequena do lado direito
+  TESTAR FOTO (diagnóstico):
+    python SIGN_DETECTOR.py --test foto.jpg
+    python SIGN_DETECTOR.py --test f1.jpg f2.jpg --conf 0.0
 
-  3. PARÂMETROS AJUSTADOS PARA PLACAS PEQUENAS/IMPRESSAS
-     • AREA_EXEC baixado de 2500 → 400 px²
-     • CONFIRM_N reduzido de 7 → 4 frames (placas passam rápido)
-     • PLACA_COR_CENTRO_MIN reduzido: placas impressas têm cor
-       distribuída diferente de placas metálicas
-     • HSV expandido: vermelho mais permissivo (S≥80, não 100)
-       e azul menos restrito
+  CÂMERA / VÍDEO (vida real no carro):
+    python SIGN_DETECTOR.py               ← vídeo (videoplayback.mp4)
+    python SIGN_DETECTOR.py --cam         ← câmera USB
 
-  4. CLASSIFICAÇÃO MELHORADA
-     • Normalização do crop por CLAHE antes da análise
-     • Detecção de cor robusta: considera saturação média
-       dentro do contorno, não só pixel count
-     • Fallback de texto: se a cor dominar >40% do crop,
-       assume placa mesmo sem forma perfeita
+  COLETAR AMOSTRAS (quando as placas chegarem):
+    python SIGN_DETECTOR.py --collect Pare
+    python SIGN_DETECTOR.py --collect Pedestre --n 200
 
-  5. VISUALIZAÇÃO BILATERAL
-     • Painel lateral mostra estado ESQ e DIR separadamente
-     • Linha divisória vertical na ROI (centro)
-     • Marcador "⚡ BORDA" quando a placa atinge a zona de gatilho
-
-  Lógica de decisão atualizada:
-  ─────────────────────────────────────────────────────────────
-  Para cada lado (ESQ / DIR) da ROI:
-    1. Localiza candidatas coloridas nessa metade
-    2. Valida (proporção + compacidade + cor central)
-    3. Classifica (cor + forma + seta)
-    4. Confirma por CONFIRM_N frames consecutivos
-    5. SE confirmado E (área >= AREA_EXEC OU x_centro na borda):
-       → Executa ação imediatamente
-
-  Comandos seriais: STOP/YIELD/LEFT/RIGHT/STRAIGHT/SLOW_DOWN/SPEED_UP/OBSTACLE
-
-  USO:
-    python sign_detector.py            ← vídeo (videoplayback.mp4)
-    python sign_detector.py --cam      ← câmera USB
-    python sign_detector.py --cal      ← calibrar HSV
+  Arquivos necessários na mesma pasta:
+    sign_model.tflite   ← gerado por TRAIN_SIGN_CNN.py
+    sign_labels.txt     ← gerado por TRAIN_SIGN_CNN.py
 ================================================================
 """
 
@@ -63,40 +30,36 @@ import time
 import sys
 import os
 
+# ================================================================
 #  [1] CONFIGURAÇÃO
+# ================================================================
 
-VIDEO       = "./videoplayback.mp4"
-CAM_IDX     = 0
-PROP        = 2
+VIDEO        = "./videoplayback.mp4"
+CAM_IDX      = 0
+PROP         = 2
+SERIAL_PORT  = "COM3"
+BAUD         = 115200
+MODEL_PATH   = "./sign_model.tflite"
+LABELS_PATH  = "./sign_labels.txt"
 
-SERIAL_PORT = "COM3"
-BAUD        = 115200
+# Detecção
+ROI_Y0       = 0.05
+ROI_Y1       = 0.72
+BORDA_FRAC   = 0.18
+AREA_MIN     = 300
+AREA_MAX     = 80_000
+CONFIRM_N    = 4
+AREA_EXEC    = 400
+COOLDOWN     = 55
+CONF_MIN     = 0.60
 
-# ROI de placas — faixa onde placas aparecem fisicamente
-ROI_Y0 = 0.05   # 5% do topo (abre levemente para pegar placas altas)
-ROI_Y1 = 0.72   # 72%
+# Obstáculo
+OBST_Y0      = 0.50
+OBST_AREA_MIN= 3000
 
-# ── Lógica bilateral ──────────────────────────────────────────
-BORDA_FRAC = 0.18   # 18% das bordas = zona de gatilho
-
-# Parâmetros de detecção
-AREA_MIN   = 300     # px² mínimo para candidata (placas impressas são menores)
-AREA_MAX   = 80_000  # px² máximo
-CONFIRM_N  = 4       # frames consecutivos para confirmar (reduzido de 7→4)
-AREA_EXEC  = 400     # px² mínimo para execução por área (reduzido de 2500→400)
-COOLDOWN   = 55      # frames de espera após executar
-
-# Limiares de validação de placa real
-PLACA_COMPACIDADE_MIN  = 0.28   # reduzido: placas impressas podem ter bordas irregulares
-PLACA_COR_CENTRO_MIN   = 0.15   # reduzido: texto na placa reduz cor no centro
-PLACA_PROP_MIN         = 0.35   # aceita mais formatos
-PLACA_PROP_MAX         = 2.20   # aceita placas retangulares horizontais
-
-# Detecção de obstáculo
-OBST_Y0       = 0.50
-OBST_AREA_MIN = 3000
-
-#  [2] AÇÕES
+# ================================================================
+#  [2] AÇÕES DO CARRO
+# ================================================================
 
 ACOES = {
     "STOP":      dict(mot=0,  srv=127, buz=0, led=1, brk=1, dir=0, dur=2.5),
@@ -109,643 +72,507 @@ ACOES = {
     "SPEED_UP":  dict(mot=80, srv=127, buz=0, led=0, brk=0, dir=3, dur=2.0),
 }
 
-#  [3] RANGES HSV — expandidos para placas impressas
-#  Placas impressas (papel/papelão) têm saturação menor que
-#  placas metálicas; o limiar de S foi reduzido.
-
-HSV = {
-    # Vermelho: S≥80 (era 100) — abrange vermelho impresso/fosco
-    "vermelho": [
-        (np.array([0,   80,  50]), np.array([12,  255, 255])),
-        (np.array([165, 80,  50]), np.array([180, 255, 255])),
-    ],
-    # Azul: S≥80 (era 100) — abrange azul de impressora
-    "azul": [
-        (np.array([90, 80, 50]), np.array([135, 255, 255])),
-    ],
-    # Amarelo: S≥120 (era 150)
-    "amarelo": [
-        (np.array([15, 120, 80]), np.array([38, 255, 255])),
-    ],
-    # Verde: S≥120 (era 150)
-    "verde": [
-        (np.array([38, 120, 60]), np.array([88, 255, 255])),
-    ],
-    # Laranja: S≥110 (era 140)
-    "laranja": [
-        (np.array([7, 110, 80]), np.array([22, 255, 255])),
-    ],
-    # Roxo/lilás: adicionado — aparece em algumas placas impressas
-    "roxo": [
-        (np.array([125, 60, 40]), np.array([165, 255, 255])),
-    ],
+LABEL_TO_ACTION = {
+    "B": "SLOW_DOWN", "F": "SLOW_DOWN", "K": "STOP",
+    "N": "STRAIGHT",  "P": "STRAIGHT",  "S": "STOP",
+    "T": "STRAIGHT",  "U": "SPEED_UP",  "W": "SLOW_DOWN",
+    "Y": "YIELD",
 }
 
-#  [4] KERNELS
+LABEL_NAMES = {
+    "B": "Bump/Road_Work",  "F": "Speed_Limit_90",
+    "K": "No_Stopping",     "N": "No_U-Turn",
+    "P": "No_Parking",      "S": "Stop/Pare",
+    "T": "Sentido_Obrig.",  "U": "Speed_Limit_120",
+    "W": "Speed_Limit_40",  "Y": "Pedestrian",
+}
 
-K3 = np.ones((3, 3), np.uint8)
-K5 = np.ones((5, 5), np.uint8)
-K7 = np.ones((7, 7), np.uint8)
+CORES_VIS = {
+    "STOP":      (50,  50,  220), "OBSTACLE": (0,   0,   200),
+    "YIELD":     (0,   200, 220), "LEFT":     (220, 120, 0),
+    "RIGHT":     (0,   120, 220), "STRAIGHT": (50,  220, 50),
+    "SLOW_DOWN": (0,   180, 255), "SPEED_UP": (0,   200, 100),
+}
 
-#  [5] ESTADO
+# ================================================================
+#  [3] RANGES HSV
+# ================================================================
 
-CMD = dict(mot=0, srv=127, buz=0, led=0, brk=0, dir=0, spd=0)
+HSV_RANGES = {
+    "vermelho": [(np.array([0,  80, 50]), np.array([12, 255,255])),
+                 (np.array([165,80, 50]), np.array([180,255,255]))],
+    "azul":     [(np.array([90, 80, 50]), np.array([135,255,255]))],
+    "amarelo":  [(np.array([15,120, 80]), np.array([38, 255,255]))],
+    "verde":    [(np.array([38,120, 60]), np.array([88, 255,255]))],
+    "laranja":  [(np.array([7, 110, 80]), np.array([22, 255,255]))],
+    "roxo":     [(np.array([125,60, 40]), np.array([165,255,255]))],
+}
 
-# Confirmação bilateral — um estado por lado
-_conf_esq = dict(label=None, cnt=0, area=0.0, x_centro=0)
-_conf_dir = dict(label=None, cnt=0, area=0.0, x_centro=0)
+K3 = np.ones((3,3), np.uint8)
+K5 = np.ones((5,5), np.uint8)
+K7 = np.ones((7,7), np.uint8)
 
-_nav = dict(
-    cooldown=0,
-    ultimo=None,
-    acao_label=None,
-    acao_t=0.0,
-    acao_dur=0.0,
-    obstaculo_ativo=False,
-    # Logs de disparo por borda (para debug)
-    ultimo_gatilho="",
-)
+# ================================================================
+#  [4] PRÉ-PROCESSADOR DE SÍMBOLO  (era PREP_SIGN.py)
+#  Grayscale + threshold adaptativo → foca no desenho, ignora cor
+# ================================================================
 
-_ser = None
+def prep_sign(img_bgr: np.ndarray, sz: int = 96) -> np.ndarray:
+    """
+    Converte crop BGR em tensor focado no símbolo da placa.
+    Saída: RGB float32 (sz,sz,3) em [0,255] para MobileNetV2.
+    """
+    if img_bgr is None or img_bgr.size == 0:
+        return np.zeros((sz, sz, 3), np.float32)
 
-#  [6] SERIAL
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
-def conectar_serial():
-    kws = ["arduino", "ch340", "cp210", "uart", "usb serial"]
-    for p in serial.tools.list_ports.comports():
-        if any(k in (p.description or "").lower() for k in kws):
-            try:
-                s = serial.Serial(p.device, BAUD, timeout=0, write_timeout=0)
-                time.sleep(2); s.reset_input_buffer()
-                print(f"[SER] {p.device}", flush=True)
-                return s
-            except Exception:
-                pass
+    # Padding proporcional
+    hh, ww  = gray.shape
+    scale   = sz / max(hh, ww)
+    nh, nw  = max(1, int(hh*scale)), max(1, int(ww*scale))
+    resized = cv2.resize(gray, (nw, nh), interpolation=cv2.INTER_AREA)
+    canvas  = np.zeros((sz, sz), np.uint8)
+    canvas[(sz-nh)//2:(sz-nh)//2+nh, (sz-nw)//2:(sz-nw)//2+nw] = resized
+
+    # CLAHE leve + threshold adaptativo
+    cl     = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(4,4))
+    canvas = cl.apply(canvas)
+    thresh = cv2.adaptiveThreshold(
+        canvas, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, blockSize=13, C=5
+    )
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, np.ones((2,2), np.uint8))
+
+    return cv2.cvtColor(thresh, cv2.COLOR_GRAY2RGB).astype(np.float32)
+
+
+# ================================================================
+#  [5] MODELO TFLite
+# ================================================================
+
+def carregar_modelo(model_path=MODEL_PATH, labels_path=LABELS_PATH):
+    if not os.path.isfile(model_path):
+        raise FileNotFoundError(
+            f"[CNN] Modelo não encontrado: {model_path}\n"
+            f"      Execute: python TRAIN_SIGN_CNN.py --dataset ./dataset_tratado"
+        )
+    if not os.path.isfile(labels_path):
+        raise FileNotFoundError(f"[CNN] Labels não encontrados: {labels_path}")
+
+    with open(labels_path) as f:
+        labels = [l.strip() for l in f if l.strip()]
+
     try:
-        s = serial.Serial(SERIAL_PORT, BAUD, timeout=0, write_timeout=0)
-        time.sleep(2); s.reset_input_buffer()
-        print(f"[SER] {SERIAL_PORT}", flush=True)
-        return s
-    except Exception as e:
-        print(f"[SER] Simulação ({e})", flush=True)
-        return None
+        import tflite_runtime.interpreter as tflite
+        interp = tflite.Interpreter(model_path=model_path)
+    except ImportError:
+        import tensorflow as tf
+        interp = tf.lite.Interpreter(model_path=model_path)
+
+    interp.allocate_tensors()
+    in_idx  = interp.get_input_details()[0]["index"]
+    out_idx = interp.get_output_details()[0]["index"]
+    sz      = interp.get_input_details()[0]["shape"][1]
+    print(f"[CNN] {len(labels)} classes: {labels} | entrada {sz}×{sz}", flush=True)
+    return interp, labels, in_idx, out_idx
 
 
-def enviar(cmd: dict, ser):
-    j = (f'{{"mot":{cmd["mot"]},"srv":{cmd["srv"]},'
-         f'"buz":{cmd["buz"]},"led":{cmd["led"]},'
-         f'"brk":{cmd["brk"]},"dir":{cmd["dir"]},'
-         f'"spd":{cmd["spd"]}}}')
-    print(f"[CMD] {j}", flush=True)
-    if ser:
-        try:
-            ser.write((j + "\n").encode())
-        except Exception:
-            pass
+def classificar(crop_bgr, interp, labels, in_idx, out_idx):
+    """Retorna (label, confiança, probs_array)."""
+    sz    = interp.get_input_details()[0]["shape"][1]
+    batch = np.expand_dims(prep_sign(crop_bgr, sz), 0)
+    interp.set_tensor(in_idx, batch)
+    interp.invoke()
+    probs = interp.get_tensor(out_idx)[0]
+    best  = int(np.argmax(probs))
+    return labels[best], float(probs[best]), probs
 
 
-#  [7] MÁSCARA DE COR
+# ================================================================
+#  [6] DETECÇÃO DE CANDIDATAS (HSV bilateral)
+# ================================================================
 
-def mascara_cor(hsv_img: np.ndarray, nome: str) -> np.ndarray:
-    m = np.zeros(hsv_img.shape[:2], np.uint8)
-    for lo, hi in HSV[nome]:
-        m = cv2.bitwise_or(m, cv2.inRange(hsv_img, lo, hi))
+def _mascara(hsv):
+    m = np.zeros(hsv.shape[:2], np.uint8)
+    for ranges in HSV_RANGES.values():
+        for lo, hi in ranges:
+            m = cv2.bitwise_or(m, cv2.inRange(hsv, lo, hi))
     return m
 
 
-def mascara_total(hsv_img: np.ndarray) -> np.ndarray:
-    m = np.zeros(hsv_img.shape[:2], np.uint8)
-    for nome in HSV:
-        m = cv2.bitwise_or(m, mascara_cor(hsv_img, nome))
-    return m
-
-
-#  [8] VALIDAÇÃO DE PLACA REAL
-#  Três testes: proporção, compacidade, cor no centro.
-#  Versão relaxada para placas impressas em papel/papelão.
-
-def validar_placa(crop_bgr: np.ndarray, area_contorno: float,
-                  bbox_w: int, bbox_h: int) -> tuple[bool, str]:
-    # ── Teste 1: Proporção ────────────────────────────────────────
-    prop = bbox_w / max(bbox_h, 1)
-    if not (PLACA_PROP_MIN <= prop <= PLACA_PROP_MAX):
-        return False, f"prop={prop:.2f}"
-
-    # ── Teste 2: Compacidade ──────────────────────────────────────
-    bbox_area = bbox_w * bbox_h
-    compac    = area_contorno / max(bbox_area, 1)
-    if compac < PLACA_COMPACIDADE_MIN:
-        return False, f"compac={compac:.2f}"
-
-    # ── Teste 3: Cor no centro ────────────────────────────────────
-    if crop_bgr.size == 0:
-        return False, "crop vazio"
-
-    sz       = 64
-    crop_r   = cv2.resize(crop_bgr, (sz, sz), interpolation=cv2.INTER_AREA)
-
-    # CLAHE para normalizar iluminação antes de checar cor
-    lab      = cv2.cvtColor(crop_r, cv2.COLOR_BGR2LAB)
-    cl       = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
-    lab[:, :, 0] = cl.apply(lab[:, :, 0])
-    crop_r   = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-
-    hsv_crop = cv2.cvtColor(crop_r, cv2.COLOR_BGR2HSV)
-
-    # Centro = 60% central
-    m0 = sz // 5
-    m1 = sz - m0
-    centro_hsv = hsv_crop[m0:m1, m0:m1]
-    m_centro   = mascara_total(centro_hsv)
-    frac_cor   = float(m_centro.sum()) / (m_centro.size * 255 + 1e-9)
-
-    if frac_cor < PLACA_COR_CENTRO_MIN:
-        return False, f"cor_ctr={frac_cor:.2f}"
-
-    return True, "ok"
-
-
-#  [9] CLASSIFICAÇÃO (cor + forma + seta)
-
-def _analisar_forma(gray):
-    cl   = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
-    gray = cl.apply(gray)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, thr = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    cnts, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
-        return 4, 0.0
-    c    = max(cnts, key=cv2.contourArea)
-    peri = cv2.arcLength(c, True)
-    ap   = cv2.approxPolyDP(c, 0.04 * peri, True)
-    area = cv2.contourArea(c)
-    circ = (4 * np.pi * area) / (peri ** 2 + 1e-9)
-    return len(ap), float(circ)
-
-
-def _detectar_seta(gray):
-    H, W = gray.shape
-    _, inv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    inv    = cv2.morphologyEx(inv, cv2.MORPH_OPEN, K3)
-    cnts, _ = cv2.findContours(inv, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
-        return None
-    c = max(cnts, key=cv2.contourArea)
-    if cv2.contourArea(c) < 30:
-        return None
-    M = cv2.moments(c)
-    if M["m00"] == 0:
-        return None
-    cx = M["m10"] / M["m00"]
-    cy = M["m01"] / M["m00"]
-    rx = (cx - W / 2) / (W / 2 + 1e-9)
-    ry = (cy - H / 2) / (H / 2 + 1e-9)
-    _, _, bw, bh = cv2.boundingRect(c)
-    asp = bw / max(bh, 1)
-    if asp > 1.2:
-        if rx < -0.12: return "left"
-        if rx >  0.12: return "right"
-    if ry < -0.12: return "up"
-    if ry >  0.12: return "down"
-    return "up"
-
-
-def classificar(crop_bgr: np.ndarray) -> tuple[str | None, float, str]:
-    """
-    Classifica o crop de uma placa já validada.
-    Usa CLAHE para normalizar iluminação antes de medir cores.
-    Retorna (label, confiança, cor_dominante).
-    """
-    crop = cv2.resize(crop_bgr, (80, 80), interpolation=cv2.INTER_AREA)
-
-    # Normalização por CLAHE antes de medir cor
-    lab  = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
-    cl   = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(4, 4))
-    lab[:, :, 0] = cl.apply(lab[:, :, 0])
-    crop = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-
-    hsv  = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-
-    total_px = hsv.shape[0] * hsv.shape[1] * 255 + 1e-9
-    pc = {n: float(mascara_cor(hsv, n).sum()) / total_px for n in HSV}
-    cor, val = max(pc.items(), key=lambda x: x[1])
-
-    # Limite mínimo reduzido: placas impressas têm cor menos saturada
-    if val < 0.06:
-        return None, 0.0, "?"
-
-    verts, circ = _analisar_forma(gray)
-    seta        = _detectar_seta(gray)
-
-    label = conf = None
-
-    if cor in ("vermelho", "laranja"):
-        if _v(verts, 7, 99) and circ > 0.55:
-            label, conf = "STOP",      0.90
-        elif _v(verts, 3, 3):
-            label, conf = "YIELD",     0.85
-        elif circ > 0.65:
-            label, conf = "STOP",      0.80
-        elif seta == "left":
-            label, conf = "LEFT",      0.72
-        elif seta == "right":
-            label, conf = "RIGHT",     0.72
-        elif cor == "laranja":
-            label, conf = "SLOW_DOWN", 0.72
-        else:
-            label, conf = "STOP",      0.65
-
-    elif cor == "azul":
-        if seta == "left":    label, conf = "LEFT",      0.88
-        elif seta == "right": label, conf = "RIGHT",     0.88
-        elif seta == "up":    label, conf = "STRAIGHT",  0.85
-        elif seta == "down":  label, conf = "SLOW_DOWN", 0.78
-        else:                 label, conf = "STRAIGHT",  0.62
-
-    elif cor == "amarelo":
-        if _v(verts, 3, 3):       label, conf = "YIELD",     0.83
-        elif seta == "left":      label, conf = "LEFT",      0.76
-        elif seta == "right":     label, conf = "RIGHT",     0.76
-        else:                     label, conf = "SLOW_DOWN", 0.68
-
-    elif cor == "verde":
-        if seta == "left":    label, conf = "LEFT",      0.80
-        elif seta == "right": label, conf = "RIGHT",     0.80
-        elif seta == "up":    label, conf = "SPEED_UP",  0.78
-        else:                 label, conf = "STRAIGHT",  0.65
-
-    elif cor == "roxo":
-        # Roxo geralmente indica "DELIVERY" ou ação especial
-        label, conf = "STOP", 0.70
-
-    return label, conf or 0.0, cor
-
-
-def _v(v, vmin, vmax):
-    return vmin <= v <= vmax
-
-
-#  [10] LOCALIZAR CANDIDATAS — BILATERAL
-#  Agora retorna candidatas separadas por lado (esq/dir).
-#  A divisão é feita no centro da ROI (largura do frame / 2).
-
-def localizar_candidatas(frame: np.ndarray):
-    """
-    Encontra candidatas na ROI e as divide em ESQUERDA e DIREITA.
-
-    Retorna:
-      esq: lista de (x, y, w, h, area, crop)  — x_centro < w/2
-      dir: lista de (x, y, w, h, area, crop)  — x_centro >= w/2
-      rejeitadas: lista de (x, y, w, h, motivo)
-    """
+def localizar_candidatas(frame):
     h, w  = frame.shape[:2]
-    y0    = int(h * ROI_Y0)
-    y1    = int(h * ROI_Y1)
-    cx    = w // 2          # linha divisória
+    y0, y1 = int(h*ROI_Y0), int(h*ROI_Y1)
     roi   = frame[y0:y1]
-
-    hsv   = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    hsv   = cv2.GaussianBlur(hsv, (5, 5), 0)
-
-    mask  = mascara_total(hsv)
+    hsv   = cv2.GaussianBlur(cv2.cvtColor(roi, cv2.COLOR_BGR2HSV), (5,5), 0)
+    mask  = _mascara(hsv)
     mask  = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, K7)
     mask  = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  K5)
-
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    esq        = []
-    dir_       = []
-    rejeitadas = []
+    cx   = w // 2
+    esq, dir_, rej = [], [], []
 
     for cnt in cnts:
         area = cv2.contourArea(cnt)
         if not (AREA_MIN < area < AREA_MAX):
             continue
-
         x, y, bw, bh = cv2.boundingRect(cnt)
-        crop = frame[y + y0: y + y0 + bh, x: x + bw]
+        crop = frame[y+y0:y+y0+bh, x:x+bw]
         if crop.size == 0:
             continue
-
-        ok, motivo = validar_placa(crop, area, bw, bh)
-        if not ok:
-            rejeitadas.append((x, y + y0, bw, bh, motivo))
+        prop  = bw / max(bh, 1)
+        compac = area / max(bw*bh, 1)
+        if not (0.35 <= prop <= 2.2) or compac < 0.28:
+            rej.append((x, y+y0, bw, bh, f"p={prop:.1f}"))
             continue
+        entry = (x, y+y0, bw, bh, area, crop)
+        (esq if x+bw//2 < cx else dir_).append(entry)
 
-        x_centro = x + bw // 2
-        entry    = (x, y + y0, bw, bh, area, crop)
-
-        if x_centro < cx:
-            esq.append(entry)
-        else:
-            dir_.append(entry)
-
-    # Ordena por área decrescente, pega até 2 por lado
     esq.sort(key=lambda b: b[4], reverse=True)
     dir_.sort(key=lambda b: b[4], reverse=True)
-    return esq[:2], dir_[:2], rejeitadas
+    return esq[:2], dir_[:2], rej
 
 
-#  [11] DETECÇÃO DE OBSTÁCULO
-
-def detectar_obstaculo(frame: np.ndarray) -> bool:
+def detectar_obstaculo(frame):
     h, w  = frame.shape[:2]
-    y0    = int(h * OBST_Y0)
-    roi   = frame[y0:, :]
-
-    gray  = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    blur  = cv2.GaussianBlur(gray, (15, 15), 0)
-
-    thresh = cv2.adaptiveThreshold(
-        blur, 255,
-        cv2.ADAPTIVE_THRESH_MEAN_C,
-        cv2.THRESH_BINARY_INV,
-        blockSize=51, C=10
-    )
+    roi   = frame[int(h*OBST_Y0):]
+    gray  = cv2.GaussianBlur(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY), (15,15), 0)
+    thresh = cv2.adaptiveThreshold(gray, 255,
+                cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 51, 10)
     thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, K7)
     thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN,  K5)
-
-    cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    for cnt in cnts:
-        area = cv2.contourArea(cnt)
-        if area < OBST_AREA_MIN:
+    for cnt in cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]:
+        if cv2.contourArea(cnt) < OBST_AREA_MIN:
             continue
-        x, y, bw, bh = cv2.boundingRect(cnt)
-        if bh > bw * 0.4 and bw < w * 0.85:
+        _, _, bw, bh = cv2.boundingRect(cnt)
+        if bh > bw*0.4 and bw < w*0.85:
             return True
     return False
 
 
-#  [12] CONFIRMAÇÃO BILATERAL
-#  Cada lado mantém seu próprio estado de confirmação.
-#  O gatilho de execução agora tem DUAS condições:
-#    A) área >= AREA_EXEC  (placa próxima, visível claramente)
-#    B) x_centro na borda da ROI  (placa saindo do campo de visão)
-#  Qualquer uma das condições dispara a ação.
+# ================================================================
+#  [7] CONFIRMAÇÃO BILATERAL
+# ================================================================
 
-def _checar_borda(x, bw, w_frame) -> bool:
-    """
-    Retorna True se o centro da placa está na zona de borda da ROI.
-    Zona de borda = 18% de cada extremidade da largura do frame.
-    """
-    x_centro     = x + bw // 2
-    borda_px_esq = int(w_frame * BORDA_FRAC)
-    borda_px_dir = w_frame - borda_px_esq
-    return x_centro < borda_px_esq or x_centro > borda_px_dir
+def _na_borda(x, bw, w):
+    cx = x + bw//2
+    lim = int(w * BORDA_FRAC)
+    return cx < lim or cx > w - lim
 
 
-def confirmar_lado(estado: dict, label: str | None,
-                   area: float, x: int, bw: int, w_frame: int) -> str | None:
-    """
-    Atualiza o estado de confirmação de um lado e retorna o label
-    confirmado quando o critério for atingido, ou None.
-    """
+def confirmar_lado(estado, label, area, x, bw, w):
     if _nav["cooldown"] > 0:
-        estado.update(label=None, cnt=0)
-        return None
-
+        estado.update(label=None, cnt=0); return None
     if label is None:
-        estado.update(cnt=0, label=None)
-        return None
-
+        estado.update(cnt=0, label=None); return None
     if label == estado["label"]:
-        estado["cnt"]      += 1
-        estado["area"]      = area
-        estado["x_centro"]  = x + bw // 2
+        estado["cnt"] += 1; estado["area"] = area
     else:
-        estado.update(label=label, cnt=1, area=area, x_centro=x + bw // 2)
-
-    na_borda = _checar_borda(x, bw, w_frame)
-
-    # Dispara se: (confirmado o suficiente) E (área OK OU na borda)
-    pronto_frames = estado["cnt"] >= CONFIRM_N
-    pronto_area   = area >= AREA_EXEC
-    pronto_borda  = na_borda and estado["cnt"] >= max(2, CONFIRM_N // 2)
-
-    if pronto_frames and (pronto_area or pronto_borda):
-        gatilho = "BORDA" if na_borda else "AREA"
-        _nav["ultimo_gatilho"] = gatilho
+        estado.update(label=label, cnt=1, area=area)
+    borda = _na_borda(x, bw, w)
+    if estado["cnt"] >= CONFIRM_N and (area >= AREA_EXEC or
+       (borda and estado["cnt"] >= max(2, CONFIRM_N//2))):
+        _nav["gatilho"] = "BORDA" if borda else "AREA"
         estado.update(cnt=0, label=None)
         return label
-
     return None
 
 
-#  [13] EXECUTOR
+# ================================================================
+#  [8] ESTADO / SERIAL / EXECUTOR
+# ================================================================
 
-def executar(label: str, ser):
-    if label not in ACOES:
-        return
-    a = ACOES[label]
+CMD = dict(mot=0, srv=127, buz=0, led=0, brk=0, dir=0, spd=0)
+_conf_esq = dict(label=None, cnt=0, area=0.0)
+_conf_dir = dict(label=None, cnt=0, area=0.0)
+_nav = dict(cooldown=0, ultimo=None, acao_label=None,
+            acao_t=0.0, acao_dur=0.0, gatilho="")
+
+
+def conectar_serial():
+    kws = ["arduino","ch340","cp210","uart"]
+    for p in serial.tools.list_ports.comports():
+        if any(k in (p.description or "").lower() for k in kws):
+            try:
+                s = serial.Serial(p.device, BAUD, timeout=0, write_timeout=0)
+                time.sleep(2); s.reset_input_buffer()
+                print(f"[SER] {p.device}", flush=True); return s
+            except Exception: pass
+    try:
+        s = serial.Serial(SERIAL_PORT, BAUD, timeout=0, write_timeout=0)
+        time.sleep(2); s.reset_input_buffer()
+        print(f"[SER] {SERIAL_PORT}", flush=True); return s
+    except Exception as e:
+        print(f"[SER] Simulação ({e})", flush=True); return None
+
+
+def enviar(ser):
+    j = (f'{{"mot":{CMD["mot"]},"srv":{CMD["srv"]},'
+         f'"buz":{CMD["buz"]},"led":{CMD["led"]},'
+         f'"brk":{CMD["brk"]},"dir":{CMD["dir"]},'
+         f'"spd":{CMD["spd"]}}}')
+    print(f"[CMD] {j}", flush=True)
+    if ser:
+        try: ser.write((j+"\n").encode())
+        except Exception: pass
+
+
+def executar(label, ser):
+    acao = LABEL_TO_ACTION.get(label)
+    if not acao or acao not in ACOES: return
+    a = ACOES[acao]
     CMD.update(mot=a["mot"], srv=a["srv"], buz=a["buz"],
                led=a["led"], brk=a["brk"], dir=a["dir"],
-               spd=0 if a["mot"] == 0 else (1 if a["mot"] < 50 else 2))
-    enviar(CMD, ser)
-    _nav.update(
-        acao_label=label,
-        acao_t=time.monotonic(),
-        acao_dur=a["dur"],
-        cooldown=COOLDOWN,
-        ultimo=label,
-    )
-    print(f"[NAV] ▶ {label}  [{_nav['ultimo_gatilho']}]", flush=True)
+               spd=0 if a["mot"]==0 else (1 if a["mot"]<50 else 2))
+    enviar(ser)
+    _nav.update(acao_label=acao, acao_t=time.monotonic(),
+                acao_dur=a["dur"], cooldown=COOLDOWN, ultimo=label)
+    print(f"[NAV] ▶ {acao} ← '{label}' [{_nav['gatilho']}]", flush=True)
 
 
-def tick(ser) -> bool:
+def tick(ser):
     lbl = _nav["acao_label"]
-    if lbl is None:
-        return False
-    if lbl == "OBSTACLE":
-        return True
-    dt = time.monotonic() - _nav["acao_t"]
-    if dt >= _nav["acao_dur"]:
+    if lbl is None: return False
+    if lbl == "OBSTACLE": return True
+    if time.monotonic() - _nav["acao_t"] >= _nav["acao_dur"]:
         CMD.update(mot=0, srv=127, buz=0, led=0, brk=0, dir=0, spd=0)
-        enviar(CMD, ser)
-        print(f"[NAV] ✅ Fim: {lbl}", flush=True)
-        _nav["acao_label"] = None
-        return False
+        enviar(ser)
+        print(f"[NAV] ✅ {lbl}", flush=True)
+        _nav["acao_label"] = None; return False
     return True
 
 
-def liberar_obstaculo(ser):
-    CMD.update(mot=0, srv=127, buz=0, led=0, brk=0, dir=0, spd=0)
-    enviar(CMD, ser)
-    print("[NAV] ✅ Obstáculo removido", flush=True)
-    _nav["acao_label"] = None
+# ================================================================
+#  [9] VISUALIZAÇÃO
+# ================================================================
 
-
-#  [14] VISUALIZAÇÃO BILATERAL
-
-CORES = {
-    "STOP":      (50,  50,  220),
-    "OBSTACLE":  (0,   0,   200),
-    "YIELD":     (0,   200, 220),
-    "LEFT":      (220, 120, 0  ),
-    "RIGHT":     (0,   120, 220),
-    "STRAIGHT":  (50,  220, 50 ),
-    "SLOW_DOWN": (0,   180, 255),
-    "SPEED_UP":  (0,   200, 100),
-}
-
-
-def desenhar(frame, esq, dir_, rejeitadas,
-             lbl_esq, conf_esq, lbl_dir, conf_dir,
-             fps, obstaculo):
-    out  = frame.copy()
+def desenhar(frame, esq, dir_, rej, lbl_e, lbl_d, conf_e, conf_d, fps, obst):
+    out = frame.copy()
     h, w = out.shape[:2]
-    cx   = w // 2
+    cx   = w//2
+    borda_px = int(w*BORDA_FRAC)
 
-    # ROI de placas (contorno amarelo)
-    cv2.rectangle(out, (0, int(h * ROI_Y0)), (w - 1, int(h * ROI_Y1)), (0, 200, 255), 1)
+    cv2.rectangle(out, (0,int(h*ROI_Y0)), (w-1,int(h*ROI_Y1)), (0,200,255), 1)
+    for yy in range(int(h*ROI_Y0), int(h*ROI_Y1), 8):
+        cv2.line(out, (cx,yy), (cx,yy+4), (0,200,255), 1)
+    for yy in range(int(h*ROI_Y0), int(h*ROI_Y1), 6):
+        cv2.line(out, (borda_px,yy), (borda_px,yy+3), (0,100,255), 1)
+        cv2.line(out, (w-borda_px,yy), (w-borda_px,yy+3), (0,100,255), 1)
 
-    # Linha divisória central (tracejada)
-    for yy in range(int(h * ROI_Y0), int(h * ROI_Y1), 8):
-        cv2.line(out, (cx, yy), (cx, yy + 4), (0, 200, 255), 1)
+    for x,y,bw,bh,mot in rej[:3]:
+        cv2.rectangle(out,(x,y),(x+bw,y+bh),(60,60,150),1)
 
-    # Zonas de borda (linhas verticais tracejadas)
-    borda_px_esq = int(w * BORDA_FRAC)
-    borda_px_dir = w - borda_px_esq
-    for yy in range(int(h * ROI_Y0), int(h * ROI_Y1), 6):
-        cv2.line(out, (borda_px_esq, yy), (borda_px_esq, yy + 3), (0, 120, 255), 1)
-        cv2.line(out, (borda_px_dir, yy), (borda_px_dir, yy + 3), (0, 120, 255), 1)
+    def _box(lista, lbl, conf, estado):
+        if not lista: return
+        x,y,bw,bh,area,_ = lista[0]
+        acao = LABEL_TO_ACTION.get(lbl,"") if lbl else ""
+        cor  = CORES_VIS.get(acao,(160,160,160))
+        thick = 3 if _na_borda(x,bw,w) else 2
+        cv2.rectangle(out,(x,y),(x+bw,y+bh),cor,thick)
+        if lbl:
+            txt = f"{lbl} {conf:.0%} [{estado['cnt']}/{CONFIRM_N}]"
+            cv2.rectangle(out,(x,y-18),(x+len(txt)*7,y),cor,-1)
+            cv2.putText(out,txt,(x+2,y-4),cv2.FONT_HERSHEY_SIMPLEX,0.38,(255,255,255),1)
+            prog = int(bw*min(estado["cnt"],CONFIRM_N)/CONFIRM_N)
+            cv2.rectangle(out,(x,y+bh+2),(x+bw,y+bh+6),(40,40,40),-1)
+            cv2.rectangle(out,(x,y+bh+2),(x+prog,y+bh+6),cor,-1)
 
-    # Labels "ESQ" / "DIR" na ROI
-    y_label = int(h * ROI_Y0) + 12
-    cv2.putText(out, "ESQ", (6, y_label),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 200, 255), 1)
-    cv2.putText(out, "DIR", (w - 35, y_label),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 200, 255), 1)
+    _box(esq, lbl_e, conf_e, _conf_esq)
+    _box(dir_, lbl_d, conf_d, _conf_dir)
 
-    # Rejeitadas (cinza)
-    for x, y, bw, bh, motivo in rejeitadas[:4]:
-        cv2.rectangle(out, (x, y), (x + bw, y + bh), (60, 60, 160), 1)
-        cv2.putText(out, motivo[:14], (x, y - 2),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.22, (80, 80, 180), 1)
+    if obst:
+        cv2.rectangle(out,(0,int(h*OBST_Y0)),(w-1,h-1),(0,0,255),2)
+        cv2.putText(out,"OBSTACULO",(w//2-55,h-8),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,0,255),2)
 
-    def _desenhar_candidata(lista, label_raw, conf, conf_estado):
-        if not lista:
-            return
-        x, y, bw, bh, area, _ = lista[0]
-        x_centro = x + bw // 2
+    pw = 200
+    pan = np.zeros((h,pw,3),np.uint8); pan[:]=(18,18,18)
+    cv2.rectangle(pan,(0,0),(pw-1,h-1),(45,45,45),1)
+    def t(s,l,cor=(190,190,190),sc=0.34):
+        cv2.putText(pan,s,(5,14+l*16),cv2.FONT_HERSHEY_SIMPLEX,sc,cor,1)
 
-        # Cor base pela área/borda
-        na_borda = _checar_borda(x, bw, w)
-        cor_box  = CORES.get(label_raw, (180, 180, 180)) if label_raw else (100, 100, 100)
-        thick    = 3 if na_borda or conf_estado["cnt"] >= CONFIRM_N - 1 else 2
-
-        cv2.rectangle(out, (x, y), (x + bw, y + bh), cor_box, thick)
-
-        # Marcador de borda
-        if na_borda:
-            cv2.putText(out, "⚡BORDA", (x, y - 14),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.32, (0, 255, 255), 1)
-
-        if label_raw:
-            txt = f"{label_raw} {conf:.2f} [{conf_estado['cnt']}/{CONFIRM_N}]"
-            (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)
-            cv2.rectangle(out, (x, y - th - 8), (x + tw + 4, y), cor_box, -1)
-            cv2.putText(out, txt, (x + 2, y - 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 255, 255), 1)
-
-            # Barra de confirmação
-            prog = int(bw * min(conf_estado["cnt"], CONFIRM_N) / CONFIRM_N)
-            cv2.rectangle(out, (x, y + bh + 2), (x + bw, y + bh + 7), (40, 40, 40), -1)
-            cv2.rectangle(out, (x, y + bh + 2), (x + prog, y + bh + 7), cor_box, -1)
-
-    _desenhar_candidata(esq,  lbl_esq, conf_esq, _conf_esq)
-    _desenhar_candidata(dir_, lbl_dir, conf_dir, _conf_dir)
-
-    # Obstáculo
-    if obstaculo:
-        cv2.rectangle(out, (0, int(h * OBST_Y0)), (w - 1, h - 1), (0, 0, 255), 2)
-        cv2.putText(out, "OBSTACULO", (w // 2 - 55, h - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 0, 255), 2)
-
-    # ── Painel lateral ───────────────────────────────────────────
-    pw  = 215
-    pan = np.zeros((h, pw, 3), np.uint8)
-    pan[:] = (18, 18, 18)
-    cv2.rectangle(pan, (0, 0), (pw - 1, h - 1), (45, 45, 45), 1)
-
-    def t(s, l, cor=(190, 190, 190), sc=0.35):
-        cv2.putText(pan, s, (5, 14 + l * 16),
-                    cv2.FONT_HERSHEY_SIMPLEX, sc, cor, 1)
-
-    t(f"FPS: {fps}", 0, (255, 255, 255), 0.40)
-
+    t(f"FPS:{fps}",0,(255,255,255),0.40)
     acao = _nav["acao_label"]
     if acao:
-        cor_a = CORES.get(acao, (200, 200, 200))
-        t(f"EXEC: {acao}", 1, cor_a, 0.40)
-        if acao != "OBSTACLE":
-            dt = time.monotonic() - _nav["acao_t"]
-            t(f"  {dt:.1f}s / {_nav['acao_dur']}s", 2, cor_a)
-        else:
-            t("  aguard. sumir...", 2, (0, 0, 200), 0.30)
-        t(f"  gatilho: {_nav['ultimo_gatilho']}", 3, (200, 200, 0), 0.30)
+        cor_a = CORES_VIS.get(acao,(200,200,200))
+        t(f"EXEC:{acao}",1,cor_a,0.40)
+        if acao!="OBSTACLE":
+            t(f" {time.monotonic()-_nav['acao_t']:.1f}s/{_nav['acao_dur']}s",2,cor_a)
     else:
-        t("livre", 1, (100, 200, 100))
-        t(f"cooldown: {_nav['cooldown']}", 2, (80, 80, 80))
+        t("livre",1,(100,200,100))
+        t(f"cd:{_nav['cooldown']}",2,(80,80,80))
+    t("─ESQ─",4,(60,60,60))
+    t(f"'{lbl_e or '-'}' {conf_e:.0%}",5,CORES_VIS.get(LABEL_TO_ACTION.get(lbl_e,""),  (140,140,140)))
+    t(f"f:{_conf_esq['cnt']}/{CONFIRM_N}",6)
+    t("─DIR─",8,(60,60,60))
+    t(f"'{lbl_d or '-'}' {conf_d:.0%}",9,CORES_VIS.get(LABEL_TO_ACTION.get(lbl_d,""),  (140,140,140)))
+    t(f"f:{_conf_dir['cnt']}/{CONFIRM_N}",10)
+    t("─ÚLTIMO─",12,(60,60,60))
+    t(f"  {_nav['ultimo'] or '-'}",13,CORES_VIS.get(LABEL_TO_ACTION.get(_nav['ultimo'],""), (160,160,160)))
+    t("OBST:SIM" if obst else "obst:nao",15,(0,0,255) if obst else (80,180,80))
 
-    # Lado esquerdo
-    t("── LADO ESQ ──", 5,  (60, 60, 60))
-    lbl_e = lbl_esq or "-"
-    cor_e = CORES.get(lbl_esq, (140, 140, 140)) if lbl_esq else (80, 80, 80)
-    t(f"label: {lbl_e}", 6,  cor_e)
-    t(f"conf:  {conf_esq:.2f}", 7)
-    t(f"frames:{_conf_esq['cnt']}/{CONFIRM_N}", 8)
-    borda_e = _checar_borda(_conf_esq.get("x_centro", 0) - 1,
-                            2, w) if _conf_esq["cnt"] > 0 else False
-    t("BORDA!" if borda_e else "centro", 9,
-      (0, 255, 255) if borda_e else (80, 80, 80), 0.30)
-
-    # Lado direito
-    t("── LADO DIR ──", 11, (60, 60, 60))
-    lbl_d = lbl_dir or "-"
-    cor_d = CORES.get(lbl_dir, (140, 140, 140)) if lbl_dir else (80, 80, 80)
-    t(f"label: {lbl_d}", 12, cor_d)
-    t(f"conf:  {conf_dir:.2f}", 13)
-    t(f"frames:{_conf_dir['cnt']}/{CONFIRM_N}", 14)
-    borda_d = _checar_borda(_conf_dir.get("x_centro", 0) - 1,
-                            2, w) if _conf_dir["cnt"] > 0 else False
-    t("BORDA!" if borda_d else "centro", 15,
-      (0, 255, 255) if borda_d else (80, 80, 80), 0.30)
-
-    # Último executado
-    t("── ÚLTIMO ──", 17, (60, 60, 60))
-    ult = _nav["ultimo"] or "-"
-    t(f"  {ult}", 18, CORES.get(ult, (160, 160, 160)))
-
-    # Obstáculo
-    t("── OBSTÁCULO ──", 20, (60, 60, 60))
-    t("SIM" if obstaculo else "não", 21,
-      (0, 0, 255) if obstaculo else (80, 180, 80))
-
-    return np.hstack([out, pan])
+    return np.hstack([out,pan])
 
 
-#  [15] LOOP PRINCIPAL
+# ================================================================
+#  [10] MODO --test (diagnóstico com foto)
+# ================================================================
 
-def main(usar_camera=False):
-    global _ser
+def modo_teste(caminhos, conf_min, top_n):
+    try:
+        interp, labels, in_idx, out_idx = carregar_modelo()
+    except (FileNotFoundError, ImportError) as e:
+        print(e); sys.exit(1)
+
+    sz = interp.get_input_details()[0]["shape"][1]
+
+    for caminho in caminhos:
+        img = cv2.imread(caminho)
+        if img is None:
+            print(f"[ERRO] {caminho}"); continue
+
+        h, w = img.shape[:2]
+        lbl, conf, probs = classificar(img, interp, labels, in_idx, out_idx)
+        top_idx = np.argsort(probs)[::-1][:min(top_n, len(labels))]
+
+        print(f"\n{'='*55}")
+        print(f"  {os.path.basename(caminho)}  ({w}×{h}px)")
+        print(f"{'='*55}")
+        print(f"  #   Lbl   Conf    Classe               Ação")
+        print(f"  {'-'*52}")
+        for i, idx in enumerate(top_idx):
+            l = labels[idx]; c = probs[idx]
+            acao  = LABEL_TO_ACTION.get(l,"—")
+            nome  = LABEL_NAMES.get(l,l)
+            marca = "◄" if i==0 else " "
+            dim   = "" if c >= conf_min else "  (< limiar)"
+            print(f"  {i+1}{marca} '{l}'  {c*100:5.1f}%  {nome:<22} {acao}{dim}")
+
+        best_lbl = labels[top_idx[0]]
+        best_conf = probs[top_idx[0]]
+        print(f"\n  {'AÇÃO' if best_conf>=conf_min else 'BAIXA CONF'}: "
+              f"'{best_lbl}' {best_conf*100:.1f}% → "
+              f"{LABEL_TO_ACTION.get(best_lbl,'—') if best_conf>=conf_min else 'não dispara'}")
+        print(f"{'='*55}\n")
+
+        # Painel visual: original | símbolo extraído
+        orig_r   = cv2.resize(img, (sz, sz))
+        prep_vis = cv2.cvtColor(prep_sign(img,sz).astype(np.uint8), cv2.COLOR_RGB2BGR)
+        painel   = np.hstack([orig_r, prep_vis])
+        cv2.putText(painel, "ORIGINAL", (2,12), cv2.FONT_HERSHEY_SIMPLEX, 0.35,(0,220,80),1)
+        cv2.putText(painel, "SIMBOLO",  (sz+2,12), cv2.FONT_HERSHEY_SIMPLEX, 0.35,(0,220,80),1)
+        cv2.putText(painel, f"'{best_lbl}' {best_conf*100:.0f}%",
+                    (4,sz-6), cv2.FONT_HERSHEY_SIMPLEX, 0.40,(0,220,80),1)
+        cv2.imshow(f"SIGN_DETECTOR — {os.path.basename(caminho)}", painel)
+        cv2.waitKey(0)
+
+    cv2.destroyAllWindows()
+
+
+# ================================================================
+#  [11] MODO --collect (coleta de amostras)
+# ================================================================
+
+def modo_collect(label, n_alvo, cam_idx, delay, manual, out_dir, sz):
+    pasta = os.path.join(out_dir, "train", label)
+    os.makedirs(pasta, exist_ok=True)
+    existentes = len([f for f in os.listdir(pasta) if f.endswith(".jpg")])
+    print(f"\n[COLLECT] '{label}' | alvo: {existentes+n_alvo} | pasta: {pasta}")
+    print(f"[COLLECT] {'MANUAL (ESPAÇO)' if manual else f'AUTO ({delay}s)'} | Q=sair\n")
+
+    cap = cv2.VideoCapture(cam_idx, cv2.CAP_DSHOW)
+    if not cap.isOpened(): cap = cv2.VideoCapture(cam_idx)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    contador = existentes
+    t_ultima = 0.0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret: break
+
+        vis   = frame.copy()
+        h, w  = frame.shape[:2]
+        y0, y1 = int(h*0.05), int(h*0.90)
+        roi   = frame[y0:y1]
+        hsv   = cv2.GaussianBlur(cv2.cvtColor(roi,cv2.COLOR_BGR2HSV),(5,5),0)
+        mask  = np.zeros(hsv.shape[:2],np.uint8)
+        for ranges in HSV_RANGES.values():
+            for lo,hi in ranges:
+                mask = cv2.bitwise_or(mask, cv2.inRange(hsv,lo,hi))
+        mask = cv2.morphologyEx(mask,cv2.MORPH_CLOSE,K5)
+        mask = cv2.morphologyEx(mask,cv2.MORPH_OPEN,K3)
+        cnts,_ = cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+
+        bbox = None
+        if cnts:
+            c = max(cnts, key=cv2.contourArea)
+            if cv2.contourArea(c) > 500:
+                x,y,bw,bh = cv2.boundingRect(c)
+                if 0.3 < bw/max(bh,1) < 2.5:
+                    pad = int(max(bw,bh)*0.10)
+                    bbox = (max(0,x-pad), max(0,y+y0-pad),
+                            min(w,x+bw+pad), min(h,y+y0+bh+pad))
+                    cv2.rectangle(vis,bbox[:2],bbox[2:],(0,220,80),2)
+
+        agora = time.monotonic()
+        total_alvo = existentes+n_alvo
+        prog  = int((contador-existentes)/n_alvo*30) if n_alvo>0 else 0
+        barra = "█"*prog + "░"*(30-prog)
+        cv2.putText(vis,f"[{barra}] {contador}/{total_alvo}",(10,25),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.50,(255,255,255),1)
+        cv2.putText(vis,f"Label: {label}",(10,45),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.50,(200,200,255),1)
+
+        cv2.imshow(f"COLLECT — {label}", vis)
+        k = cv2.waitKey(1) & 0xFF
+        if k == ord('q'): break
+
+        capturar = (bbox and not manual and (agora-t_ultima) >= delay) or \
+                   (k == ord(' ') and bbox)
+        if capturar and bbox:
+            x1,y1_,x2,y2 = bbox
+            crop = frame[y1_:y2, x1:x2]
+            if crop.size == 0: continue
+            img_s = cv2.cvtColor(prep_sign(crop,sz).astype(np.uint8), cv2.COLOR_RGB2BGR)
+            caminho = os.path.join(pasta, f"{contador:05d}.jpg")
+            cv2.imwrite(caminho, img_s)
+            contador += 1; t_ultima = agora
+            print(f"  [{contador}/{total_alvo}] {caminho}", flush=True)
+            if contador >= total_alvo:
+                print(f"[OK] {n_alvo} amostras coletadas"); break
+
+    cap.release(); cv2.destroyAllWindows()
+    print(f"[COLLECT] Total em '{pasta}': {contador}")
+
+
+# ================================================================
+#  [12] MODO CÂMERA/VÍDEO (vida real)
+# ================================================================
+
+def modo_camera(usar_camera):
+    try:
+        interp, labels, in_idx, out_idx = carregar_modelo()
+    except (FileNotFoundError, ImportError) as e:
+        print(e); sys.exit(1)
 
     src = CAM_IDX if usar_camera else VIDEO
     print(f"[CAM] {'Câmera' if usar_camera else 'Vídeo'}: {src}", flush=True)
 
     cap = cv2.VideoCapture(src, cv2.CAP_DSHOW if usar_camera else cv2.CAP_ANY)
     if not cap.isOpened():
-        print("[ERRO] Não abriu fonte de vídeo."); sys.exit(1)
-
+        print("[ERRO] Fonte de vídeo não abriu"); sys.exit(1)
     if usar_camera:
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        cap.set(cv2.CAP_PROP_FPS,          30)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-    _ser = conectar_serial()
+    ser = conectar_serial()
     fps_t = time.monotonic(); fps_n = fps = 0
-
     print("[OK] Rodando — Q para sair\n", flush=True)
 
     while True:
@@ -753,114 +580,101 @@ def main(usar_camera=False):
         if not ret:
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0); continue
 
-        h_r = round(frame_big.shape[0] / PROP)
-        w_r = round(frame_big.shape[1] / PROP)
-        frame = cv2.resize(frame_big, (w_r, h_r))
-        w_frame = w_r
+        h = round(frame_big.shape[0]/PROP)
+        w = round(frame_big.shape[1]/PROP)
+        frame = cv2.resize(frame_big, (w,h))
 
-        if _nav["cooldown"] > 0:
-            _nav["cooldown"] -= 1
+        if _nav["cooldown"] > 0: _nav["cooldown"] -= 1
+        em_acao = tick(ser)
 
-        em_acao = tick(_ser)
-
-        # ── Detecção principal ────────────────────────────────────
-        esq, dir_, rejeitadas = localizar_candidatas(frame)
-
-        lbl_esq = conf_esq_raw = None
-        lbl_dir = conf_dir_raw = None
-        obstaculo = False
+        esq, dir_, rej = localizar_candidatas(frame)
+        lbl_e = lbl_d = None
+        conf_e = conf_d = 0.0
+        obst = False
 
         if _nav["cooldown"] == 0 and not em_acao:
-
-            # ── Lado esquerdo ─────────────────────────────────────
             if esq:
-                x, y, bw, bh, area, crop = esq[0]
-                lbl_esq, conf_esq_raw, _ = classificar(crop)
-                confirmado = confirmar_lado(
-                    _conf_esq, lbl_esq, area, x, bw, w_frame)
-                if confirmado:
-                    executar(confirmado, _ser)
+                x,y,bw,bh,area,crop = esq[0]
+                lbl_e, conf_e, _ = classificar(crop, interp, labels, in_idx, out_idx)
+                if conf_e < CONF_MIN: lbl_e = None
+                confirmado = confirmar_lado(_conf_esq, lbl_e, area, x, bw, w)
+                if confirmado: executar(confirmado, ser)
             else:
-                confirmar_lado(_conf_esq, None, 0, 0, 0, w_frame)
+                confirmar_lado(_conf_esq, None, 0, 0, 0, w)
 
-            # ── Lado direito ──────────────────────────────────────
             if dir_ and not em_acao and _nav["cooldown"] == 0:
-                x, y, bw, bh, area, crop = dir_[0]
-                lbl_dir, conf_dir_raw, _ = classificar(crop)
-                confirmado = confirmar_lado(
-                    _conf_dir, lbl_dir, area, x, bw, w_frame)
-                if confirmado:
-                    executar(confirmado, _ser)
+                x,y,bw,bh,area,crop = dir_[0]
+                lbl_d, conf_d, _ = classificar(crop, interp, labels, in_idx, out_idx)
+                if conf_d < CONF_MIN: lbl_d = None
+                confirmado = confirmar_lado(_conf_dir, lbl_d, area, x, bw, w)
+                if confirmado: executar(confirmado, ser)
             else:
-                confirmar_lado(_conf_dir, None, 0, 0, 0, w_frame)
+                confirmar_lado(_conf_dir, None, 0, 0, 0, w)
 
-            # ── Sem placas → verifica obstáculo ───────────────────
             if not esq and not dir_:
-                obstaculo = detectar_obstaculo(frame)
-                if obstaculo and _nav["acao_label"] is None:
-                    executar("OBSTACLE", _ser)
+                obst = detectar_obstaculo(frame)
+                if obst and _nav["acao_label"] is None:
+                    executar("OBSTACLE", ser)
 
-        # ── Libera obstáculo quando some ─────────────────────────
         if _nav["acao_label"] == "OBSTACLE":
-            obstaculo = detectar_obstaculo(frame)
-            if not obstaculo:
-                liberar_obstaculo(_ser)
+            obst = detectar_obstaculo(frame)
+            if not obst:
+                CMD.update(mot=0,srv=127,buz=0,led=0,brk=0,dir=0,spd=0)
+                enviar(ser)
+                _nav["acao_label"] = None
 
-        # ── Visualização ──────────────────────────────────────────
-        vis = desenhar(frame, esq, dir_, rejeitadas,
-                       lbl_esq, conf_esq_raw or 0.0,
-                       lbl_dir, conf_dir_raw or 0.0,
-                       fps, obstaculo)
-        cv2.imshow("Detector de Placas", vis)
+        vis = desenhar(frame, esq, dir_, rej, lbl_e, lbl_d, conf_e, conf_d, fps, obst)
+        cv2.imshow("SIGN_DETECTOR", vis)
 
         fps_n += 1
-        if time.monotonic() - fps_t >= 1.0:
-            fps = fps_n; fps_n = 0; fps_t = time.monotonic()
+        if time.monotonic()-fps_t >= 1.0:
+            fps=fps_n; fps_n=0; fps_t=time.monotonic()
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
-    CMD.update(mot=0, srv=127, buz=0, led=0, brk=1, dir=0, spd=0)
-    enviar(CMD, _ser)
-    if _ser: _ser.close()
+    CMD.update(mot=0,srv=127,buz=0,led=0,brk=1,dir=0,spd=0)
+    enviar(ser)
+    if ser: ser.close()
     cap.release(); cv2.destroyAllWindows()
     print("[OK] Encerrado.", flush=True)
 
 
-#  CALIBRAÇÃO HSV
-
-def calibrar():
-    cap = cv2.VideoCapture(CAM_IDX, cv2.CAP_DSHOW)
-    if not cap.isOpened(): cap = cv2.VideoCapture(VIDEO)
-    if not cap.isOpened(): return
-
-    win = "Calibrar HSV — S=salvar Q=sair"
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL); cv2.resizeWindow(win, 1000, 520)
-    for n, v in [("H_min", 0), ("S_min", 80), ("V_min", 50),
-                 ("H_max", 15), ("S_max", 255), ("V_max", 255)]:
-        cv2.createTrackbar(n, win, v, 180 if "H" in n else 255, lambda x: None)
-
-    print("[CAL] S=salvar  Q=sair")
-    while True:
-        ret, f = cap.read()
-        if not ret: break
-        f   = cv2.resize(f, (f.shape[1] // PROP, f.shape[0] // PROP))
-        hsv = cv2.cvtColor(f, cv2.COLOR_BGR2HSV)
-        lo  = np.array([cv2.getTrackbarPos(n, win) for n in ("H_min","S_min","V_min")])
-        hi  = np.array([cv2.getTrackbarPos(n, win) for n in ("H_max","S_max","V_max")])
-        mask = cv2.inRange(hsv, lo, hi)
-        res  = cv2.bitwise_and(f, f, mask=mask)
-        cv2.putText(res, f"lo={lo.tolist()} hi={hi.tolist()}", (6, 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 180), 1)
-        cv2.imshow(win, np.hstack([f, res]))
-        k = cv2.waitKey(1) & 0xFF
-        if k == ord('s'): print(f"[CAL] lo={lo.tolist()}, hi={hi.tolist()}")
-        elif k == ord('q'): break
-    cap.release(); cv2.destroyAllWindows()
-
+# ================================================================
+#  ENTRY POINT
+# ================================================================
 
 if __name__ == "__main__":
-    arg = sys.argv[1] if len(sys.argv) > 1 else ""
-    if   arg == "--cam": main(usar_camera=True)
-    elif arg == "--cal": calibrar()
-    else:                main(usar_camera=False)
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        description="SIGN_DETECTOR — detector de placas",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    ap.add_argument("--test",    nargs="+", metavar="FOTO",
+                    help="Testa uma ou mais fotos")
+    ap.add_argument("--conf",    type=float, default=0.60,
+                    help="Confiança mínima (padrão: 0.60)")
+    ap.add_argument("--top",     type=int,   default=3,
+                    help="Quantos resultados mostrar no --test")
+    ap.add_argument("--cam",     action="store_true",
+                    help="Câmera USB ao vivo")
+    ap.add_argument("--collect", metavar="LABEL",
+                    help="Coleta amostras: --collect Pare")
+    ap.add_argument("--n",       type=int,   default=200,
+                    help="Amostras a coletar (padrão: 200)")
+    ap.add_argument("--delay",   type=float, default=0.2,
+                    help="Segundos entre capturas automáticas")
+    ap.add_argument("--manual",  action="store_true",
+                    help="Captura só com ESPAÇO")
+    ap.add_argument("--out",     default="./dataset_circuito",
+                    help="Pasta do dataset para --collect")
+    args = ap.parse_args()
+
+    if args.test:
+        modo_teste(args.test, args.conf, args.top)
+    elif args.collect:
+        modo_collect(args.collect, args.n, CAM_IDX, args.delay,
+                     args.manual, args.out, 96)
+    else:
+        modo_camera(usar_camera=args.cam)
