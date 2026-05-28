@@ -73,18 +73,23 @@ ACOES = {
 }
 
 LABEL_TO_ACTION = {
-    "B": "SLOW_DOWN", "F": "SLOW_DOWN", "K": "STOP",
-    "N": "STRAIGHT",  "P": "STRAIGHT",  "S": "STOP",
-    "T": "STRAIGHT",  "U": "SPEED_UP",  "W": "SLOW_DOWN",
-    "Y": "YIELD",
+    "S": "STOP",      # Stop / Red Light / No Stopping
+    "L": "LEFT",      # Turn Left
+    "R": "RIGHT",     # Turn Right
+    "Y": "YIELD",     # Pedestrian Crossing
+    "N": "STRAIGHT",  # No U-Turn / Don't Turn
+    "G": "SPEED_UP",  # Green Traffic Light
+    "W": "SLOW_DOWN", # Yellow Traffic Light / Speed limits
 }
 
 LABEL_NAMES = {
-    "B": "Bump/Road_Work",  "F": "Speed_Limit_90",
-    "K": "No_Stopping",     "N": "No_U-Turn",
-    "P": "No_Parking",      "S": "Stop/Pare",
-    "T": "Sentido_Obrig.",  "U": "Speed_Limit_120",
-    "W": "Speed_Limit_40",  "Y": "Pedestrian",
+    "S": "Stop / Red Light",
+    "L": "Turn Left",
+    "R": "Turn Right",
+    "Y": "Pedestrian Crossing",
+    "N": "No Turn / No U-Turn",
+    "G": "Green Light / Go",
+    "W": "Yellow Light / Slow",
 }
 
 CORES_VIS = {

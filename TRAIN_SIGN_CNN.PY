@@ -87,38 +87,40 @@ SEED         = 42
 
 # ── Mapeamento classe → comando serial ───────────────────────────
 # Dataset original
+# ── Dataset novo (DS2 tratado) ──────────────────────────────────
+# Pasta: dataset_novo/train/<CMD>/  onde CMD é direto o label
+# Não há mapeamento classe→cmd porque as pastas JÁ são os cmds
 CLASS_TO_CMD = {
+    # Dataset novo — pastas já nomeadas pelo CMD
+    "S": "S",   # Stop / Red Traffic Light / No Stopping → STOP
+    "L": "L",   # Turn Left                              → LEFT
+    "R": "R",   # Turn Right                             → RIGHT
+    "Y": "Y",   # Pedestrian Crossing                    → YIELD
+    "N": "N",   # No U-Turn / Don't Turn                 → STRAIGHT
+    "G": "G",   # Green Traffic Light                    → SPEED_UP
+    "W": "W",   # Yellow Traffic Light                   → SLOW_DOWN
+    # Dataset original (opcional, se quiser combinar)
     "Stop":            "S",
     "Pedestrian":      "Y",
     "Speed_Limit_40":  "W",
-    "Speed_Limit_90":  "F",
-    "Speed_Limit_120": "U",
+    "Speed_Limit_90":  "W",
+    "Speed_Limit_120": "G",
     "No_U-Turn":       "N",
-    "No_Stopping":     "K",
-    "No_Parking":      "P",
-    "Bump":            "B",
-    "Road_Work":       "B",
-    # Placas do circuito — adicione aqui quando tiver
-    "Pare":            "S",   # → STOP
-    "Pedestre":        "Y",   # → YIELD / STOP
-    "Semaforo":        "S",   # → STOP
-    "Sentido_Ob":      "T",   # → STRAIGHT (novo label)
-    "Proibido":        "K",   # → STOP
-    # Adicione mais conforme seu circuito
+    "No_Stopping":     "S",
+    "No_Parking":      "N",
+    "Bump":            "W",
+    "Road_Work":       "W",
 }
 
 # ── Mapeamento label → ação do carro ────────────────────────────
 LABEL_TO_ACTION = {
-    "B": "SLOW_DOWN",
-    "F": "SLOW_DOWN",
-    "K": "STOP",
-    "N": "STRAIGHT",
-    "P": "STRAIGHT",
     "S": "STOP",
-    "T": "STRAIGHT",
-    "U": "SPEED_UP",
-    "W": "SLOW_DOWN",
+    "L": "LEFT",
+    "R": "RIGHT",
     "Y": "YIELD",
+    "N": "STRAIGHT",
+    "G": "SPEED_UP",
+    "W": "SLOW_DOWN",
 }
 
 
