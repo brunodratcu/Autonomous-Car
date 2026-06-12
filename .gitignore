@@ -2,6 +2,8 @@ videoplayback.mp4
 # Dataset — pode ser gigabyte, não sobe no git
 dataset_tratado/
 dataset/
+dataset_novo/
+
 *.zip
 
 sign_model.tflite
