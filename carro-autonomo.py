@@ -72,14 +72,45 @@ ACOES = {
     "SPEED_UP":  dict(mot=80, srv=127, buz=0, led=0, brk=0, dir=3, dur=2.0),
 }
 
+# Labels = nomes completos (dataset_v3: 8 classes)
 LABEL_TO_ACTION = {
-    "S":"STOP", "L":"LEFT",  "R":"RIGHT",
-    "Y":"YIELD","N":"STRAIGHT","G":"SPEED_UP","W":"SLOW_DOWN",
+    "Stop":       "STOP",
+    "Esquerda":   "LEFT",
+    "Direita":    "RIGHT",
+    "SemRetorno": "STRAIGHT",
+    "Verde":      "SPEED_UP",
+    "Cone":       "OBSTACLE",
+    "Carro":      "OBSTACLE",
+    "Pessoa":     "OBSTACLE",
+    # Compatibilidade legada
+    "S":"STOP","L":"LEFT","R":"RIGHT","N":"STRAIGHT",
+    "G":"SPEED_UP","W":"SLOW_DOWN","Y":"YIELD",
 }
 LABEL_NAMES = {
-    "S":"Stop/Pare",    "L":"Vira Esq",  "R":"Vira Dir",
-    "Y":"Pedestre",     "N":"Sem Retorno","G":"Siga","W":"Devagar",
+    "Stop":       "Pare/Stop",
+    "Esquerda":   "Vira Esquerda",
+    "Direita":    "Vira Direita",
+    "SemRetorno": "Sem Retorno",
+    "Verde":      "Semáforo Verde",
+    "Cone":       "Cone na Pista",
+    "Carro":      "Carro na Pista",
+    "Pessoa":     "Pessoa na Pista",
 }
+_OBSTACLE_LABELS = {"Cone","Carro","Pessoa"}
+# Thresholds adaptativos — carregados de sign_thresholds.txt
+_THRESHOLDS = {}
+def _carregar_thresh():
+    global _THRESHOLDS
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)),"sign_thresholds.txt")
+    if os.path.isfile(p):
+        with open(p) as f:
+            for line in f:
+                parts = line.strip().split(",")
+                if len(parts)==2:
+                    _THRESHOLDS[parts[0]] = float(parts[1])
+        print(f"[CNN] Thresholds: {_THRESHOLDS}", flush=True)
+    else:
+        print("[CNN] sign_thresholds.txt não encontrado — usando CONF_MIN padrão", flush=True)
 CORES = {
     "STOP":(50,50,220),"OBSTACLE":(0,0,200),"YIELD":(0,200,220),
     "LEFT":(220,120,0),"RIGHT":(0,120,220),"STRAIGHT":(50,220,50),
@@ -152,6 +183,28 @@ def prep_sign(img, sz=96):
     return cv2.cvtColor(t, cv2.COLOR_GRAY2RGB).astype(np.float32)
 
 # ================================================================
+#  PRÉ-PROCESSADOR DE OBSTÁCULOS — RGB preservado
+# ================================================================
+
+def prep_obstacle(img, sz=96):
+    """Obstáculos: RGB completo com CLAHE suave."""
+    if img is None or img.size == 0:
+        return np.zeros((sz,sz,3), np.float32)
+    img_r = cv2.resize(img,(sz,sz),interpolation=cv2.INTER_AREA)
+    lab   = cv2.cvtColor(img_r,cv2.COLOR_BGR2LAB)
+    lab[:,:,0]=cv2.createCLAHE(clipLimit=2.0,tileGridSize=(4,4)).apply(lab[:,:,0])
+    out = cv2.cvtColor(lab,cv2.COLOR_LAB2BGR)
+    return cv2.cvtColor(out,cv2.COLOR_BGR2RGB).astype(np.float32)
+
+_OBSTACLE_LABELS = {"Cone","Carro","Pessoa"}
+
+def prep_auto(img, label=None, sz=96):
+    """Roteia para o pipeline correto baseado no label classificado."""
+    if label in _OBSTACLE_LABELS:
+        return prep_obstacle(img, sz)
+    return prep_sign(img, sz)
+
+# ================================================================
 #  MODELO
 # ================================================================
 
@@ -172,16 +225,36 @@ def carregar_modelo():
     ii  = interp.get_input_details()[0]["index"]
     oi  = interp.get_output_details()[0]["index"]
     sz  = interp.get_input_details()[0]["shape"][1]
+    _carregar_thresh()
     print(f"[CNN] {len(labels)} classes: {labels} | {sz}×{sz}", flush=True)
     return interp, labels, ii, oi
 
 def classificar(crop, interp, labels, ii, oi):
-    sz = interp.get_input_details()[0]["shape"][1]
+    """
+    Inferência com threshold adaptativo por classe.
+    Retorna (label, confiança, probs).
+    Se confiança < threshold da classe → retorna None.
+    """
+    sz    = interp.get_input_details()[0]["shape"][1]
+    # Primeira passagem: usa prep_sign para todos
+    # (obstáculos serão reclassificados se necessário)
     interp.set_tensor(ii, np.expand_dims(prep_sign(crop, sz), 0))
     interp.invoke()
-    p = interp.get_tensor(oi)[0]
-    b = int(np.argmax(p))
-    return labels[b], float(p[b]), p
+    p     = interp.get_tensor(oi)[0]
+    b     = int(np.argmax(p))
+    lbl   = labels[b]; conf = float(p[b])
+
+    # Se top label é obstáculo, reprocessa com RGB
+    if lbl in _OBSTACLE_LABELS:
+        interp.set_tensor(ii, np.expand_dims(prep_obstacle(crop, sz), 0))
+        interp.invoke()
+        p2   = interp.get_tensor(oi)[0]
+        b2   = int(np.argmax(p2)); conf2 = float(p2[b2])
+        # Usa o resultado mais confiante
+        if conf2 > conf:
+            p = p2; b = b2; lbl = labels[b]; conf = conf2
+
+    return lbl, conf, p
 
 # ================================================================
 #  DETECÇÃO — HSV + validação geométrica
@@ -541,7 +614,8 @@ def main(usar_camera):
             if esq:
                 x,y,bw,bh,area,crop,_ = esq[0]
                 le,ce,_ = classificar(crop,interp,labels,ii,oi)
-                if ce < (CONF_BORDA if _borda(x,bw,w) else CONF_MIN): le=None
+                thr_e = _THRESHOLDS.get(le, CONF_BORDA if _borda(x,bw,w) else CONF_MIN)
+                if ce < thr_e: le=None
                 conf = confirmar(_esq,le,area,x,bw,w)
                 if conf: executar(conf,ser)
             else:
@@ -550,7 +624,8 @@ def main(usar_camera):
             if dir_ and not em_acao and _nav["cooldown"]==0:
                 x,y,bw,bh,area,crop,_ = dir_[0]
                 ld,cd,_ = classificar(crop,interp,labels,ii,oi)
-                if cd < (CONF_BORDA if _borda(x,bw,w) else CONF_MIN): ld=None
+                thr_d = _THRESHOLDS.get(ld, CONF_BORDA if _borda(x,bw,w) else CONF_MIN)
+                if cd < thr_d: ld=None
                 conf = confirmar(_dir,ld,area,x,bw,w)
                 if conf: executar(conf,ser)
             else:
