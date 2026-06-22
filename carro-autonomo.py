@@ -1,65 +1,128 @@
 """
 ================================================================
-  SIGN_DETECTOR.py — Detector de placas
+  SIGN_DETECTOR.py  v4.0 — YOLOv8n + ByteTrack + ONNX
   ─────────────────────────────────────────────────────────────
-  USO:
-    python SIGN_DETECTOR.py            ← vídeo (videoplayback.mp4)
-    python SIGN_DETECTOR.py --cam      ← câmera USB
-    python SIGN_DETECTOR.py --test foto.jpg
-    python SIGN_DETECTOR.py --collect Pare
+  Pipeline:
+    Câmera/Vídeo
+       ↓
+    YOLOv8n (ONNX Runtime — CPU otimizado)
+       ↓
+    Bounding Boxes + Classe + Confiança
+       ↓
+    ByteTrack  (ID persistente por objeto)
+       ↓
+    Threshold por classe (sign_thresholds.txt)
+       ↓
+    Filtro temporal  (N frames consecutivos)
+       ↓
+    Test Time Augmentation  (flip + brilho → média)
+       ↓
+    LABEL_TO_ACTION
+       ↓
+    Arduino (JSON serial)
 
-  Necessário na mesma pasta:
-    sign_model.tflite   ← gerado por TRAIN_SIGN_CNN.py
-    sign_labels.txt     ← gerado por TRAIN_SIGN_CNN.py
+  INSTALAÇÃO:
+    pip install ultralytics onnxruntime opencv-python pyserial
+
+  USO:
+    python SIGN_DETECTOR.py --export        ← exporta YOLOv8n→ONNX (1x)
+    python SIGN_DETECTOR.py                 ← vídeo (videoplayback.mp4)
+    python SIGN_DETECTOR.py --cam           ← câmera USB
+    python SIGN_DETECTOR.py --test foto.jpg ← diagnóstico
+
+  ARQUIVOS NECESSÁRIOS:
+    yolov8n_signs.onnx      ← gerado por --export (ou treinado)
+    sign_thresholds.txt     ← gerado por TRAIN_SIGN_CNN.py
 ================================================================
 """
 
-import cv2, numpy as np, serial, serial.tools.list_ports
-import time, sys, os, argparse
+import cv2
+import numpy as np
+import serial
+import serial.tools.list_ports
+import time
+import sys
+import os
+import argparse
+import collections
+
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 # ================================================================
-#  CONFIGURAÇÃO
+#  [1] CONFIGURAÇÃO
 # ================================================================
 
-VIDEO       = "./videoplayback.mp4"
-CAM_IDX     = 0
-PROP        = 2
-SERIAL_PORT = "COM3"
-BAUD        = 115200
-MODEL_PATH  = "./sign_model.tflite"
-LABELS_PATH = "./sign_labels.txt"
+VIDEO        = "./videoplayback.mp4"
+CAM_IDX      = 0
+PROP         = 1          # sem redução — YOLO precisa de resolução
+SERIAL_PORT  = "COM3"
+BAUD         = 115200
 
-ROI_Y0      = 0.05
-ROI_Y1      = 0.72
-BORDA_FRAC  = 0.18
+# Modelo ONNX
+ONNX_PATH    = "./yolov8n_signs.onnx"
+PT_PATH      = "./yolov8n_signs.pt"   # fallback se ONNX não existir
+THRESH_PATH  = "./sign_thresholds.txt"
 
-# Filtros geométricos
-CIRC_MIN    = 0.50    # circularity — elimina vegetação/ruído
-SOLID_MIN   = 0.78    # solidity    — forma convexa sólida
-EXTENT_MIN  = 0.48    # extent      — preenche a bbox
-PROP_MIN    = 0.25    # W/H mínimo  — aceita semáforo vertical
-PROP_MAX    = 3.50    # W/H máximo
-AREA_MIN    = 500
-AREA_MAX    = 60_000
+# Detecção
+CONF_DEFAULT = 0.45    # confiança mínima YOLO
+IOU_THRESH   = 0.45    # NMS IoU
+IMGSZ        = 640     # tamanho de entrada YOLO
 
-# CNN
-CONFIRM_N   = 4
-AREA_EXEC   = 500
-COOLDOWN    = 55
-CONF_MIN    = 0.65
-CONF_BORDA  = 0.50    # limiar reduzido quando placa está na borda
+# Filtro temporal — exige N detecções consecutivas do mesmo ID
+CONFIRM_N    = 4       # frames para confirmar placa
+CONFIRM_OBS  = 2       # frames para confirmar obstáculo (mais urgente)
+COOLDOWN     = 60      # frames de espera após executar ação
 
-# Obstáculo
-OBST_Y0     = 0.55
-OBST_MIN    = 3500
+# TTA — Test Time Augmentation
+TTA_ENABLED  = True    # média sobre variantes do frame
+TTA_FLIP     = True    # inclui flip horizontal
+TTA_BRIGHT   = [0.8, 1.2]  # fatores de brilho extras
 
-K3 = np.ones((3,3), np.uint8)
-K5 = np.ones((5,5), np.uint8)
-K7 = np.ones((7,7), np.uint8)
+# Obstáculo: distância mínima (bbox ocupa % da largura do frame)
+OBST_MIN_W_FRAC = 0.08  # bbox largura >= 8% do frame → relevante
 
 # ================================================================
-#  AÇÕES E LABELS
+#  [2] CLASSES E AÇÕES
 # ================================================================
+
+# Estas classes devem corresponder ao modelo treinado
+# Se usar yolov8n padrão COCO: mapeia classes COCO para ações
+# Se usar modelo treinado: classes são as do dataset_v3
+
+LABEL_TO_ACTION = {
+    # Placas
+    "Stop":       "STOP",
+    "Esquerda":   "LEFT",
+    "Direita":    "RIGHT",
+    "SemRetorno": "STRAIGHT",
+    "Verde":      "SPEED_UP",
+    # Obstáculos
+    "Cone":       "OBSTACLE",
+    "Carro":      "OBSTACLE",
+    "Pessoa":     "OBSTACLE",
+    # Classes COCO (se usar yolov8n padrão)
+    "stop sign":  "STOP",
+    "person":     "OBSTACLE",
+    "car":        "OBSTACLE",
+    "truck":      "OBSTACLE",
+    "bicycle":    "OBSTACLE",
+    "motorcycle": "OBSTACLE",
+    "traffic light": "SPEED_UP",
+}
+
+LABEL_NAMES = {
+    "Stop":"Pare",           "Esquerda":"Vira Esq",
+    "Direita":"Vira Dir",    "SemRetorno":"Sem Retorno",
+    "Verde":"Semáforo Verde","Cone":"Cone",
+    "Carro":"Carro",         "Pessoa":"Pessoa",
+    "stop sign":"Placa PARE","person":"Pessoa",
+    "car":"Carro",           "truck":"Caminhão",
+    "traffic light":"Semáforo",
+}
+
+OBSTACLE_CLASSES = {
+    "Cone","Carro","Pessoa","person","car","truck","bicycle","motorcycle"
+}
 
 ACOES = {
     "STOP":      dict(mot=0,  srv=127, buz=0, led=1, brk=1, dir=0, dur=2.5),
@@ -72,63 +135,57 @@ ACOES = {
     "SPEED_UP":  dict(mot=80, srv=127, buz=0, led=0, brk=0, dir=3, dur=2.0),
 }
 
-# Labels = nomes completos (dataset_v3: 8 classes)
-LABEL_TO_ACTION = {
-    "Stop":       "STOP",
-    "Esquerda":   "LEFT",
-    "Direita":    "RIGHT",
-    "SemRetorno": "STRAIGHT",
-    "Verde":      "SPEED_UP",
-    "Cone":       "OBSTACLE",
-    "Carro":      "OBSTACLE",
-    "Pessoa":     "OBSTACLE",
-    # Compatibilidade legada
-    "S":"STOP","L":"LEFT","R":"RIGHT","N":"STRAIGHT",
-    "G":"SPEED_UP","W":"SLOW_DOWN","Y":"YIELD",
-}
-LABEL_NAMES = {
-    "Stop":       "Pare/Stop",
-    "Esquerda":   "Vira Esquerda",
-    "Direita":    "Vira Direita",
-    "SemRetorno": "Sem Retorno",
-    "Verde":      "Semáforo Verde",
-    "Cone":       "Cone na Pista",
-    "Carro":      "Carro na Pista",
-    "Pessoa":     "Pessoa na Pista",
-}
-_OBSTACLE_LABELS = {"Cone","Carro","Pessoa"}
-# Thresholds adaptativos — carregados de sign_thresholds.txt
-_THRESHOLDS = {}
-def _carregar_thresh():
-    global _THRESHOLDS
-    p = os.path.join(os.path.dirname(os.path.abspath(__file__)),"sign_thresholds.txt")
-    if os.path.isfile(p):
-        with open(p) as f:
-            for line in f:
-                parts = line.strip().split(",")
-                if len(parts)==2:
-                    _THRESHOLDS[parts[0]] = float(parts[1])
-        print(f"[CNN] Thresholds: {_THRESHOLDS}", flush=True)
-    else:
-        print("[CNN] sign_thresholds.txt não encontrado — usando CONF_MIN padrão", flush=True)
 CORES = {
-    "STOP":(50,50,220),"OBSTACLE":(0,0,200),"YIELD":(0,200,220),
-    "LEFT":(220,120,0),"RIGHT":(0,120,220),"STRAIGHT":(50,220,50),
-    "SLOW_DOWN":(0,180,255),"SPEED_UP":(0,200,100),
+    "STOP":(50,50,220),      "OBSTACLE":(0,0,200),
+    "YIELD":(0,200,220),     "LEFT":(220,120,0),
+    "RIGHT":(0,120,220),     "STRAIGHT":(50,220,50),
+    "SLOW_DOWN":(0,180,255), "SPEED_UP":(0,200,100),
 }
 
 # ================================================================
-#  ESTADO GLOBAL
+#  [3] THRESHOLDS ADAPTATIVOS
 # ================================================================
 
-CMD       = dict(mot=0, srv=127, buz=0, led=0, brk=0, dir=0, spd=0)
-_esq      = dict(label=None, cnt=0, area=0.0)
-_dir      = dict(label=None, cnt=0, area=0.0)
-_nav      = dict(cooldown=0, ultimo=None, acao_label=None,
-                 acao_t=0.0, acao_dur=0.0, gatilho="")
+_THRESHOLDS: dict[str, float] = {}
+
+def carregar_thresholds():
+    global _THRESHOLDS
+    if os.path.isfile(THRESH_PATH):
+        with open(THRESH_PATH) as f:
+            for line in f:
+                p = line.strip().split(",")
+                if len(p) == 2:
+                    try: _THRESHOLDS[p[0]] = float(p[1])
+                    except: pass
+        print(f"[THRESH] {_THRESHOLDS}", flush=True)
+    else:
+        print("[THRESH] sign_thresholds.txt não encontrado — usando padrão 0.45",
+              flush=True)
+
+def thresh(label: str) -> float:
+    return _THRESHOLDS.get(label, CONF_DEFAULT)
 
 # ================================================================
-#  SERIAL
+#  [4] ESTADO GLOBAL
+# ================================================================
+
+CMD = dict(mot=0, srv=127, buz=0, led=0, brk=0, dir=0, spd=0)
+
+_nav = dict(
+    cooldown    = 0,
+    ultimo      = None,
+    acao_label  = None,
+    acao_t      = 0.0,
+    acao_dur    = 0.0,
+)
+
+# Filtro temporal por track_id
+# _temporal[track_id] = deque de labels dos últimos N frames
+_temporal: dict[int, collections.deque] = {}
+_DEQUE_LEN = max(CONFIRM_N, CONFIRM_OBS) + 2
+
+# ================================================================
+#  [5] SERIAL
 # ================================================================
 
 def conectar_serial():
@@ -154,218 +211,297 @@ def enviar(ser):
          f'"spd":{CMD["spd"]}}}')
     print(f"[CMD] {j}", flush=True)
     if ser:
-        try: ser.write((j+"\n").encode())
+        try: ser.write((j + "\n").encode())
         except: pass
 
 # ================================================================
-#  PRÉ-PROCESSADOR — foca no símbolo interno da placa
+#  [6] MODELO YOLO — ONNX Runtime
 # ================================================================
 
-def prep_sign(img, sz=96):
-    if img is None or img.size == 0:
-        return np.zeros((sz, sz, 3), np.float32)
-    h, w = img.shape[:2]
-    # Remove 12% de borda colorida — CNN vê só o símbolo
-    py, px = max(1,int(h*.12)), max(1,int(w*.12))
-    roi = img[py:h-py, px:w-px]
-    if roi.size == 0: roi = img
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    hh, ww = gray.shape
-    sc = sz / max(hh, ww)
-    nh, nw = max(1,int(hh*sc)), max(1,int(ww*sc))
-    rs = cv2.resize(gray, (nw, nh), interpolation=cv2.INTER_AREA)
-    c  = np.zeros((sz, sz), np.uint8)
-    c[(sz-nh)//2:(sz-nh)//2+nh, (sz-nw)//2:(sz-nw)//2+nw] = rs
-    c  = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(4,4)).apply(c)
-    t  = cv2.adaptiveThreshold(c, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                cv2.THRESH_BINARY, 13, 5)
-    t  = cv2.morphologyEx(t, cv2.MORPH_OPEN, np.ones((2,2),np.uint8))
-    return cv2.cvtColor(t, cv2.COLOR_GRAY2RGB).astype(np.float32)
-
-# ================================================================
-#  PRÉ-PROCESSADOR DE OBSTÁCULOS — RGB preservado
-# ================================================================
-
-def prep_obstacle(img, sz=96):
-    """Obstáculos: RGB completo com CLAHE suave."""
-    if img is None or img.size == 0:
-        return np.zeros((sz,sz,3), np.float32)
-    img_r = cv2.resize(img,(sz,sz),interpolation=cv2.INTER_AREA)
-    lab   = cv2.cvtColor(img_r,cv2.COLOR_BGR2LAB)
-    lab[:,:,0]=cv2.createCLAHE(clipLimit=2.0,tileGridSize=(4,4)).apply(lab[:,:,0])
-    out = cv2.cvtColor(lab,cv2.COLOR_LAB2BGR)
-    return cv2.cvtColor(out,cv2.COLOR_BGR2RGB).astype(np.float32)
-
-_OBSTACLE_LABELS = {"Cone","Carro","Pessoa"}
-
-def prep_auto(img, label=None, sz=96):
-    """Roteia para o pipeline correto baseado no label classificado."""
-    if label in _OBSTACLE_LABELS:
-        return prep_obstacle(img, sz)
-    return prep_sign(img, sz)
-
-# ================================================================
-#  MODELO
-# ================================================================
-
-def carregar_modelo():
-    if not os.path.isfile(MODEL_PATH):
-        raise FileNotFoundError(
-            f"[CNN] {MODEL_PATH} não encontrado\n"
-            "      Execute: python TRAIN_SIGN_CNN.py --dataset ./dataset_novo")
-    with open(LABELS_PATH) as f:
-        labels = [l.strip() for l in f if l.strip()]
-    try:
-        import tflite_runtime.interpreter as tfl
-        interp = tfl.Interpreter(model_path=MODEL_PATH)
-    except ImportError:
-        import tensorflow as tf
-        interp = tf.lite.Interpreter(model_path=MODEL_PATH)
-    interp.allocate_tensors()
-    ii  = interp.get_input_details()[0]["index"]
-    oi  = interp.get_output_details()[0]["index"]
-    sz  = interp.get_input_details()[0]["shape"][1]
-    _carregar_thresh()
-    print(f"[CNN] {len(labels)} classes: {labels} | {sz}×{sz}", flush=True)
-    return interp, labels, ii, oi
-
-def classificar(crop, interp, labels, ii, oi):
+class YOLODetector:
     """
-    Inferência com threshold adaptativo por classe.
-    Retorna (label, confiança, probs).
-    Se confiança < threshold da classe → retorna None.
+    YOLOv8n via ONNX Runtime (CPU).
+    Suporta ByteTrack quando usado via ultralytics.YOLO.track().
     """
-    sz    = interp.get_input_details()[0]["shape"][1]
-    # Primeira passagem: usa prep_sign para todos
-    # (obstáculos serão reclassificados se necessário)
-    interp.set_tensor(ii, np.expand_dims(prep_sign(crop, sz), 0))
-    interp.invoke()
-    p     = interp.get_tensor(oi)[0]
-    b     = int(np.argmax(p))
-    lbl   = labels[b]; conf = float(p[b])
 
-    # Se top label é obstáculo, reprocessa com RGB
-    if lbl in _OBSTACLE_LABELS:
-        interp.set_tensor(ii, np.expand_dims(prep_obstacle(crop, sz), 0))
-        interp.invoke()
-        p2   = interp.get_tensor(oi)[0]
-        b2   = int(np.argmax(p2)); conf2 = float(p2[b2])
-        # Usa o resultado mais confiante
-        if conf2 > conf:
-            p = p2; b = b2; lbl = labels[b]; conf = conf2
+    def __init__(self):
+        self.model_onnx  = None   # onnxruntime session
+        self.model_ultra = None   # ultralytics YOLO (tracking)
+        self.class_names = []
+        self.using_onnx  = False
 
-    return lbl, conf, p
+    def carregar(self):
+        """Tenta ONNX primeiro, fallback para ultralytics .pt"""
+        # Tentativa 1: ONNX Runtime direto
+        if os.path.isfile(ONNX_PATH):
+            try:
+                import onnxruntime as ort
+                opts = ort.SessionOptions()
+                opts.inter_op_num_threads = 4
+                opts.intra_op_num_threads = 4
+                self.model_onnx = ort.InferenceSession(
+                    ONNX_PATH,
+                    sess_options=opts,
+                    providers=["CPUExecutionProvider"]
+                )
+                # Lê nomes das classes do arquivo auxiliar
+                names_path = ONNX_PATH.replace(".onnx", "_classes.txt")
+                if os.path.isfile(names_path):
+                    with open(names_path) as f:
+                        self.class_names = [l.strip() for l in f if l.strip()]
+                self.using_onnx = True
+                print(f"[YOLO] ONNX carregado: {ONNX_PATH}", flush=True)
+                print(f"[YOLO] Classes: {self.class_names}", flush=True)
+                return True
+            except Exception as e:
+                print(f"[YOLO] ONNX falhou ({e}) — tentando ultralytics",
+                      flush=True)
+
+        # Tentativa 2: ultralytics (com tracking nativo)
+        try:
+            from ultralytics import YOLO
+            pt = PT_PATH if os.path.isfile(PT_PATH) else "yolov8n.pt"
+            self.model_ultra = YOLO(pt)
+            self.class_names = list(self.model_ultra.names.values())
+            self.using_onnx  = False
+            print(f"[YOLO] ultralytics carregado: {pt}", flush=True)
+            print(f"[YOLO] {len(self.class_names)} classes", flush=True)
+            return True
+        except ImportError:
+            print("[YOLO] ultralytics não instalado.", flush=True)
+            print("       Execute: pip install ultralytics", flush=True)
+            return False
+
+    def detectar(self, frame: np.ndarray) -> list[dict]:
+        """
+        Retorna lista de dicts:
+          {label, conf, bbox:(x1,y1,x2,y2), track_id}
+        """
+        if self.using_onnx and self.model_onnx:
+            return self._detectar_onnx(frame)
+        elif self.model_ultra:
+            return self._detectar_ultra(frame)
+        return []
+
+    # ── ONNX Runtime ─────────────────────────────────────────────
+    def _pre_onnx(self, frame):
+        img  = cv2.resize(frame, (IMGSZ, IMGSZ))
+        img  = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        return np.expand_dims(img.transpose(2,0,1), 0)  # NCHW
+
+    def _detectar_onnx(self, frame) -> list[dict]:
+        h, w = frame.shape[:2]
+        inp  = self._pre_onnx(frame)
+        out  = self.model_onnx.run(None, {
+            self.model_onnx.get_inputs()[0].name: inp
+        })[0]  # (1, 84, 8400) for YOLOv8
+
+        # Decode YOLOv8 output
+        out = out[0].T  # (8400, 84)
+        boxes  = out[:, :4]
+        scores = out[:, 4:]
+        class_ids = np.argmax(scores, axis=1)
+        confs     = scores[np.arange(len(scores)), class_ids]
+
+        # Scale boxes to frame size
+        cx, cy, bw, bh = boxes[:,0], boxes[:,1], boxes[:,2], boxes[:,3]
+        x1 = ((cx - bw/2) / IMGSZ * w).astype(int)
+        y1 = ((cy - bh/2) / IMGSZ * h).astype(int)
+        x2 = ((cx + bw/2) / IMGSZ * w).astype(int)
+        y2 = ((cy + bh/2) / IMGSZ * h).astype(int)
+
+        results = []
+        for i in range(len(confs)):
+            cid  = int(class_ids[i])
+            conf = float(confs[i])
+            lbl  = self.class_names[cid] if cid < len(self.class_names) else str(cid)
+            t    = thresh(lbl)
+            if conf < t: continue
+            # NMS handled externally — basic area filter
+            bx1,by1,bx2,by2 = int(x1[i]),int(y1[i]),int(x2[i]),int(y2[i])
+            if bx2<=bx1 or by2<=by1: continue
+            results.append(dict(
+                label=lbl, conf=conf,
+                bbox=(max(0,bx1),max(0,by1),min(w,bx2),min(h,by2)),
+                track_id=-1  # ONNX sem tracker
+            ))
+
+        # Apply NMS manually
+        return _nms(results, IOU_THRESH)
+
+    # ── Ultralytics com ByteTrack ─────────────────────────────────
+    def _detectar_ultra(self, frame) -> list[dict]:
+        results = self.model_ultra.track(
+            frame,
+            tracker   = "bytetrack.yaml",
+            persist   = True,
+            conf      = CONF_DEFAULT,
+            iou       = IOU_THRESH,
+            imgsz     = IMGSZ,
+            verbose   = False,
+        )
+        dets = []
+        if not results or results[0].boxes is None:
+            return dets
+        boxes = results[0].boxes
+        for box in boxes:
+            cid      = int(box.cls[0])
+            conf     = float(box.conf[0])
+            lbl      = self.model_ultra.names[cid]
+            t        = thresh(lbl)
+            if conf < t: continue
+            x1,y1,x2,y2 = box.xyxy[0].tolist()
+            tid      = int(box.id[0]) if box.id is not None else -1
+            dets.append(dict(
+                label=lbl, conf=conf,
+                bbox=(int(x1),int(y1),int(x2),int(y2)),
+                track_id=tid
+            ))
+        return dets
+
+    # ── TTA — Test Time Augmentation ─────────────────────────────
+    def detectar_tta(self, frame: np.ndarray) -> list[dict]:
+        """
+        Roda inferência em múltiplas variantes do frame e agrega.
+        Aumenta robustez em condições de iluminação variável.
+        """
+        if not TTA_ENABLED:
+            return self.detectar(frame)
+
+        variants = [frame]
+        if TTA_FLIP:
+            variants.append(cv2.flip(frame, 1))
+        for f in TTA_BRIGHT:
+            v = np.clip(frame.astype(np.float32) * f, 0, 255).astype(np.uint8)
+            variants.append(v)
+
+        all_dets: list[dict] = []
+        for i, v in enumerate(variants):
+            dets = self.detectar(v)
+            if i == 1 and TTA_FLIP:
+                # Espelha bboxes de volta
+                w = frame.shape[1]
+                for d in dets:
+                    x1,y1,x2,y2 = d["bbox"]
+                    d["bbox"] = (w-x2, y1, w-x1, y2)
+            all_dets.extend(dets)
+
+        # Agrega: para cada grupo de bboxes sobrepostas, usa conf média
+        return _nms_merge(all_dets, IOU_THRESH)
+
+
+# ── Instância global ─────────────────────────────────────────────
+_yolo = YOLODetector()
+
 
 # ================================================================
-#  DETECÇÃO — HSV + validação geométrica
-#  Sem Canny: reduz falsos positivos de bordas de interface/janelas
+#  [7] NMS HELPERS
 # ================================================================
 
-# Ranges HSV calibrados para placas de trânsito impressas
-_HSV = [
-    (np.array([0,   70, 50]),  np.array([14,  255,255])),  # vermelho
-    (np.array([162, 70, 50]),  np.array([180, 255,255])),  # vermelho wrap
-    (np.array([92,  70, 45]),  np.array([130, 255,255])),  # azul
-    (np.array([16, 110, 75]),  np.array([36,  255,255])),  # amarelo
-    (np.array([36, 110, 50]),  np.array([86,  255,255])),  # verde
-    (np.array([8,  100, 65]),  np.array([21,  255,255])),  # laranja
-]
+def _iou(a, b):
+    ax1,ay1,ax2,ay2 = a
+    bx1,by1,bx2,by2 = b
+    ix1,iy1 = max(ax1,bx1), max(ay1,by1)
+    ix2,iy2 = min(ax2,bx2), min(ay2,by2)
+    if ix2<=ix1 or iy2<=iy1: return 0.0
+    inter = (ix2-ix1)*(iy2-iy1)
+    ua    = (ax2-ax1)*(ay2-ay1) + (bx2-bx1)*(by2-by1) - inter
+    return inter / max(ua, 1e-6)
 
-def _mascara_hsv(roi):
-    hsv = cv2.GaussianBlur(cv2.cvtColor(roi, cv2.COLOR_BGR2HSV), (5,5), 0)
-    m   = np.zeros(hsv.shape[:2], np.uint8)
-    for lo, hi in _HSV:
-        m = cv2.bitwise_or(m, cv2.inRange(hsv, lo, hi))
-    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, K7)
-    m = cv2.morphologyEx(m, cv2.MORPH_OPEN,  K5)
-    return m
+def _nms(dets: list[dict], iou_thr: float) -> list[dict]:
+    if not dets: return []
+    dets = sorted(dets, key=lambda d: -d["conf"])
+    keep = []
+    used = [False] * len(dets)
+    for i, d in enumerate(dets):
+        if used[i]: continue
+        keep.append(d)
+        for j in range(i+1, len(dets)):
+            if not used[j] and _iou(d["bbox"], dets[j]["bbox"]) > iou_thr:
+                used[j] = True
+    return keep
 
-def _validar(cnt):
-    area = cv2.contourArea(cnt)
-    if not (AREA_MIN < area < AREA_MAX): return False, {}
-    peri = cv2.arcLength(cnt, True)
-    if peri < 10: return False, {}
-    circ  = 4 * np.pi * area / (peri**2)
-    hull  = cv2.convexHull(cnt)
-    solid = area / max(cv2.contourArea(hull), 1)
-    x, y, bw, bh = cv2.boundingRect(cnt)
-    extent = area / max(bw*bh, 1)
-    prop   = bw / max(bh, 1)
-    m = dict(circ=circ, solid=solid, extent=extent,
-             prop=prop, area=area, x=x, y=y, bw=bw, bh=bh)
-    if circ   < CIRC_MIN:  return False, m
-    if solid  < SOLID_MIN: return False, m
-    if extent < EXTENT_MIN: return False, m
-    if not (PROP_MIN <= prop <= PROP_MAX): return False, m
-    return True, m
+def _nms_merge(dets: list[dict], iou_thr: float) -> list[dict]:
+    """NMS com média de confiança para TTA."""
+    if not dets: return []
+    dets = sorted(dets, key=lambda d: -d["conf"])
+    keep = []
+    used = [False] * len(dets)
+    for i, d in enumerate(dets):
+        if used[i]: continue
+        group  = [d]
+        for j in range(i+1, len(dets)):
+            if not used[j] and _iou(d["bbox"], dets[j]["bbox"]) > iou_thr:
+                group.append(dets[j]); used[j] = True
+        # Média de confiança do grupo
+        avg_conf = float(np.mean([g["conf"] for g in group]))
+        best = max(group, key=lambda g: g["conf"])
+        best["conf"] = avg_conf
+        keep.append(best)
+    return keep
 
-def localizar(frame):
-    h, w  = frame.shape[:2]
-    y0, y1 = int(h*ROI_Y0), int(h*ROI_Y1)
-    roi   = frame[y0:y1]
-    cx    = w // 2
-    cnts, _ = cv2.findContours(_mascara_hsv(roi),
-                                cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    esq, dir_, rej = [], [], []
-    for cnt in cnts:
-        ok, m = _validar(cnt)
-        if not ok:
-            if m: rej.append((m["x"], m["y"]+y0, m["bw"], m["bh"],
-                              f"c={m['circ']:.2f} s={m['solid']:.2f}"))
-            continue
-        x, y, bw, bh = m["x"], m["y"]+y0, m["bw"], m["bh"]
-        crop = frame[y:y+bh, x:x+bw]
-        if crop.size == 0: continue
-        entry = (x, y, bw, bh, m["area"], crop, m)
-        (esq if x+bw//2 < cx else dir_).append(entry)
-    esq.sort(key=lambda b: b[4], reverse=True)
-    dir_.sort(key=lambda b: b[4], reverse=True)
-    return esq[:2], dir_[:2], rej
-
-def detectar_obst(frame):
-    h, w = frame.shape[:2]
-    roi  = frame[int(h*OBST_Y0):]
-    gray = cv2.GaussianBlur(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY), (15,15), 0)
-    t    = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-                                  cv2.THRESH_BINARY_INV, 51, 10)
-    t    = cv2.morphologyEx(t, cv2.MORPH_CLOSE, K7)
-    t    = cv2.morphologyEx(t, cv2.MORPH_OPEN,  K5)
-    for cnt in cv2.findContours(t, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]:
-        if cv2.contourArea(cnt) < OBST_MIN: continue
-        _, _, bw, bh = cv2.boundingRect(cnt)
-        if bh > bw*.4 and bw < w*.85: return True
-    return False
 
 # ================================================================
-#  CONFIRMAÇÃO BILATERAL
+#  [8] FILTRO TEMPORAL (ByteTrack ID → deque de labels)
 # ================================================================
 
-def _borda(x, bw, w):
-    cx = x + bw//2
-    lim = int(w * BORDA_FRAC)
-    return cx < lim or cx > w - lim
+def atualizar_temporal(dets: list[dict], frame_id: int) -> list[dict]:
+    """
+    Para cada detecção com track_id, mantém histórico de labels.
+    Só confirma se o label aparece N vezes consecutivas.
+    Retorna lista de detecções confirmadas.
+    """
+    global _temporal
 
-def confirmar(estado, label, area, x, bw, w):
+    # Marca IDs ativos neste frame
+    ids_ativos = set()
+    for d in dets:
+        tid = d["track_id"]
+        if tid < 0:
+            # Sem tracker (ONNX direto): usa posição como proxy de ID
+            tid = hash((d["label"], d["bbox"][0]//30, d["bbox"][1]//30)) % 10000
+            d["track_id"] = tid
+        ids_ativos.add(tid)
+        if tid not in _temporal:
+            _temporal[tid] = collections.deque(maxlen=_DEQUE_LEN)
+        _temporal[tid].append(d["label"])
+
+    # Remove IDs que sumiram há mais de 2x DEQUE_LEN frames
+    stale = [k for k in list(_temporal) if k not in ids_ativos]
+    for k in stale[:10]:  # limita remoções por frame
+        del _temporal[k]
+
+    # Verifica quais passam no filtro temporal
+    confirmadas = []
+    for d in dets:
+        tid   = d["track_id"]
+        hist  = list(_temporal.get(tid, []))
+        lbl   = d["label"]
+        n_req = CONFIRM_OBS if lbl in OBSTACLE_CLASSES else CONFIRM_N
+
+        if len(hist) >= n_req:
+            recente = hist[-n_req:]
+            if recente.count(lbl) >= n_req:
+                d["confirmado"] = True
+            else:
+                d["confirmado"] = False
+        else:
+            d["confirmado"] = False
+        confirmadas.append(d)
+
+    return confirmadas
+
+
+# ================================================================
+#  [9] NAVEGAÇÃO — EXECUTOR + TICK
+# ================================================================
+
+def executar(label: str, ser):
     if _nav["cooldown"] > 0:
-        estado.update(label=None, cnt=0); return None
-    if label is None:
-        estado.update(cnt=0, label=None); return None
-    if label == estado["label"]:
-        estado["cnt"] += 1; estado["area"] = area
-    else:
-        estado.update(label=label, cnt=1, area=area)
-    b  = _borda(x, bw, w)
-    pa = estado["cnt"] >= CONFIRM_N and area >= AREA_EXEC
-    pb = b and estado["cnt"] >= max(2, CONFIRM_N//2)
-    if pa or pb:
-        _nav["gatilho"] = "BORDA" if pb and not pa else "AREA"
-        estado.update(cnt=0, label=None)
-        return label
-    return None
-
-def executar(label, ser):
+        return
     acao = LABEL_TO_ACTION.get(label)
-    if not acao or acao not in ACOES: return
+    if not acao or acao not in ACOES:
+        return
     a = ACOES[acao]
     CMD.update(mot=a["mot"], srv=a["srv"], buz=a["buz"],
                led=a["led"], brk=a["brk"], dir=a["dir"],
@@ -373,9 +509,9 @@ def executar(label, ser):
     enviar(ser)
     _nav.update(acao_label=acao, acao_t=time.monotonic(),
                 acao_dur=a["dur"], cooldown=COOLDOWN, ultimo=label)
-    print(f"[NAV] ▶ {acao} ← '{label}' [{_nav['gatilho']}]", flush=True)
+    print(f"[NAV] ▶ {acao} ← '{label}'", flush=True)
 
-def tick(ser):
+def tick(ser) -> bool:
     lbl = _nav["acao_label"]
     if lbl is None: return False
     if lbl == "OBSTACLE": return True
@@ -383,302 +519,311 @@ def tick(ser):
         CMD.update(mot=0, srv=127, buz=0, led=0, brk=0, dir=0, spd=0)
         enviar(ser)
         print(f"[NAV] ✅ {lbl}", flush=True)
-        _nav["acao_label"] = None; return False
+        _nav["acao_label"] = None
+        return False
     return True
 
+def decrementar_cooldown():
+    if _nav["cooldown"] > 0:
+        _nav["cooldown"] -= 1
+
+
 # ================================================================
-#  VISUALIZAÇÃO
+#  [10] DECISÃO — prioridade entre detecções confirmadas
 # ================================================================
 
-def desenhar(frame, esq, dir_, rej, le, ld, ce, cd, fps, obst):
-    out = frame.copy(); h, w = out.shape[:2]
-    cx  = w//2; bpx = int(w*BORDA_FRAC)
+def decidir(dets_confirmadas: list[dict], ser, frame_w: int):
+    """
+    Prioridade:
+      1. OBSTACLE (qualquer obstáculo próximo → para imediato)
+      2. STOP
+      3. Outras placas (LEFT/RIGHT/STRAIGHT/SPEED_UP)
+    """
+    if _nav["cooldown"] > 0:
+        return
 
-    cv2.rectangle(out,(0,int(h*ROI_Y0)),(w-1,int(h*ROI_Y1)),(0,200,255),1)
-    for yy in range(int(h*ROI_Y0), int(h*ROI_Y1), 8):
-        cv2.line(out,(cx,yy),(cx,yy+4),(0,200,255),1)
-    for yy in range(int(h*ROI_Y0), int(h*ROI_Y1), 6):
-        cv2.line(out,(bpx,yy),(bpx,yy+3),(0,80,200),1)
-        cv2.line(out,(w-bpx,yy),(w-bpx,yy+3),(0,80,200),1)
-    cv2.putText(out,"ESQ",(4,int(h*ROI_Y0)+12),
-                cv2.FONT_HERSHEY_SIMPLEX,0.33,(0,200,255),1)
-    cv2.putText(out,"DIR",(w-30,int(h*ROI_Y0)+12),
-                cv2.FONT_HERSHEY_SIMPLEX,0.33,(0,200,255),1)
+    em_acao = tick(ser)
+    if em_acao and _nav["acao_label"] != "OBSTACLE":
+        return
 
-    for x,y,bw,bh,mot in rej[:3]:
-        cv2.rectangle(out,(x,y),(x+bw,y+bh),(50,50,120),1)
-        cv2.putText(out,mot,(x,y-2),cv2.FONT_HERSHEY_SIMPLEX,0.22,(80,80,160),1)
+    # Verifica se obstáculo ACTIVE sumiu
+    if _nav["acao_label"] == "OBSTACLE":
+        obstaculos = [d for d in dets_confirmadas
+                      if LABEL_TO_ACTION.get(d["label"]) == "OBSTACLE"]
+        if not obstaculos:
+            CMD.update(mot=0,srv=127,buz=0,led=0,brk=0,dir=0,spd=0)
+            enviar(ser)
+            print("[NAV] ✅ Obstáculo removido", flush=True)
+            _nav["acao_label"] = None
+        return
 
-    def _box(lista, lbl, conf, estado):
-        if not lista: return
-        x,y,bw,bh,area,_,m = lista[0]
-        acao = LABEL_TO_ACTION.get(lbl,"") if lbl else ""
-        cor  = CORES.get(acao,(160,160,160))
-        cv2.rectangle(out,(x,y),(x+bw,y+bh),cor,3 if _borda(x,bw,w) else 2)
-        cv2.putText(out,f"c={m['circ']:.2f} s={m['solid']:.2f}",
-                    (x,y+bh+12),cv2.FONT_HERSHEY_SIMPLEX,0.26,(180,180,80),1)
-        if lbl:
-            txt = f"{lbl}:{LABEL_NAMES.get(lbl,lbl)} {conf:.0%} [{estado['cnt']}/{CONFIRM_N}]"
-            cv2.rectangle(out,(x,y-18),(x+len(txt)*7,y),cor,-1)
-            cv2.putText(out,txt,(x+2,y-4),cv2.FONT_HERSHEY_SIMPLEX,0.35,(255,255,255),1)
-            p = int(bw*min(estado["cnt"],CONFIRM_N)/CONFIRM_N)
-            cv2.rectangle(out,(x,y+bh+2),(x+bw,y+bh+6),(40,40,40),-1)
-            cv2.rectangle(out,(x,y+bh+2),(x+p,y+bh+6),cor,-1)
-        if _borda(x,bw,w):
-            cv2.putText(out,"BORDA",(x,y-22),
-                        cv2.FONT_HERSHEY_SIMPLEX,0.28,(0,255,255),1)
+    # Filtra só confirmadas
+    conf_list = [d for d in dets_confirmadas if d.get("confirmado")]
+    if not conf_list:
+        return
 
-    _box(esq, le, ce, _esq); _box(dir_, ld, cd, _dir)
+    # Ordena: obstáculos primeiro, depois por confiança
+    def prioridade(d):
+        acao = LABEL_TO_ACTION.get(d["label"], "")
+        order = {"OBSTACLE": 0, "STOP": 1}.get(acao, 2)
+        return (order, -d["conf"])
 
-    if obst:
-        cv2.rectangle(out,(0,int(h*OBST_Y0)),(w-1,h-1),(0,0,255),2)
-        cv2.putText(out,"OBSTACULO",(w//2-55,h-8),
-                    cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,0,255),2)
+    conf_list.sort(key=prioridade)
+    melhor = conf_list[0]
 
-    pw  = 200; pan = np.zeros((h,pw,3),np.uint8); pan[:]=(18,18,18)
-    cv2.rectangle(pan,(0,0),(pw-1,h-1),(45,45,45),1)
-    def t(s,l,cor=(190,190,190),sc=0.33):
-        cv2.putText(pan,s,(5,14+l*16),cv2.FONT_HERSHEY_SIMPLEX,sc,cor,1)
+    # Obstáculo: valida tamanho da bbox (evita detecções distantes)
+    acao = LABEL_TO_ACTION.get(melhor["label"])
+    if acao == "OBSTACLE":
+        x1,y1,x2,y2 = melhor["bbox"]
+        bw = x2 - x1
+        if bw < frame_w * OBST_MIN_W_FRAC:
+            return  # muito longe
 
-    t(f"FPS:{fps}",0,(255,255,255),0.40)
+    executar(melhor["label"], ser)
+
+
+# ================================================================
+#  [11] VISUALIZAÇÃO
+# ================================================================
+
+def desenhar(frame, dets, fps):
+    out  = frame.copy()
+    h, w = out.shape[:2]
+
+    for d in dets:
+        x1,y1,x2,y2 = d["bbox"]
+        lbl    = d["label"]
+        conf   = d["conf"]
+        tid    = d["track_id"]
+        conf_n = d.get("confirmado", False)
+        acao   = LABEL_TO_ACTION.get(lbl, "")
+        cor    = CORES.get(acao, (160,160,160))
+
+        thick  = 3 if conf_n else 1
+        cv2.rectangle(out, (x1,y1), (x2,y2), cor, thick)
+
+        # Label com nome, confiança e track_id
+        nome = LABEL_NAMES.get(lbl, lbl)
+        txt  = f"#{tid} {nome} {conf:.0%}"
+        if conf_n:
+            txt += " ✓"
+        tw   = len(txt) * 7
+        cv2.rectangle(out, (x1, y1-18), (x1+tw, y1), cor, -1)
+        cv2.putText(out, txt, (x1+2, y1-4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, (255,255,255), 1)
+
+        # Barra de confirmação temporal
+        tid_ = d["track_id"]
+        hist = list(_temporal.get(tid_, []))
+        n_req = CONFIRM_OBS if lbl in OBSTACLE_CLASSES else CONFIRM_N
+        cnt   = min(hist.count(lbl), n_req) if hist else 0
+        prog  = int((x2-x1) * cnt / max(n_req,1))
+        cv2.rectangle(out, (x1,y2+2), (x2,y2+6), (40,40,40), -1)
+        cv2.rectangle(out, (x1,y2+2), (x1+prog,y2+6), cor, -1)
+
+    # Painel lateral
+    pw  = 210
+    pan = np.zeros((h, pw, 3), np.uint8); pan[:] = (18,18,18)
+    cv2.rectangle(pan, (0,0), (pw-1,h-1), (45,45,45), 1)
+
+    def t(s, l, cor=(190,190,190), sc=0.33):
+        cv2.putText(pan, s, (5, 14+l*16),
+                    cv2.FONT_HERSHEY_SIMPLEX, sc, cor, 1)
+
+    t(f"FPS:{fps}",  0, (255,255,255), 0.40)
+    t(f"Dets:{len(dets)}", 1, (200,200,200), 0.36)
+    t(f"Conf:{len([d for d in dets if d.get('confirmado')])}",
+      2, (100,220,100), 0.36)
+
     acao = _nav["acao_label"]
     if acao:
-        ca = CORES.get(acao,(200,200,200))
-        t(f"EXEC:{acao}",1,ca,0.40)
+        ca = CORES.get(acao, (200,200,200))
+        t(f"EXEC:{acao}", 4, ca, 0.40)
         if acao != "OBSTACLE":
-            t(f" {time.monotonic()-_nav['acao_t']:.1f}s/{_nav['acao_dur']}s",2,ca)
-        t(f" [{_nav['gatilho']}]",3,(200,200,0),0.28)
+            dt = time.monotonic() - _nav["acao_t"]
+            t(f" {dt:.1f}s/{_nav['acao_dur']}s", 5, ca)
     else:
-        t("livre",1,(100,200,100)); t(f"cd:{_nav['cooldown']}",2,(80,80,80))
-    t("─ESQ─",5,(60,60,60))
-    t(f"'{le or'-'}' {ce:.0%}",6,CORES.get(LABEL_TO_ACTION.get(le,""),(140,140,140)))
-    t(f"f:{_esq['cnt']}/{CONFIRM_N}",7)
-    t("─DIR─",9,(60,60,60))
-    t(f"'{ld or'-'}' {cd:.0%}",10,CORES.get(LABEL_TO_ACTION.get(ld,""),(140,140,140)))
-    t(f"f:{_dir['cnt']}/{CONFIRM_N}",11)
-    t("─ÚLTIMO─",13,(60,60,60))
-    ult = _nav["ultimo"] or "-"
-    t(f"  {ult}",14,CORES.get(LABEL_TO_ACTION.get(ult,""),(160,160,160)))
-    t("OBST:SIM" if obst else "obst:não",16,(0,0,255) if obst else(80,180,80))
+        t("livre", 4, (100,200,100))
+        t(f"cd:{_nav['cooldown']}", 5, (80,80,80))
+
+    t("─ ÚLTIMO ─", 7, (60,60,60))
+    ult = _nav["ultimo"] or "—"
+    t(f" {ult}", 8, CORES.get(LABEL_TO_ACTION.get(ult,""), (160,160,160)))
+
+    t("─ TTA ─", 10, (60,60,60))
+    t(f" {'ON' if TTA_ENABLED else 'OFF'}", 11,
+      (100,220,100) if TTA_ENABLED else (150,150,150))
+
+    t("─ THRESH ─", 13, (60,60,60))
+    for i, (k,v) in enumerate(list(_THRESHOLDS.items())[:5]):
+        t(f" {k[:8]}:{v:.0%}", 14+i, (120,120,180), 0.28)
 
     return np.hstack([out, pan])
 
+
 # ================================================================
-#  MODO --test
+#  [12] MODO --export (YOLOv8n pt → ONNX)
 # ================================================================
 
-def modo_teste(caminhos, conf_min, top_n, interp, labels, ii, oi):
-    sz = interp.get_input_details()[0]["shape"][1]
+def exportar_onnx():
+    print("[EXPORT] Exportando YOLOv8n → ONNX...")
+    try:
+        from ultralytics import YOLO
+        pt = PT_PATH if os.path.isfile(PT_PATH) else "yolov8n.pt"
+        model = YOLO(pt)
+        path  = model.export(format="onnx", imgsz=IMGSZ, simplify=True)
+        print(f"[EXPORT] Salvo: {path}")
+
+        # Salva lista de classes
+        names_path = ONNX_PATH.replace(".onnx", "_classes.txt")
+        with open(names_path, "w") as f:
+            for name in model.names.values():
+                f.write(name + "\n")
+        print(f"[EXPORT] Classes: {names_path}")
+        print(f"\n  Renomeie {path} para {ONNX_PATH}")
+    except ImportError:
+        print("[EXPORT] ultralytics não instalado.")
+        print("         pip install ultralytics")
+    except Exception as e:
+        print(f"[EXPORT] Erro: {e}")
+
+
+# ================================================================
+#  [13] MODO --test
+# ================================================================
+
+def modo_teste(caminhos: list[str]):
+    if not _yolo.carregar():
+        print("[ERRO] Nenhum modelo disponível."); sys.exit(1)
+
     for caminho in caminhos:
         img = cv2.imread(caminho)
-        if img is None: print(f"[ERRO] {caminho}"); continue
+        if img is None:
+            print(f"[ERRO] {caminho}"); continue
+
         h, w = img.shape[:2]
-        lbl, conf, probs = classificar(img, interp, labels, ii, oi)
-        top = np.argsort(probs)[::-1][:min(top_n, len(labels))]
-
-        # Métricas geométricas
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        _, thr = cv2.threshold(cv2.GaussianBlur(gray,(5,5),0), 0, 255,
-                               cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU)
-        cnts,_ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        gstr = "—"
-        if cnts:
-            c = max(cnts, key=cv2.contourArea)
-            a = cv2.contourArea(c); p = cv2.arcLength(c, True)
-            if p > 0:
-                ci = 4*np.pi*a/p**2
-                so = a/max(cv2.contourArea(cv2.convexHull(c)),1)
-                x,y,bw,bh = cv2.boundingRect(c)
-                ex = a/max(bw*bh,1); pr = bw/max(bh,1)
-                gstr=(f"circ={ci:.2f}{'✅' if ci>=CIRC_MIN else '❌'}  "
-                      f"solid={so:.2f}{'✅' if so>=SOLID_MIN else '❌'}  "
-                      f"ext={ex:.2f}{'✅' if ex>=EXTENT_MIN else '❌'}  "
-                      f"W/H={pr:.2f}{'✅' if PROP_MIN<=pr<=PROP_MAX else '❌'}")
-
-        print(f"\n{'='*58}")
+        print(f"\n{'='*60}")
         print(f"  {os.path.basename(caminho)}  ({w}×{h}px)")
-        print(f"  Geometria: {gstr}")
-        print(f"{'='*58}")
-        for i, idx in enumerate(top):
-            l=labels[idx]; c=probs[idx]
-            mk="◄" if i==0 else " "
-            dim="" if c>=conf_min else "  (<limiar)"
-            print(f"  {i+1}{mk} '{l}'  {c*100:5.1f}%  "
-                  f"{LABEL_NAMES.get(l,l):<18} {LABEL_TO_ACTION.get(l,'—')}{dim}")
-        best = labels[top[0]]; bc = probs[top[0]]
-        print(f"\n  {'AÇÃO' if bc>=conf_min else 'BAIXA CONF'}: "
-              f"'{best}' {bc*100:.1f}% → "
-              f"{LABEL_TO_ACTION.get(best,'—') if bc>=conf_min else 'não dispara'}")
-        print(f"{'='*58}\n")
 
-        orig = cv2.resize(img,(sz,sz))
-        symb = cv2.cvtColor(prep_sign(img,sz).astype(np.uint8), cv2.COLOR_RGB2BGR)
-        pan  = np.hstack([orig,symb])
-        cv2.putText(pan,"ORIGINAL",(2,12),cv2.FONT_HERSHEY_SIMPLEX,0.35,(0,220,80),1)
-        cv2.putText(pan,"SÍMBOLO",(sz+2,12),cv2.FONT_HERSHEY_SIMPLEX,0.35,(0,220,80),1)
-        cv2.putText(pan,f"'{best}' {bc*100:.0f}%",
-                    (4,sz-6),cv2.FONT_HERSHEY_SIMPLEX,0.40,(0,220,80),1)
-        cv2.imshow(f"TEST — {os.path.basename(caminho)}", pan)
+        # TTA
+        dets = _yolo.detectar_tta(img)
+        dets = atualizar_temporal(dets, 0)
+
+        print(f"  {len(dets)} detecção(ões):")
+        print(f"  {'Label':<14} {'Conf':>6}  {'Ação':<12}  BBox")
+        print(f"  {'-'*55}")
+        for d in sorted(dets, key=lambda x: -x["conf"]):
+            lbl  = d["label"]
+            acao = LABEL_TO_ACTION.get(lbl, "—")
+            print(f"  {lbl:<14} {d['conf']*100:5.1f}%  {acao:<12}  {d['bbox']}")
+
+        if not dets:
+            print("  Nenhuma detecção acima do threshold.")
+
+        print(f"{'='*60}\n")
+
+        vis = desenhar(img, dets, fps=0)
+        cv2.imshow(f"TEST — {os.path.basename(caminho)}", vis)
         cv2.waitKey(0)
+
     cv2.destroyAllWindows()
 
-# ================================================================
-#  MODO --collect
-# ================================================================
-
-def modo_collect(label, n_alvo, cam_idx, delay, manual, out_dir):
-    pasta = os.path.join(out_dir, "train", label)
-    os.makedirs(pasta, exist_ok=True)
-    exist = len([f for f in os.listdir(pasta) if f.endswith(".jpg")])
-    print(f"\n[COLLECT] '{label}' | alvo: {exist+n_alvo} | Q=sair\n")
-    cap = cv2.VideoCapture(cam_idx, cv2.CAP_DSHOW)
-    if not cap.isOpened(): cap = cv2.VideoCapture(cam_idx)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,640); cap.set(cv2.CAP_PROP_FRAME_HEIGHT,480)
-    cnt = exist; t_ul = 0.0
-    while True:
-        ret, frame = cap.read()
-        if not ret: break
-        vis = frame.copy(); h, w = frame.shape[:2]
-        roi = frame[int(h*.05):int(h*.90)]
-        cnts,_ = cv2.findContours(_mascara_hsv(roi),
-                                   cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        bbox = None; ba = 0
-        for c in cnts:
-            ok, m = _validar(c)
-            if not ok or m.get("area",0) <= ba: continue
-            pad = int(max(m["bw"],m["bh"])*.08)
-            x1=max(0,m["x"]-pad); y1=max(0,m["y"]+int(h*.05)-pad)
-            x2=min(w,m["x"]+m["bw"]+pad); y2=min(h,m["y"]+int(h*.05)+m["bh"]+pad)
-            bbox=(x1,y1,x2,y2); ba=m["area"]
-        if bbox:
-            cv2.rectangle(vis,bbox[:2],bbox[2:],(0,220,80),2)
-        agora = time.monotonic()
-        total = exist+n_alvo
-        prog  = int((cnt-exist)/n_alvo*30) if n_alvo>0 else 0
-        cv2.putText(vis,f"[{'█'*prog+'░'*(30-prog)}] {cnt}/{total}",
-                    (10,25),cv2.FONT_HERSHEY_SIMPLEX,0.48,(255,255,255),1)
-        cv2.putText(vis,f"Label: {label}",
-                    (10,45),cv2.FONT_HERSHEY_SIMPLEX,0.48,(200,200,255),1)
-        cv2.imshow(f"COLLECT — {label}", vis)
-        k = cv2.waitKey(1)&0xFF
-        if k==ord('q'): break
-        capturar = (bbox and not manual and (agora-t_ul)>=delay) or (k==32 and bbox)
-        if capturar and bbox:
-            x1,y1,x2,y2=bbox; crop=frame[y1:y2,x1:x2]
-            if crop.size==0: continue
-            img_s=cv2.cvtColor(prep_sign(crop,96).astype(np.uint8),cv2.COLOR_RGB2BGR)
-            cv2.imwrite(os.path.join(pasta,f"{cnt:05d}.jpg"),img_s)
-            cnt+=1; t_ul=agora; print(f"  [{cnt}/{total}]",flush=True)
-            if cnt>=total: print(f"[OK] {n_alvo} amostras"); break
-    cap.release(); cv2.destroyAllWindows()
-    print(f"[COLLECT] {cnt} amostras em {pasta}")
 
 # ================================================================
-#  LOOP PRINCIPAL — câmera ou vídeo
+#  [14] LOOP PRINCIPAL
 # ================================================================
 
-def main(usar_camera):
-    try:
-        interp, labels, ii, oi = carregar_modelo()
-    except (FileNotFoundError, ImportError) as e:
-        print(e); sys.exit(1)
+def main(usar_camera: bool):
+    if not _yolo.carregar():
+        print("[ERRO] Modelo não carregado."); sys.exit(1)
 
     src = CAM_IDX if usar_camera else VIDEO
     cap = cv2.VideoCapture(src, cv2.CAP_DSHOW if usar_camera else cv2.CAP_ANY)
     if not cap.isOpened():
         print(f"[ERRO] Fonte não abriu: {src}"); sys.exit(1)
-    if usar_camera:
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH,640); cap.set(cv2.CAP_PROP_FRAME_HEIGHT,480)
-        cap.set(cv2.CAP_PROP_FPS,30); cap.set(cv2.CAP_PROP_BUFFERSIZE,1)
 
-    ser   = conectar_serial()
-    fps_t = time.monotonic(); fps_n = fps = 0
-    print(f"[OK] {'Câmera' if usar_camera else 'Vídeo'}: {src} — Q para sair\n",flush=True)
+    if usar_camera:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FPS,          30)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+
+    ser    = conectar_serial()
+    fps_t  = time.monotonic(); fps_n = fps = 0
+    frame_id = 0
+
+    print(f"[OK] {'Câmera' if usar_camera else 'Vídeo'}: {src}", flush=True)
+    print(f"[OK] TTA: {'ON' if TTA_ENABLED else 'OFF'}", flush=True)
+    print("[OK] Q para sair\n", flush=True)
 
     while True:
         ret, fb = cap.read()
         if not ret:
-            if not usar_camera: cap.set(cv2.CAP_PROP_POS_FRAMES,0); continue
+            if not usar_camera:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0); continue
             break
 
-        h=round(fb.shape[0]/PROP); w=round(fb.shape[1]/PROP)
-        frame = cv2.resize(fb,(w,h))
+        frame    = fb if PROP == 1 else cv2.resize(
+            fb, (round(fb.shape[1]/PROP), round(fb.shape[0]/PROP)))
+        frame_id += 1
+        h, w     = frame.shape[:2]
 
-        if _nav["cooldown"]>0: _nav["cooldown"]-=1
-        em_acao = tick(ser)
+        decrementar_cooldown()
 
-        esq,dir_,rej = localizar(frame)
-        le=ld=None; ce=cd=0.0; obst=False
+        # Detecção com TTA
+        dets = _yolo.detectar_tta(frame)
 
-        if _nav["cooldown"]==0 and not em_acao:
-            if esq:
-                x,y,bw,bh,area,crop,_ = esq[0]
-                le,ce,_ = classificar(crop,interp,labels,ii,oi)
-                thr_e = _THRESHOLDS.get(le, CONF_BORDA if _borda(x,bw,w) else CONF_MIN)
-                if ce < thr_e: le=None
-                conf = confirmar(_esq,le,area,x,bw,w)
-                if conf: executar(conf,ser)
-            else:
-                confirmar(_esq,None,0,0,0,w)
+        # Filtro temporal com ByteTrack IDs
+        dets = atualizar_temporal(dets, frame_id)
 
-            if dir_ and not em_acao and _nav["cooldown"]==0:
-                x,y,bw,bh,area,crop,_ = dir_[0]
-                ld,cd,_ = classificar(crop,interp,labels,ii,oi)
-                thr_d = _THRESHOLDS.get(ld, CONF_BORDA if _borda(x,bw,w) else CONF_MIN)
-                if cd < thr_d: ld=None
-                conf = confirmar(_dir,ld,area,x,bw,w)
-                if conf: executar(conf,ser)
-            else:
-                confirmar(_dir,None,0,0,0,w)
+        # Decisão e envio ao Arduino
+        decidir(dets, ser, w)
 
-            if not esq and not dir_:
-                obst = detectar_obst(frame)
-                if obst and _nav["acao_label"] is None:
-                    executar("OBSTACLE",ser)
+        # Visualização
+        vis = desenhar(frame, dets, fps)
+        cv2.imshow("SIGN_DETECTOR v4.0", vis)
 
-        if _nav["acao_label"]=="OBSTACLE":
-            if not detectar_obst(frame):
-                CMD.update(mot=0,srv=127,buz=0,led=0,brk=0,dir=0,spd=0)
-                enviar(ser); _nav["acao_label"]=None
+        fps_n += 1
+        if time.monotonic() - fps_t >= 1.0:
+            fps = fps_n; fps_n = 0; fps_t = time.monotonic()
 
-        vis = desenhar(frame,esq,dir_,rej,le,ld,ce,cd,fps,obst)
-        cv2.imshow("SIGN_DETECTOR",vis)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
-        fps_n+=1
-        if time.monotonic()-fps_t>=1.0:
-            fps=fps_n; fps_n=0; fps_t=time.monotonic()
-
-        if cv2.waitKey(1)&0xFF==ord('q'): break
-
-    CMD.update(mot=0,srv=127,buz=0,led=0,brk=1,dir=0,spd=0)
+    CMD.update(mot=0, srv=127, buz=0, led=0, brk=1, dir=0, spd=0)
     enviar(ser)
     if ser: ser.close()
     cap.release(); cv2.destroyAllWindows()
-    print("[OK] Encerrado.",flush=True)
+    print("[OK] Encerrado.", flush=True)
+
 
 # ================================================================
 #  ENTRY POINT
 # ================================================================
 
-if __name__=="__main__":
-    ap=argparse.ArgumentParser(description="SIGN_DETECTOR",
-                               formatter_class=argparse.RawTextHelpFormatter)
-    ap.add_argument("--cam",     action="store_true", help="Câmera USB ao vivo")
-    ap.add_argument("--test",    nargs="+", metavar="FOTO")
-    ap.add_argument("--conf",    type=float, default=CONF_MIN)
-    ap.add_argument("--top",     type=int,   default=3)
-    ap.add_argument("--collect", metavar="LABEL")
-    ap.add_argument("--n",       type=int,   default=200)
-    ap.add_argument("--delay",   type=float, default=0.2)
-    ap.add_argument("--manual",  action="store_true")
-    ap.add_argument("--out",     default="./dataset_circuito")
-    args=ap.parse_args()
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(
+        description="SIGN_DETECTOR v4.0 — YOLOv8n + ByteTrack + ONNX",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    ap.add_argument("--cam",    action="store_true",
+                    help="Câmera USB ao vivo")
+    ap.add_argument("--test",   nargs="+", metavar="FOTO",
+                    help="Testa imagens")
+    ap.add_argument("--export", action="store_true",
+                    help="Exporta YOLOv8n → ONNX (precisa ultralytics)")
+    ap.add_argument("--no-tta", action="store_true",
+                    help="Desativa TTA (mais rápido, menos preciso)")
+    args = ap.parse_args()
 
-    if args.test:
-        try: interp,labels,ii,oi=carregar_modelo()
-        except (FileNotFoundError,ImportError) as e: print(e); sys.exit(1)
-        modo_teste(args.test,args.conf,args.top,interp,labels,ii,oi)
-    elif args.collect:
-        modo_collect(args.collect,args.n,CAM_IDX,args.delay,args.manual,args.out)
+    if args.no_tta:
+        TTA_ENABLED = False
+
+    carregar_thresholds()
+
+    if args.export:
+        exportar_onnx()
+    elif args.test:
+        modo_teste(args.test)
     else:
         main(usar_camera=args.cam)
