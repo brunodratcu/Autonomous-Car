@@ -1,8 +1,0 @@
-Carro,0.25
-Cone,0.25
-Direita,0.33
-Esquerda,0.31
-Pessoa,0.25
-SemRetorno,0.25
-Stop,0.67
-Verde,0.31

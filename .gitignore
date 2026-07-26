@@ -5,12 +5,16 @@ dataset/
 dataset_novo/
 dataset_v3/
 *.zip
+yolo_dataset/
+models/
 
 sign_model.tflite
 sign_model.keras
 sign_model.h5
 sign_labels.txt
 training_report.png
+yolo8n.onnx
+yolo8n.pt
 
 
 __pycache__/

@@ -1,595 +1,548 @@
 """
 ================================================================
-  TRAIN_SIGN_CNN.py — Dual-pipeline CNN  v3
-  ─────────────────────────────────────────────────────────────
-  8 classes:
-    Placas  → prep_sign()     (símbolo binário)
-      Stop | Esquerda | Direita | SemRetorno | Verde
-    Obstáculos → prep_obstacle()  (RGB+CLAHE)
-      Cone | Carro | Pessoa
+  TREINO CNN — MobileNetV3Small 96x96
+  Estruturas de dataset aceitas automaticamente:
 
-  Gera após treino:
-    sign_model.tflite       ← modelo compacto
-    sign_labels.txt         ← ordem das classes
-    sign_thresholds.txt     ← threshold ótimo por classe (F1)
-    training_report.png     ← curvas treino/validação
-    confusion_matrix.png    ← onde a rede erra
+  A) Flat (mais comum):
+       dataset_v3/Stop/*.jpg
+       dataset_v3/Esquerda/*.jpg  ...
+     -> Script auto-divide 80/20 estratificado
+
+  B) Ja dividido:
+       dataset_v3/train/Stop/  dataset_v3/val/Stop/  ...
+     -> Usado como esta
 
   USO:
-    python TRAIN_SIGN_CNN.py --dataset ./dataset_v3
-    python TRAIN_SIGN_CNN.py --test foto.jpg
+    python TRAIN_SIGN_CNN.py
+    python TRAIN_SIGN_CNN.py --dataset ./meu_dataset
+    python TRAIN_SIGN_CNN.py --dataset ./dataset_v3 --val-split 0.20
+
+  SAIDAS em ./models/:
+    sign_classifier.tflite   <- para carro-autonomo.py
+    sign_classifier.keras    <- backup completo
+    ood_thresholds.json      <- calibrado no val set
+    confusion_matrix.png     <- avaliacao visual
 ================================================================
 """
+import os, sys, json, time, argparse
+import numpy as np
+import cv2
+from pathlib import Path
+from collections import defaultdict
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from tensorflow import keras
 
-import os, sys, argparse, glob
-import cv2, numpy as np
+# ================================================================
+#  [1] CONFIG
+# ================================================================
+OUTPUT_DIR    = "./models"
+CNN_SIZE      = 96
+BATCH_SIZE    = 32
+SEED          = 42
+VAL_SPLIT     = 0.20
+EPOCHS_1      = 15;   LR_1 = 1e-3
+EPOCHS_2      = 20;   LR_2 = 2e-5
+UNFREEZE_LAST = 50
+OOD_PERCENTILE = 5;   OOD_MIN = 0.40;  OOD_MAX = 0.92
 
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+CLASSES = ["Stop","Esquerda","Direita","SemRetorno",
+           "Verde","Cone","Carro","Pessoa"]
+NUM_CLASSES      = len(CLASSES)
+IDX              = {c:i for i,c in enumerate(CLASSES)}
+OBSTACLE_CLASSES = {"Cone","Carro","Pessoa"}
+NO_FLIP_CLASSES  = {"Esquerda","Direita","SemRetorno"}
+EXTS             = {".jpg",".jpeg",".png",".bmp",".webp"}
 
-try:
-    import tensorflow as tf
-    from tensorflow import keras
-    from tensorflow.keras import layers, applications
+tf.random.set_seed(SEED)
+np.random.seed(SEED)
+
+# ================================================================
+#  [2] DIAGNOSTICO
+# ================================================================
+
+def _scan_flat(base: Path) -> dict | None:
+    """
+    Tenta detectar estrutura flat em 'base': procura subpastas
+    cujo nome bate (case-insensitive) com alguma classe.
+    Retorna dict ou None se nao encontrou nenhuma classe.
+    """
+    subdirs = [d for d in base.iterdir() if d.is_dir()]
+    cls_dirs = {}
+    for d in subdirs:
+        for cls in CLASSES:
+            if d.name.lower() == cls.lower():
+                cls_dirs[cls] = d; break
+
+    if not cls_dirs:
+        return None
+
+    contagem, faltando = {}, []
+    for cls in CLASSES:
+        if cls in cls_dirs:
+            n = len([f for f in cls_dirs[cls].iterdir()
+                     if f.suffix.lower() in EXTS])
+            if n > 0: contagem[cls] = n
+            else:     faltando.append(cls)
+        else:
+            faltando.append(cls)
+    return {
+        "estrutura":     "flat",
+        "raiz_efetiva":  str(base),
+        "pastas":        sorted(d.name for d in subdirs),
+        "contagem":      contagem,
+        "faltando":      faltando,
+    }
+
+
+def diagnosticar(dataset_dir: str) -> dict:
+    """
+    Detecta estrutura real do dataset e conta imagens por classe.
+    Casos suportados:
+      1. dataset/ClassName/          -> flat, auto-split
+      2. dataset/train/ + val/       -> split
+      3. dataset/train/  (sem val/)  -> entra em train/, trata como flat
+    """
+    base = Path(dataset_dir)
+    if not base.exists():
+        return {"estrutura":"vazio","raiz_efetiva":str(base),
+                "pastas":[],"contagem":{},"faltando":list(CLASSES)}
+
+    subdirs = [d for d in base.iterdir() if d.is_dir()]
+    nomes   = {d.name for d in subdirs}
+
+    # ── Caso 1: split completo (train + val) ──────────────────────
+    if "train" in nomes and "val" in nomes:
+        contagem, faltando = {}, []
+        for cls in CLASSES:
+            n = 0
+            for split in ("train","val"):
+                p = base / split / cls
+                if p.exists():
+                    n += len([f for f in p.iterdir()
+                               if f.suffix.lower() in EXTS])
+            if n > 0: contagem[cls] = n
+            else:     faltando.append(cls)
+        return {"estrutura":"split","raiz_efetiva":str(base),
+                "pastas":sorted(nomes),"contagem":contagem,"faltando":faltando}
+
+    # ── Caso 2: flat direto (pastas de classe no root) ────────────
+    flat = _scan_flat(base)
+    if flat:
+        return flat
+
+    # ── Caso 3: so 'train/' existe sem 'val/' ─────────────────────
+    #    Entra em train/ e trata como flat, fazendo auto-split
+    if "train" in nomes:
+        flat_in_train = _scan_flat(base / "train")
+        if flat_in_train:
+            flat_in_train["nota"] = (
+                "Apenas train/ encontrado (sem val/). "
+                "Usando train/ como raiz flat com auto-split."
+            )
+            return flat_in_train
+
+        # train/ existe mas as pastas internas nao batem com CLASSES
+        pastas_internas = sorted(
+            d.name for d in (base/"train").iterdir() if d.is_dir()
+        )
+        return {"estrutura":"desconhecido","raiz_efetiva":str(base),
+                "pastas":sorted(nomes),
+                "pastas_em_train": pastas_internas,
+                "contagem":{},"faltando":list(CLASSES)}
+
+    # ── Desconhecido ──────────────────────────────────────────────
+    return {"estrutura":"desconhecido","raiz_efetiva":str(base),
+            "pastas":sorted(nomes),"contagem":{},"faltando":list(CLASSES)}
+
+
+def imprimir_diagnostico(dataset_dir: str, info: dict):
+    print("\n" + "-"*62)
+    print(f"  DIAGNOSTICO")
+    print(f"  Argumento    : {os.path.abspath(dataset_dir)}")
+    raiz = info.get("raiz_efetiva", dataset_dir)
+    if os.path.abspath(raiz) != os.path.abspath(dataset_dir):
+        print(f"  Raiz efetiva : {os.path.abspath(raiz)}  <- ajustado automaticamente")
+    print("-"*62)
+    print(f"  Estrutura detectada : {info['estrutura'].upper()}")
+    if "nota" in info:
+        print(f"  Nota: {info['nota']}")
+    print(f"  Pastas encontradas  : {info['pastas'] or '(nenhuma)'}")
+    if "pastas_em_train" in info:
+        print(f"  Pastas em train/    : {info['pastas_em_train']}")
+    print()
+    print(f"  {'Classe':<14s}  {'Imagens':>8s}  Status")
+    print("  " + "-"*36)
+    for cls in CLASSES:
+        n      = info["contagem"].get(cls, 0)
+        status = "OK" if n > 0 else "AUSENTE"
+        print(f"  {cls:<14s}  {n:>8d}  {status}")
+    total = sum(info["contagem"].values())
+    print(f"\n  Total: {total} imagens")
+    if info["faltando"]:
+        print(f"  Ausentes: {info['faltando']}")
+    print("-"*62)
+
+# ================================================================
+#  [3] PREPROCESSING DUAL
+# ================================================================
+
+def prep_sign(img_bgr):
+    img  = cv2.resize(img_bgr, (CNN_SIZE,CNN_SIZE))
+    gray = cv2.GaussianBlur(cv2.cvtColor(img,cv2.COLOR_BGR2GRAY),(3,3),0)
+    thr  = cv2.adaptiveThreshold(gray,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                  cv2.THRESH_BINARY,11,2)
+    return np.stack([thr,thr,thr],axis=-1).astype(np.float32)/255.0
+
+def prep_obstacle(img_bgr):
+    img = cv2.resize(img_bgr,(CNN_SIZE,CNN_SIZE))
+    lab = cv2.cvtColor(img,cv2.COLOR_BGR2LAB)
+    clahe = cv2.createCLAHE(clipLimit=2.0,tileGridSize=(4,4))
+    lab[:,:,0] = clahe.apply(lab[:,:,0])
+    img = cv2.cvtColor(lab,cv2.COLOR_LAB2BGR)
+    return cv2.cvtColor(img,cv2.COLOR_BGR2RGB).astype(np.float32)/255.0
+
+def preprocess(img_bgr, cls_name):
+    return prep_obstacle(img_bgr) if cls_name in OBSTACLE_CLASSES else prep_sign(img_bgr)
+
+# ================================================================
+#  [4] AUGMENTACAO
+# ================================================================
+
+def augmentar(img, cls_name):
+    h, w = img.shape[:2]
+    if np.random.rand() < 0.55:
+        ang = np.random.uniform(-10,10)
+        M   = cv2.getRotationMatrix2D((w/2,h/2),ang,1.0)
+        img = cv2.warpAffine(img,M,(w,h),borderMode=cv2.BORDER_REFLECT_101)
+    if np.random.rand() < 0.40:
+        f = np.random.uniform(0.90,1.10)
+        nh,nw = int(h*f),int(w*f)
+        rsz = cv2.resize(img,(nw,nh))
+        if f>1:
+            y0=(nh-h)//2; x0=(nw-w)//2
+            img = rsz[y0:y0+h, x0:x0+w]
+        else:
+            tmp = np.full((h,w,3),128,dtype=img.dtype)
+            y0=(h-nh)//2; x0=(w-nw)//2
+            tmp[y0:y0+nh, x0:x0+nw]=rsz; img=tmp
+    if np.random.rand() < 0.55:
+        img = np.clip(img.astype(np.float32)*np.random.uniform(0.75,1.30)
+                      + np.random.randint(-25,25),0,255).astype(np.uint8)
+    if np.random.rand() < 0.30:
+        img = np.clip(img.astype(np.float32)
+                      +np.random.randn(*img.shape)*8,0,255).astype(np.uint8)
+    # Flip horizontal proibido para classes direcionais
+    if cls_name not in NO_FLIP_CLASSES and np.random.rand() < 0.50:
+        img = cv2.flip(img,1)
+    return img
+
+# ================================================================
+#  [5] CARREGAMENTO
+# ================================================================
+
+def _ler_pasta(pasta):
+    imgs=[]
+    for p in Path(pasta).iterdir():
+        if p.suffix.lower() in EXTS:
+            img=cv2.imread(str(p))
+            if img is not None: imgs.append(img)
+    return imgs
+
+
+def carregar_flat(dataset_dir, val_frac, aug_factor):
     from sklearn.model_selection import train_test_split
+    base = Path(dataset_dir)
+    print(f"\n  Modo FLAT — auto-split {int((1-val_frac)*100)}/{int(val_frac*100)}")
+    raw_imgs, raw_labels = [],[]
+    for cls in CLASSES:
+        pasta=None
+        for d in base.iterdir():
+            if d.is_dir() and d.name.lower()==cls.lower(): pasta=d; break
+        if pasta is None: print(f"    [SKIP] {cls}: pasta nao encontrada"); continue
+        imgs = _ler_pasta(pasta)
+        print(f"    {cls:<14s}: {len(imgs):>4d}")
+        for img in imgs:
+            raw_imgs.append(img); raw_labels.append(IDX[cls])
+    if not raw_imgs: print("[ERRO] Nenhuma imagem carregada."); sys.exit(1)
+
+    Xr_tr,Xr_va,yr_tr,yr_va = train_test_split(
+        raw_imgs,raw_labels,test_size=val_frac,random_state=SEED,stratify=raw_labels)
+    print(f"\n    Split: {len(Xr_tr)} treino / {len(Xr_va)} val")
+
+    X_tr,y_tr=[],[]
+    for img,lbl in zip(Xr_tr,yr_tr):
+        cls=CLASSES[lbl]
+        for k in range(aug_factor):
+            src = augmentar(img.copy(),cls) if k>0 else img
+            X_tr.append(preprocess(src,cls)); y_tr.append(lbl)
+
+    X_va=[preprocess(img,CLASSES[lbl]) for img,lbl in zip(Xr_va,yr_va)]
+    return (np.array(X_tr,dtype=np.float32),np.array(y_tr,dtype=np.int32),
+            np.array(X_va,dtype=np.float32),np.array(yr_va,dtype=np.int32))
+
+
+def carregar_split(dataset_dir, aug_factor):
+    base=Path(dataset_dir)
+    print("\n  Modo SPLIT — usando train/ e val/")
+    def _load(split,augment):
+        X,y=[],[]
+        for cls in CLASSES:
+            p = base/split/cls
+            if not p.exists(): print(f"    [SKIP] [{split}] {cls}"); continue
+            imgs=_ler_pasta(p)
+            print(f"    [{split}] {cls:<14s}: {len(imgs):>4d}")
+            for img in imgs:
+                if augment:
+                    for k in range(aug_factor):
+                        src=augmentar(img.copy(),cls) if k>0 else img
+                        X.append(preprocess(src,cls)); y.append(IDX[cls])
+                else:
+                    X.append(preprocess(img,cls)); y.append(IDX[cls])
+        return np.array(X,dtype=np.float32),np.array(y,dtype=np.int32)
+    X_tr,y_tr=_load("train",True)
+    X_va,y_va=_load("val",  False)
+    return X_tr,y_tr,X_va,y_va
+
+# ================================================================
+#  [6] MODELO
+# ================================================================
+
+def build_model():
+    base=keras.applications.MobileNetV3Small(
+        input_shape=(CNN_SIZE,CNN_SIZE,3),include_top=False,
+        weights="imagenet",include_preprocessing=False)
+    base.trainable=False
+    inp=keras.Input(shape=(CNN_SIZE,CNN_SIZE,3),name="input")
+    x=base(inp,training=False)
+    x=keras.layers.GlobalAveragePooling2D()(x)
+    x=keras.layers.BatchNormalization()(x)
+    x=keras.layers.Dropout(0.35)(x)
+    x=keras.layers.Dense(128,activation="relu",
+                          kernel_regularizer=keras.regularizers.l2(1e-4))(x)
+    x=keras.layers.Dropout(0.20)(x)
+    out=keras.layers.Dense(NUM_CLASSES,activation="softmax",name="output")(x)
+    return keras.Model(inp,out,name="MobileNetV3Small_sign"),base
+
+# ================================================================
+#  [7] TREINO 2 FASES
+# ================================================================
+
+def treinar(X_tr,y_tr,X_va,y_va):
     from sklearn.utils.class_weight import compute_class_weight
-except ImportError:
-    print("Execute: pip install tensorflow scikit-learn"); sys.exit(1)
+    cw_arr=compute_class_weight("balanced",classes=np.arange(NUM_CLASSES),y=y_tr)
+    cw=dict(enumerate(cw_arr))
+    pesos_str = {cls: round(v, 2) for cls, v in zip(CLASSES, cw_arr)}
+    print(f"\n  Pesos: {pesos_str}")
+
+    model,base=build_model()
+    print(f"  Params totais: {model.count_params():,}")
+
+    def compile_(lr):
+        model.compile(optimizer=keras.optimizers.Adam(lr),
+                      loss="sparse_categorical_crossentropy",metrics=["accuracy"])
+
+    print(f"\n  FASE 1 — Head only ({EPOCHS_1} epochs lr={LR_1})")
+    compile_(LR_1)
+    cb1=[keras.callbacks.EarlyStopping(patience=5,restore_best_weights=True,
+                                        monitor="val_accuracy"),
+         keras.callbacks.ReduceLROnPlateau(factor=0.5,patience=3,
+                                           monitor="val_loss",verbose=1,min_lr=1e-6)]
+    h1=model.fit(X_tr,y_tr,validation_data=(X_va,y_va),epochs=EPOCHS_1,
+                 batch_size=BATCH_SIZE,class_weight=cw,callbacks=cb1,verbose=1)
+    print(f"  [F1] Melhor val_acc: {max(h1.history['val_accuracy'])*100:.2f}%")
+
+    print(f"\n  FASE 2 — Fine-tune ({EPOCHS_2} epochs lr={LR_2} "
+          f"ultimas {UNFREEZE_LAST} layers)")
+    base.trainable=True
+    for layer in base.layers[:-UNFREEZE_LAST]: layer.trainable=False
+    for layer in base.layers:
+        if isinstance(layer,keras.layers.BatchNormalization): layer.trainable=False
+
+    compile_(LR_2)
+    ck=os.path.join(OUTPUT_DIR,"_ck.keras")
+    cb2=[keras.callbacks.EarlyStopping(patience=7,restore_best_weights=True,
+                                        monitor="val_accuracy"),
+         keras.callbacks.ModelCheckpoint(ck,save_best_only=True,
+                                         monitor="val_accuracy",verbose=1),
+         keras.callbacks.ReduceLROnPlateau(factor=0.5,patience=4,
+                                           monitor="val_loss",verbose=1,min_lr=1e-7)]
+    h2=model.fit(X_tr,y_tr,validation_data=(X_va,y_va),epochs=EPOCHS_2,
+                 batch_size=BATCH_SIZE,class_weight=cw,callbacks=cb2,verbose=1)
+    print(f"  [F2] Melhor val_acc: {max(h2.history['val_accuracy'])*100:.2f}%")
+
+    loss,acc=model.evaluate(X_va,y_va,verbose=0)
+    print(f"  [FINAL] val_loss={loss:.4f}  val_acc={acc*100:.2f}%")
+    if os.path.exists(ck): os.remove(ck)
+    return model
 
 # ================================================================
-#  CONFIGURAÇÃO
+#  [8] AVALIACAO
 # ================================================================
 
-DATASET_DIR  = "./dataset_v3"
-MODEL_PATH   = "./sign_model.tflite"
-LABELS_PATH  = "./sign_labels.txt"
-KERAS_PATH   = "./sign_model.keras"
-REPORT_PATH  = "./training_report.png"
-CONF_PATH    = "./confusion_matrix.png"
-THRESH_PATH  = "./sign_thresholds.txt"
-
-IMG_SIZE    = 96
-BATCH_SIZE  = 32
-EPOCHS_1    = 12
-EPOCHS_2    = 60
-LR_1        = 1e-3
-LR_2        = 5e-5
-SEED        = 42
-
-# Obstáculos usam RGB; placas usam símbolo
-OBSTACLE_CLASSES = {"Cone", "Carro", "Pessoa"}
-SIGN_CLASSES     = {"Stop", "Esquerda", "Direita", "SemRetorno", "Verde"}
-
-LABEL_TO_ACTION = {
-    "Stop":       "STOP",
-    "Esquerda":   "LEFT",
-    "Direita":    "RIGHT",
-    "SemRetorno": "STRAIGHT",
-    "Verde":      "SPEED_UP",
-    "Cone":       "OBSTACLE",
-    "Carro":      "OBSTACLE",
-    "Pessoa":     "OBSTACLE",
-}
-
-# ================================================================
-#  DUAL PIPELINE
-# ================================================================
-
-def prep_sign(img_bgr, sz=96):
-    """
-    Placas — símbolo binário.
-    Remove 8% de borda, grayscale, CLAHE, threshold adaptativo.
-    CNN aprende a FORMA, não a cor.
-    """
-    if img_bgr is None or img_bgr.size == 0:
-        return np.zeros((sz, sz, 3), np.float32)
-    h, w = img_bgr.shape[:2]
-    py, px = max(1, int(h*.08)), max(1, int(w*.08))
-    roi = img_bgr[py:h-py, px:w-px]
-    if roi.size == 0: roi = img_bgr
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    hh, ww = gray.shape
-    sc = sz / max(hh, ww)
-    nh, nw = max(1, int(hh*sc)), max(1, int(ww*sc))
-    rs = cv2.resize(gray, (nw, nh), interpolation=cv2.INTER_AREA)
-    c  = np.zeros((sz, sz), np.uint8)
-    c[(sz-nh)//2:(sz-nh)//2+nh, (sz-nw)//2:(sz-nw)//2+nw] = rs
-    c  = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4,4)).apply(c)
-    t  = cv2.adaptiveThreshold(c, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                cv2.THRESH_BINARY, 13, 5)
-    t  = cv2.morphologyEx(t, cv2.MORPH_OPEN, np.ones((2,2), np.uint8))
-    return cv2.cvtColor(t, cv2.COLOR_GRAY2RGB).astype(np.float32)
-
-
-def prep_obstacle(img_bgr, sz=96):
-    """
-    Obstáculos — RGB completo preservado.
-    Resize + CLAHE no canal L.
-    CNN aprende cor e silhueta do cone/carro/pessoa.
-    """
-    if img_bgr is None or img_bgr.size == 0:
-        return np.zeros((sz, sz, 3), np.float32)
-    img_r = cv2.resize(img_bgr, (sz, sz), interpolation=cv2.INTER_AREA)
-    lab   = cv2.cvtColor(img_r, cv2.COLOR_BGR2LAB)
-    lab[:,:,0] = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4,4)).apply(lab[:,:,0])
-    out = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-    return cv2.cvtColor(out, cv2.COLOR_BGR2RGB).astype(np.float32)
-
-
-def preprocess(img_bgr, cls_name, sz=96):
-    if cls_name in OBSTACLE_CLASSES:
-        return prep_obstacle(img_bgr, sz)
-    return prep_sign(img_bgr, sz)
-
+def avaliar(model,X_va,y_va):
+    from sklearn.metrics import confusion_matrix,classification_report
+    probs=model.predict(X_va,verbose=0); y_pred=probs.argmax(axis=1)
+    print("\n"+classification_report(y_va,y_pred,target_names=CLASSES,
+                                     digits=3,zero_division=0))
+    cm=confusion_matrix(y_va,y_pred)
+    cm_n=cm.astype(float)/(cm.sum(axis=1,keepdims=True)+1e-9)
+    fig,axes=plt.subplots(1,2,figsize=(18,7))
+    for ax,data,title,fmt in zip(axes,[cm,cm_n],
+                                  ["Contagem","Recall normalizado"],["d",".2f"]):
+        im=ax.imshow(data,cmap="Blues" if fmt=="d" else "YlOrRd",
+                     vmin=0,vmax=None if fmt=="d" else 1)
+        ax.set_xticks(range(NUM_CLASSES)); ax.set_yticks(range(NUM_CLASSES))
+        ax.set_xticklabels(CLASSES,rotation=40,ha="right",fontsize=9)
+        ax.set_yticklabels(CLASSES,fontsize=9)
+        ax.set_xlabel("Predito"); ax.set_ylabel("Real"); ax.set_title(title)
+        plt.colorbar(im,ax=ax)
+        for i in range(NUM_CLASSES):
+            for j in range(NUM_CLASSES):
+                v=data[i,j]; t=f"{v}" if fmt=="d" else f"{v:.2f}"
+                ax.text(j,i,t,ha="center",va="center",fontsize=7,
+                        color="white" if (v>cm.max()*0.6 if fmt=="d" else v>0.6) else "black")
+    plt.suptitle("MobileNetV3Small 96x96 — Confusion Matrix")
+    plt.tight_layout()
+    out=os.path.join(OUTPUT_DIR,"confusion_matrix.png")
+    plt.savefig(out,dpi=130); plt.close()
+    print(f"  [OK] {out}")
+    print("\n  Acuracia por classe:")
+    for i,cls in enumerate(CLASSES):
+        tp=cm[i,i]; total=cm[i].sum()
+        print(f"    {cls:<14s}: {tp:3d}/{total:3d} = {tp/max(total,1)*100:5.1f}%")
 
 # ================================================================
-#  CARREGAR DATASET
+#  [9] OOD CALIBRACAO
 # ================================================================
 
-def carregar_dataset(dataset_dir, sz):
-    train_dir = os.path.join(dataset_dir, "train")
-    if not os.path.isdir(train_dir):
-        train_dir = dataset_dir
+def calibrar_ood(model,X_va,y_va):
+    print(f"\n  Calibrando OOD (percentil={OOD_PERCENTILE})...")
+    probs=model.predict(X_va,verbose=0)
+    max_sof=probs.max(axis=1); pred_cls=probs.argmax(axis=1)
+    scores=defaultdict(list)
+    for tc,pc,sc in zip(y_va,pred_cls,max_sof):
+        if tc==pc: scores[CLASSES[tc]].append(float(sc))
 
-    all_classes = sorted([
-        d for d in os.listdir(train_dir)
-        if os.path.isdir(os.path.join(train_dir, d))
-        and d in (SIGN_CLASSES | OBSTACLE_CLASSES)
-    ])
-    if not all_classes:
-        print(f"[ERRO] Nenhuma classe reconhecida em {train_dir}")
-        print(f"       Esperadas: {sorted(SIGN_CLASSES|OBSTACLE_CLASSES)}")
-        sys.exit(1)
+    thresholds={}
+    print(f"\n  {'Classe':<14s} {'n':>5s}  {'min':>5s}  {'med':>5s}  "
+          f"p{OOD_PERCENTILE:02d} -> thr")
+    for cls in CLASSES:
+        sc=scores.get(cls,[])
+        if len(sc)<5:
+            thr=0.55; print(f"  {cls:<14s} {'<5':>5s}  (poucos dados) -> {thr:.3f}")
+        else:
+            raw=float(np.percentile(sc,OOD_PERCENTILE))
+            thr=float(np.clip(raw,OOD_MIN,OOD_MAX))
+            print(f"  {cls:<14s} {len(sc):>5d}  {min(sc):>5.3f}  "
+                  f"{np.median(sc):>5.3f}  {raw:.3f} -> {thr:.3f}")
+        thresholds[cls]=thr
 
-    labels = sorted(all_classes)   # label = nome da pasta
-    l2i    = {l: i for i, l in enumerate(labels)}
-
-    print(f"\n[DATA] {len(labels)} classes: {labels}")
-    print(f"\n  {'Classe':<14} {'Pipeline':<12} {'Ação'}")
-    print("  " + "-"*40)
-    for cls in labels:
-        pipe = "RGB+CLAHE" if cls in OBSTACLE_CLASSES else "Símbolo"
-        print(f"  {cls:<14} {pipe:<12} {LABEL_TO_ACTION.get(cls,'—')}")
-
-    X_all, y_all = [], []
-    contagem = {cls: 0 for cls in labels}
-
-    for split in ["train", "valid", "test"]:
-        sdir = os.path.join(dataset_dir, split)
-        if not os.path.isdir(sdir):
-            sdir = train_dir if split == "train" else None
-        if not sdir or not os.path.isdir(sdir): continue
-
-        for cls in labels:
-            cdir = os.path.join(sdir, cls)
-            if not os.path.isdir(cdir): continue
-            for f in (glob.glob(f"{cdir}/*.jpg") +
-                      glob.glob(f"{cdir}/*.png") +
-                      glob.glob(f"{cdir}/*.jpeg")):
-                img = cv2.imread(f)
-                if img is None: continue
-                X_all.append(preprocess(img, cls, sz))
-                y_all.append(l2i[cls])
-                contagem[cls] += 1
-
-    print(f"\n  {'Classe':<14} {'Imgs':>6}")
-    for cls in labels:
-        bar = "█" * (contagem[cls]//10)
-        print(f"  {cls:<14} {contagem[cls]:>6}  {bar}")
-
-    if not X_all:
-        print("[ERRO] Nenhuma imagem carregada."); sys.exit(1)
-
-    X = np.array(X_all, np.float32)
-    y = np.array(y_all, np.int32)
-    print(f"\n[DATA] Total: {len(X)} imagens")
-    return X, y, labels
-
-
-# ================================================================
-#  MODELO
-# ================================================================
-
-def construir_modelo(n, sz):
-    base = applications.MobileNetV2(
-        input_shape=(sz, sz, 3), include_top=False,
-        weights="imagenet", pooling="avg"
-    )
-    base.trainable = False
-    inp = keras.Input(shape=(sz, sz, 3), name="imagem")
-    x   = keras.Sequential([
-        layers.RandomFlip("horizontal"),
-        layers.RandomRotation(0.10),
-        layers.RandomZoom(0.12),
-        layers.RandomBrightness(0.20),
-        layers.RandomContrast(0.15),
-    ], name="aug")(inp)
-    x   = layers.Lambda(
-        lambda i: applications.mobilenet_v2.preprocess_input(i),
-        name="preprocess")(x)
-    x   = base(x, training=False)
-    x   = layers.Dropout(0.35)(x)
-    x   = layers.Dense(256, activation="relu",
-                        kernel_regularizer=keras.regularizers.l2(1e-4))(x)
-    x   = layers.Dropout(0.25)(x)
-    out = layers.Dense(n, activation="softmax", name="saida")(x)
-    return keras.Model(inp, out, name="SignObstCNN_v3")
-
-
-# ================================================================
-#  THRESHOLD ADAPTATIVO — maximiza F1 por classe
-# ================================================================
-
-def calcular_thresholds(modelo, X_v, y_v, labels):
-    print("\n[THRESHOLD] Calculando threshold ótimo por classe (máximo F1)...")
-    probs = modelo.predict(X_v, verbose=0)
-    thresholds = {}
-    for i, lbl in enumerate(labels):
-        col  = probs[:, i]
-        mask = (y_v == i).astype(int)
-        best_t, best_f1 = 0.50, 0.0
-        for t in np.arange(0.25, 0.96, 0.01):
-            preds = (col >= t).astype(int)
-            tp = ((preds==1)&(mask==1)).sum()
-            fp = ((preds==1)&(mask==0)).sum()
-            fn = ((preds==0)&(mask==1)).sum()
-            prec = tp/(tp+fp+1e-9); rec = tp/(tp+fn+1e-9)
-            f1   = 2*prec*rec/(prec+rec+1e-9)
-            if f1 > best_f1: best_f1=f1; best_t=t
-        thresholds[lbl] = round(float(best_t), 2)
-        print(f"  '{lbl}'  t={best_t:.2f}  F1={best_f1:.3f}")
-    with open(THRESH_PATH, "w") as f:
-        for lbl, t in thresholds.items():
-            f.write(f"{lbl},{t:.2f}\n")
-    print(f"[OK] {THRESH_PATH}")
+    out=os.path.join(OUTPUT_DIR,"ood_thresholds.json")
+    with open(out,"w") as f: json.dump(thresholds,f,indent=2)
+    print(f"\n  [OK] {out}")
     return thresholds
 
-
 # ================================================================
-#  MATRIZ DE CONFUSÃO
-# ================================================================
-
-def plotar_confusao(modelo, X_v, y_v, labels):
-    try:
-        import matplotlib; matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from sklearn.metrics import confusion_matrix
-
-        probs  = modelo.predict(X_v, verbose=0)
-        y_pred = np.argmax(probs, axis=1)
-        cm     = confusion_matrix(y_v, y_pred, labels=list(range(len(labels))))
-        cm_n   = cm.astype(float) / (cm.sum(axis=1, keepdims=True) + 1e-9)
-
-        fig, ax = plt.subplots(figsize=(10, 8))
-        im = ax.imshow(cm_n, cmap="Blues", vmin=0, vmax=1)
-        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        ax.set_xticks(range(len(labels))); ax.set_yticks(range(len(labels)))
-        ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=11)
-        ax.set_yticklabels(labels, fontsize=11)
-        ax.set_xlabel("Predito", fontsize=12); ax.set_ylabel("Real", fontsize=12)
-        ax.set_title("Matriz de Confusão (recall por classe)\n"
-                     "Diagonal = acertos | Fora = erros",
-                     fontsize=12, fontweight="bold")
-        for i in range(len(labels)):
-            for j in range(len(labels)):
-                v = cm_n[i,j]; r = cm[i,j]
-                c = "white" if v > 0.6 else "black"
-                ax.text(j, i, f"{v:.0%}\n({r})",
-                        ha="center", va="center", fontsize=9,
-                        color=c, fontweight="bold" if i==j else "normal")
-        plt.tight_layout()
-        plt.savefig(CONF_PATH, dpi=120, bbox_inches="tight")
-        plt.close()
-        print(f"[CONFUSÃO] {CONF_PATH}")
-
-        print("\n[CONFUSÃO] Análise — onde o modelo erra:")
-        for i, lbl in enumerate(labels):
-            total  = cm[i].sum()
-            recall = cm[i,i] / max(total, 1)
-            erros  = [(labels[j], cm[i,j]) for j in range(len(labels))
-                      if j != i and cm[i,j] > 0]
-            erros.sort(key=lambda x: -x[1])
-            err_str = ", ".join([f"→'{e}' {n}x" for e,n in erros[:2]])
-            status  = "✅" if recall>=.85 else ("⚠️" if recall>=.65 else "❌")
-            print(f"  {status} '{lbl:<12}'  recall={recall*100:.1f}%  {err_str or 'sem erros'}")
-
-        print("\n  ✅≥85%  ⚠️65-85%  ❌<65% → adicionar mais imagens dessa classe")
-    except Exception as e:
-        print(f"[CONFUSÃO] {e}")
-
-
-# ================================================================
-#  TREINO
+#  [10] EXPORT
 # ================================================================
 
-def treinar(source, sz):
-    print("="*60)
-    print("  SIGN+OBSTACLE CNN v3 — 8 classes")
-    print(f"  {source}")
-    print("="*60)
-
-    X, y, labels = carregar_dataset(source, sz)
-    n = len(labels)
-
-    X_tr, X_v, y_tr, y_v = train_test_split(
-        X, y, test_size=0.18, stratify=y, random_state=SEED)
-    print(f"\n[SPLIT] Treino: {len(X_tr)}  |  Validação: {len(X_v)}")
-
-    pesos_vals = compute_class_weight("balanced", classes=np.arange(n), y=y_tr)
-    pesos = dict(enumerate(pesos_vals))
-    print(f"[PESOS] { {labels[k]: f'{v:.2f}' for k,v in pesos.items()} }")
-
-    ds_tr = (tf.data.Dataset.from_tensor_slices((X_tr, y_tr))
-             .shuffle(len(X_tr), seed=SEED).batch(BATCH_SIZE)
-             .prefetch(tf.data.AUTOTUNE))
-    ds_v  = (tf.data.Dataset.from_tensor_slices((X_v, y_v))
-             .batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE))
-
-    modelo = construir_modelo(n, sz)
-    modelo.summary()
-
-    ckpt = keras.callbacks.ModelCheckpoint(
-        KERAS_PATH, monitor="val_accuracy", save_best_only=True, verbose=0)
-
-    # Fase 1 — head only
-    print(f"\n[FASE 1] {EPOCHS_1} épocas — base congelada")
-    modelo.compile(optimizer=keras.optimizers.Adam(LR_1),
-                   loss="sparse_categorical_crossentropy",
-                   metrics=["accuracy"])
-    h1 = modelo.fit(ds_tr, validation_data=ds_v, epochs=EPOCHS_1,
-                    class_weight=pesos, callbacks=[ckpt], verbose=1)
-    print(f"[FASE 1] val_accuracy: {max(h1.history['val_accuracy'])*100:.1f}%")
-
-    # Fase 2 — fine-tune
-    print(f"\n[FASE 2] {EPOCHS_2} épocas — fine-tune últimas 30 camadas")
-    base = modelo.get_layer("mobilenetv2_1.00_96")
-    base.trainable = True
-    for layer in base.layers[:-30]: layer.trainable = False
-    modelo.compile(optimizer=keras.optimizers.Adam(LR_2),
-                   loss="sparse_categorical_crossentropy",
-                   metrics=["accuracy"])
-    cbs2 = [
-        keras.callbacks.EarlyStopping(monitor="val_accuracy", patience=15,
-                                       restore_best_weights=True, verbose=1),
-        ckpt,
-        keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5,
-                                           patience=5, min_lr=1e-7, verbose=1),
-    ]
-    h2 = modelo.fit(ds_tr, validation_data=ds_v, epochs=EPOCHS_2,
-                    class_weight=pesos, callbacks=cbs2, verbose=1)
-    best = max(h2.history["val_accuracy"])
-    print(f"\n[RESULTADO] val_accuracy: {max(max(h1.history['val_accuracy']),best)*100:.1f}%")
-
-    _grafico({
-        "accuracy":     h1.history["accuracy"]     + h2.history["accuracy"],
-        "val_accuracy": h1.history["val_accuracy"] + h2.history["val_accuracy"],
-        "loss":         h1.history["loss"]          + h2.history["loss"],
-        "val_loss":     h1.history["val_loss"]      + h2.history["val_loss"],
-    }, labels, EPOCHS_1)
-
-    plotar_confusao(modelo, X_v, y_v, labels)
-    calcular_thresholds(modelo, X_v, y_v, labels)
-    _exportar(modelo, labels)
-
+def exportar(model):
+    kp=os.path.join(OUTPUT_DIR,"sign_classifier.keras")
+    model.save(kp); print(f"  [OK] Keras  : {kp}")
+    conv=tf.lite.TFLiteConverter.from_keras_model(model)
+    conv.optimizations=[tf.lite.Optimize.DEFAULT]
+    tflite=conv.convert()
+    tp=os.path.join(OUTPUT_DIR,"sign_classifier.tflite")
+    with open(tp,"wb") as f: f.write(tflite)
+    print(f"  [OK] TFLite : {tp}  ({os.path.getsize(tp)//1024} KB)")
 
 # ================================================================
-#  EXPORT
+#  MAIN
 # ================================================================
 
-def _exportar(modelo, labels):
-    print("\n[EXPORT] Convertendo para TFLite...")
-    conv = tf.lite.TFLiteConverter.from_keras_model(modelo)
-    conv.optimizations = [tf.lite.Optimize.DEFAULT]
-    conv.target_spec.supported_types = [tf.float16]
-    tfl = conv.convert()
-    with open(MODEL_PATH, "wb") as f: f.write(tfl)
-    with open(LABELS_PATH, "w")  as f: f.write("\n".join(labels))
-    print(f"[OK] {MODEL_PATH}  ({len(tfl)//1024} KB)")
-    print(f"[OK] {LABELS_PATH} → {labels}")
-    print("\n[MAPA FINAL]")
-    for lbl in labels:
-        pipe = "RGB" if lbl in OBSTACLE_CLASSES else "símbolo"
-        print(f"  '{lbl}'  [{pipe}]  →  {LABEL_TO_ACTION.get(lbl,'—')}")
-    print(f"\n  Copie para a pasta do SIGN_DETECTOR.py:")
-    print(f"  sign_model.tflite  sign_labels.txt  sign_thresholds.txt")
+if __name__=="__main__":
+    ap=argparse.ArgumentParser()
+    ap.add_argument("--dataset",  default="./dataset_v3")
+    ap.add_argument("--val-split",type=float,default=VAL_SPLIT)
+    ap.add_argument("--aug",      type=int,  default=3)
+    args=ap.parse_args()
 
+    t0=time.time()
+    os.makedirs(OUTPUT_DIR,exist_ok=True)
 
-# ================================================================
-#  GRÁFICO
-# ================================================================
+    print("="*62)
+    print("  TREINO CNN — MobileNetV3Small 96x96")
+    print(f"  Classes ({NUM_CLASSES}): {', '.join(CLASSES)}")
+    print(f"  Dataset : {os.path.abspath(args.dataset)}")
+    print(f"  Output  : {os.path.abspath(OUTPUT_DIR)}")
+    print("="*62)
 
-def _grafico(hist, labels, split_ep=0):
-    try:
-        import matplotlib; matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        fig, axes = plt.subplots(1, 2, figsize=(13, 4))
-        fig.suptitle(f"Sign+Obstacle CNN v3 — {labels}",
-                     fontsize=9, fontweight="bold")
-        best_ep = int(np.argmax(hist["val_accuracy"]))
-        best_ac = hist["val_accuracy"][best_ep]
-        for i, (m, t) in enumerate([("accuracy","Acurácia"),("loss","Loss")]):
-            ax  = axes[i]; eps = range(1, len(hist[m])+1)
-            ax.plot(eps, hist[m],          label="treino",
-                    color="#2E75B6", lw=2)
-            ax.plot(eps, hist[f"val_{m}"], label="validação",
-                    color="#E74C3C", lw=2, ls="--")
-            if split_ep:
-                ax.axvline(split_ep, color="gray", alpha=0.5, ls=":", lw=1.5)
-                ax.text(split_ep+.3, ax.get_ylim()[0],
-                        "fine-tune→", fontsize=7, color="gray")
-            ax.set_title(t); ax.set_xlabel("Época")
-            ax.legend(); ax.grid(alpha=0.3)
-            if m == "accuracy":
-                ax.set_ylim(0, 1)
-                ax.axvline(best_ep+1, color="green", alpha=0.4, ls=":")
-                ax.annotate(f"best {best_ac:.3f}",
-                            xy=(best_ep+1, best_ac),
-                            xytext=(best_ep+2, best_ac-.08),
-                            fontsize=8, color="green")
-        plt.tight_layout()
-        plt.savefig(REPORT_PATH, dpi=120, bbox_inches="tight")
-        plt.close()
-        print(f"[GRÁFICO] {REPORT_PATH}")
-    except Exception as e:
-        print(f"[GRÁFICO] {e}")
-
-
-# ================================================================
-#  MODO --test  (localiza placa na cena antes de classificar)
-# ================================================================
-
-def testar(caminho):
-    for arq in [MODEL_PATH, LABELS_PATH]:
-        if not os.path.isfile(arq):
-            print(f"[ERRO] {arq} — treine primeiro."); sys.exit(1)
-
-    with open(LABELS_PATH) as f:
-        labels = [l.strip() for l in f if l.strip()]
-
-    thresholds = {}
-    if os.path.isfile(THRESH_PATH):
-        with open(THRESH_PATH) as f:
-            for line in f:
-                p = line.strip().split(",")
-                if len(p)==2: thresholds[p[0]] = float(p[1])
+    gpus=tf.config.list_physical_devices("GPU")
+    if gpus:
+        try: tf.config.experimental.set_memory_growth(gpus[0],True)
+        except Exception: pass
+        print(f"[GPU] {gpus[0].name}")
     else:
-        thresholds = {l: 0.60 for l in labels}
+        print("[CPU] Sem GPU — funcional mas mais lento")
 
-    try:
-        import tflite_runtime.interpreter as tr
-        interp = tr.Interpreter(model_path=MODEL_PATH)
-    except ImportError:
-        interp = tf.lite.Interpreter(model_path=MODEL_PATH)
+    # Diagnostico
+    info=diagnosticar(args.dataset)
+    imprimir_diagnostico(args.dataset,info)
 
-    interp.allocate_tensors()
-    ind  = interp.get_input_details()[0]
-    outd = interp.get_output_details()[0]
-    sz   = int(ind["shape"][1])
+    if info["estrutura"]=="vazio":
+        print(f"\n[ERRO] Diretorio nao encontrado: {args.dataset}")
+        print("       Use --dataset ./caminho/do/seu/dataset")
+        sys.exit(1)
 
-    img = cv2.imread(caminho)
-    if img is None: print(f"[ERRO] {caminho}"); sys.exit(1)
+    if info["estrutura"]=="desconhecido":
+        print("\n[ERRO] Estrutura nao reconhecida.")
+        print(f"       Pastas encontradas: {info['pastas']}")
+        if "pastas_em_train" in info:
+            print(f"       Pastas dentro de train/: {info['pastas_em_train']}")
+            print("\n       As pastas em train/ nao batem com os nomes das classes.")
+            print("       Renomeie as pastas para os nomes exatos:")
+            print(f"         {', '.join(CLASSES)}")
+        else:
+            print("       Esperado (flat):  dataset/Stop/  dataset/Esquerda/ ...")
+            print("       Esperado (split): dataset/train/Stop/  dataset/val/Stop/ ...")
+        sys.exit(1)
 
-    h, w = img.shape[:2]
-    print(f"\n{'='*58}")
-    print(f"  {os.path.basename(caminho)}  ({w}×{h}px)")
+    if not info["contagem"]:
+        print("\n[ERRO] Nenhuma classe com imagens encontrada.")
+        sys.exit(1)
 
-    # Tenta localizar placa via HSV na imagem
-    crops = _localizar_placas(img)
-    if crops:
-        print(f"  [{len(crops)} região(ões) detectada(s) via HSV]")
+    if info["faltando"]:
+        print(f"\n[AVISO] Classes ausentes: {info['faltando']}")
+        print("        Treinando com o que esta disponivel.")
+
+    # Usa raiz_efetiva (pode ser dataset_v3/train/ se so train/ existia)
+    dataset_efetivo = info.get("raiz_efetiva", args.dataset)
+
+    # Carregamento
+    print("\n" + "="*62 + "\n  CARREGANDO\n" + "="*62)
+    if info["estrutura"]=="split":
+        X_tr,y_tr,X_va,y_va=carregar_split(dataset_efetivo,args.aug)
     else:
-        # Fallback: usa imagem inteira
-        crops = [(img, "cena inteira")]
-        print(f"  [Nenhuma região detectada — classificando cena inteira]")
+        X_tr,y_tr,X_va,y_va=carregar_flat(dataset_efetivo,args.val_split,args.aug)
 
-    print(f"{'='*58}")
+    print(f"\n  Treino: {len(X_tr)}  Val: {len(X_va)}")
 
-    for crop_img, desc in crops[:3]:
-        print(f"\n  Região: {desc}")
-        print(f"  {'-'*50}")
+    # Pipeline
+    print("\n"+"="*62+"\n  TREINANDO\n"+"="*62)
+    model=treinar(X_tr,y_tr,X_va,y_va)
 
-        # Testa com ambos os pipelines
-        for pipe_name, tensor_img in [
-            ("Símbolo", prep_sign(crop_img, sz)),
-            ("RGB",     prep_obstacle(crop_img, sz)),
-        ]:
-            interp.set_tensor(ind["index"], np.expand_dims(tensor_img, 0))
-            interp.invoke()
-            p    = interp.get_tensor(outd["index"])[0]
-            top3 = np.argsort(p)[::-1][:3]
-            print(f"  [{pipe_name}]")
-            for i, idx in enumerate(top3):
-                lbl  = labels[idx]; conf = p[idx]
-                t    = thresholds.get(lbl, 0.60)
-                acao = LABEL_TO_ACTION.get(lbl, "—")
-                mk   = "◄" if i==0 else " "
-                dim  = "" if conf>=t else f"  (abaixo do threshold {t:.0%})"
-                print(f"    {mk} '{lbl}'  {conf*100:5.1f}%  → {acao}{dim}")
+    print("\n"+"="*62+"\n  AVALIACAO\n"+"="*62)
+    avaliar(model,X_va,y_va)
 
-    # Painel visual: original + símbolo + RGB
-    orig_96 = cv2.resize(img, (sz*2, sz*2))
-    if crops and crops[0][1] != "cena inteira":
-        crop_img = crops[0][0]
-    else:
-        crop_img = img
-    sym_v = cv2.cvtColor(prep_sign(crop_img,sz).astype(np.uint8), cv2.COLOR_RGB2BGR)
-    rgb_v = cv2.cvtColor(prep_obstacle(crop_img,sz).astype(np.uint8), cv2.COLOR_RGB2BGR)
-    sym_v = cv2.resize(sym_v, (sz*2, sz*2))
-    rgb_v = cv2.resize(rgb_v, (sz*2, sz*2))
-    panel = np.hstack([orig_96, sym_v, rgb_v])
-    for x, txt in [(2,"ORIGINAL"),(sz*2+2,"SÍMBOLO"),(sz*4+2,"RGB")]:
-        cv2.putText(panel, txt, (x,14),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,220,80), 1)
-    cv2.imshow(f"TEST — {os.path.basename(caminho)}", panel)
-    cv2.waitKey(0); cv2.destroyAllWindows()
+    print("\n"+"="*62+"\n  OOD\n"+"="*62)
+    calibrar_ood(model,X_va,y_va)
 
+    print("\n"+"="*62+"\n  EXPORTANDO\n"+"="*62)
+    exportar(model)
 
-def _localizar_placas(img):
-    """
-    Localiza regiões com cores de placa via HSV.
-    Retorna lista de (crop_bgr, descricao).
-    """
-    h, w = img.shape[:2]
-    # ROI: ignora rodapé e céu extremo
-    y0, y1 = int(h*.05), int(h*.85)
-    roi = img[y0:y1]
-
-    hsv = cv2.GaussianBlur(cv2.cvtColor(roi, cv2.COLOR_BGR2HSV), (5,5), 0)
-    ranges = [
-        (np.array([0,  70,50]), np.array([14, 255,255])),  # vermelho
-        (np.array([162,70,50]), np.array([180,255,255])),  # vermelho wrap
-        (np.array([90, 60,40]), np.array([130,255,255])),  # azul
-        (np.array([15,100,70]), np.array([36, 255,255])),  # amarelo
-        (np.array([5, 100,80]), np.array([20, 255,255])),  # laranja (cone)
-    ]
-    mask = np.zeros(hsv.shape[:2], np.uint8)
-    for lo, hi in ranges:
-        mask = cv2.bitwise_or(mask, cv2.inRange(hsv, lo, hi))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7,7),np.uint8))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  np.ones((5,5),np.uint8))
-
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    crops = []
-    for cnt in sorted(cnts, key=cv2.contourArea, reverse=True)[:3]:
-        area = cv2.contourArea(cnt)
-        if area < 500: continue
-        peri  = cv2.arcLength(cnt, True)
-        circ  = 4*np.pi*area/max(peri**2,1)
-        hull  = cv2.convexHull(cnt)
-        solid = area/max(cv2.contourArea(hull),1)
-        if circ < 0.35 or solid < 0.65: continue
-        x, y, bw, bh = cv2.boundingRect(cnt)
-        prop = bw/max(bh,1)
-        if not (0.25 <= prop <= 3.5): continue
-        pad  = int(max(bw,bh)*.08)
-        x1   = max(0, x-pad); y1_ = max(0, y+y0-pad)
-        x2   = min(w, x+bw+pad); y2 = min(h, y+y0+bh+pad)
-        crop = img[y1_:y2, x1:x2]
-        if crop.size == 0: continue
-        desc = f"bbox=({x1},{y1_},{x2},{y2})  area={area:.0f}  circ={circ:.2f}"
-        crops.append((crop, desc))
-    return crops
-
-
-# ================================================================
-#  ENTRY POINT
-# ================================================================
-
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
-    ap.add_argument("--dataset", default=None,
-                    help="Pasta do dataset (ex: ./dataset_v3)")
-    ap.add_argument("--img",  type=int, default=IMG_SIZE)
-    ap.add_argument("--test", type=str, default=None, metavar="FOTO.JPG")
-    a = ap.parse_args()
-
-    if a.test:
-        testar(a.test)
-    elif a.dataset:
-        treinar(a.dataset, a.img)
-    elif os.path.isdir(DATASET_DIR):
-        print(f"[AUTO] {DATASET_DIR}")
-        treinar(DATASET_DIR, a.img)
-    else:
-        ap.print_help()
-        print(f"\n[ERRO] Use: python TRAIN_SIGN_CNN.py --dataset ./dataset_v3")
+    print(f"\n  [DONE] {(time.time()-t0)/60:.1f} min")
+    print(f"  CNN_MODEL = '{OUTPUT_DIR}/sign_classifier.tflite'")
+    print(f"  OOD_FILE  = '{OUTPUT_DIR}/ood_thresholds.json'")
