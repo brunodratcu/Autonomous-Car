@@ -23,13 +23,21 @@ USO:
 """
 
 import shutil
+import argparse
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
 MODELS = BASE / "models"
 
+ap = argparse.ArgumentParser()
+ap.add_argument("--imgsz", type=int, default=640,
+                help="Tamanho de entrada do modelo. 640=padrão (mais preciso), "
+                     "416=mais rápido na CPU (~2.4x), 320=máxima velocidade")
+args = ap.parse_args()
+
 print("=" * 60)
 print("  EXPORT_COCO — YOLOv8n pré-treinado (sem treino)")
+print(f"  imgsz={args.imgsz}")
 print("=" * 60)
 
 from ultralytics import YOLO
@@ -37,8 +45,8 @@ from ultralytics import YOLO
 print("\n[1/3] Carregando yolov8n.pt (baixa automático se preciso)...")
 model = YOLO("yolov8n.pt")
 
-print("[2/3] Exportando para ONNX...")
-model.export(format="onnx", imgsz=640, opset=12, simplify=True, dynamic=False)
+print(f"[2/3] Exportando para ONNX (imgsz={args.imgsz})...")
+model.export(format="onnx", imgsz=args.imgsz, opset=12, simplify=True, dynamic=False)
 
 onnx = Path("yolov8n.onnx")
 if not onnx.exists():

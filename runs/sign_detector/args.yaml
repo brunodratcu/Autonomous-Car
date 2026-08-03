@@ -2,7 +2,7 @@ task: detect
 mode: train
 model: yolov8n.pt
 data: C:\Users\btdra\Desktop\Autonomous-Car\yolo_dataset\dataset.yaml
-epochs: 20
+epochs: 100
 time: null
 patience: 20
 batch: 8

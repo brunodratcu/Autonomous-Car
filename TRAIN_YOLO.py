@@ -82,9 +82,15 @@ def garantir_dataset(real_only: bool) -> Path:
     yaml = YOLO_DST / "dataset.yaml"
 
     if real_only:
-        # Recria do zero só com frames reais
+        # REAL-ONLY: dataset limpo, SÓ frames anotados serão adicionados.
+        # NÃO gera o dataset automático (bboxes 85% são o problema!)
         if YOLO_DST.exists():
             shutil.rmtree(YOLO_DST)
+        for split in ("train", "val"):
+            (YOLO_DST / "images" / split).mkdir(parents=True, exist_ok=True)
+            (YOLO_DST / "labels" / split).mkdir(parents=True, exist_ok=True)
+        print("  [REAL-ONLY] Dataset limpo — apenas frames anotados serão usados")
+        return yaml
 
     if not yaml.exists():
         prep = BASE_DIR / "PREPARE_YOLO_DATASET.py"
@@ -171,6 +177,11 @@ def copiar(onnx: Path):
     shutil.copy2(onnx, FINAL_ONNX)
     mb = FINAL_ONNX.stat().st_size / 1e6
     print(f"  [OK] {FINAL_ONNX}  ({mb:.1f} MB)")
+    # classes.txt — o carro-autonomo.py carrega automaticamente,
+    # tornando o sistema dataset-agnóstico (qualquer conjunto de classes)
+    (MODELS_DIR / "classes.txt").write_text("\n".join(CLASSES) + "\n",
+                                             encoding="utf-8")
+    print(f"  [OK] {MODELS_DIR / 'classes.txt'}")
 
 
 def metricas(best_pt: Path):

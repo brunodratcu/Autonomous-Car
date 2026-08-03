@@ -22,7 +22,7 @@
     python carro-autonomo.py --cam     ← webcam
     python carro-autonomo.py --cal     ← calibrar preprocessing
     python carro-autonomo.py --debug   ← visualização intermediária
-================================================================
+    python carro-autonomo.py --cam --auto --fast
 """
 
 import cv2
@@ -405,12 +405,23 @@ class YOLODetector:
         self.in_n  = self.sess.get_inputs()[0].name
         self.out_n = self.sess.get_outputs()[0].name
 
+        # Lê o tamanho de entrada REAL exigido pelo modelo (fixo no export).
+        # Nunca usar YOLO_SIZE cego aqui — se o ONNX foi exportado com
+        # dynamic=False, qualquer tamanho diferente quebra o InferenceSession.
+        in_shape = self.sess.get_inputs()[0].shape   # [1,3,H,W]
+        h_model, w_model = in_shape[2], in_shape[3]
+        if isinstance(h_model, int) and isinstance(w_model, int):
+            self.input_size = h_model   # assume quadrado (padrão YOLO)
+        else:
+            self.input_size = YOLO_SIZE  # modelo dinâmico → usa o configurado
+
         # Detecta automaticamente: COCO (80 classes) ou customizado (8)
         out_shape = self.sess.get_outputs()[0].shape   # [1, 4+NC, 8400]
         n_cls = out_shape[1] - 4 if isinstance(out_shape[1], int) else NUM_CLASSES
         self.coco_mode = (n_cls == 80)
         modo = "COCO (pré-treinado)" if self.coco_mode else f"CUSTOM ({n_cls} classes)"
-        print(f"[YOLO] {path} | {self.sess.get_providers()[0]} | {modo}", flush=True)
+        print(f"[YOLO] {path} | {self.sess.get_providers()[0]} | {modo} | "
+              f"input={self.input_size}px", flush=True)
 
     @staticmethod
     def _letterbox(img, size=640):
@@ -438,7 +449,7 @@ class YOLODetector:
 
     def detectar(self, frame_enhanced: np.ndarray) -> list:
         h0,w0 = frame_enhanced.shape[:2]
-        canvas,sc,px,py = self._letterbox(frame_enhanced, YOLO_SIZE)
+        canvas,sc,px,py = self._letterbox(frame_enhanced, self.input_size)
         inp = canvas[:,:,::-1].astype(np.float32)/255.0
         inp = inp.transpose(2,0,1)[np.newaxis]
         raw = self.sess.run([self.out_n],{self.in_n:inp})[0]
@@ -691,16 +702,31 @@ def tick(ser) -> bool:
     if not lbl: return False
     if lbl == "OBSTACLE": return True
     if time.monotonic()-_nav["acao_t"] >= _nav["acao_dur"]:
-        CMD.update(mot=0,srv=127,buz=0,led=0,brk=0,dir=0)
-        enviar(CMD,ser); _nav["acao_label"]=None
-        print(f"[NAV] ✓ {lbl}", flush=True); return False
+        _nav["acao_label"]=None
+        print(f"[NAV] ✓ {lbl}", flush=True)
+        # JORNADA ININTERRUPTA: ação terminou → retoma cruzeiro
+        if MISSAO.estado == "RODANDO":
+            CMD.update(mot=62,srv=127,buz=0,led=0,brk=0,dir=3)
+            enviar(CMD,ser)
+            print("[NAV] → cruzeiro retomado", flush=True)
+        else:
+            CMD.update(mot=0,srv=127,buz=0,led=0,brk=0,dir=0)
+            enviar(CMD,ser)
+        return False
     return True
 
 
 def liberar_obstaculo(ser):
-    CMD.update(mot=0,srv=127,buz=0,led=0,brk=0,dir=0)
-    enviar(CMD,ser); _nav["acao_label"]=None
+    _nav["acao_label"]=None
     print("[NAV] Obstáculo removido", flush=True)
+    # Retoma cruzeiro se a missão está em curso
+    if MISSAO.estado in ("RODANDO","PARADO_SEM"):
+        CMD.update(mot=62,srv=127,buz=0,led=0,brk=0,dir=3)
+        enviar(CMD,ser)
+        print("[NAV] → cruzeiro retomado", flush=True)
+    else:
+        CMD.update(mot=0,srv=127,buz=0,led=0,brk=0,dir=0)
+        enviar(CMD,ser)
 
 # ================================================================
 #  [11] VISUALIZAÇÃO
@@ -859,8 +885,27 @@ def calibrar(usar_camera):
 #  [13] LOOP PRINCIPAL
 # ================================================================
 
-def main(usar_camera=False, debug=False):
+def main(usar_camera=False, debug=False, auto=False, fast=False):
     global _ser, _CLAHE
+
+    # ── Modo FAST: inferência menor + sem pular frames ────────────
+    # YOLO 416px é ~2.4x mais rápido que 640px com perda mínima de
+    # acurácia em objetos médios/grandes. Essencial para alta velocidade.
+    if fast:
+        # NOTA: o tamanho de entrada do YOLO é fixo no arquivo .onnx
+        # (definido no export, não pode mudar em runtime). O ganho de
+        # velocidade real do --fast vem de processar mais frames e
+        # confirmar votos mais rápido — não de reduzir o imgsz aqui.
+        print("[FAST] Processando todo frame (sem pular) + voting rápido",
+              flush=True)
+        # Voting mais responsivo: confirma com 4 de 6 frames.
+        # A alta velocidade, o objeto fica poucos frames na tela —
+        # buffer de 10 nunca fecharia antes do carro passar.
+        global VOTE_BUFFER, VOTE_MIN_DETS, VOTE_FRAC
+        VOTE_BUFFER   = 6
+        VOTE_MIN_DETS = 3
+        VOTE_FRAC     = 0.60
+        print("[FAST] Voting 6 frames, confirma com 4/6", flush=True)
 
     # Carrega config de calibração
     cfg_p = os.path.join(os.path.dirname(os.path.abspath(__file__)),"pre_config.json")
@@ -904,7 +949,14 @@ def main(usar_camera=False, debug=False):
 
     _ser = conectar_serial()
     fps_t=time.monotonic(); fps_n=0; fps=0.0; fn=0
-    SKIP = 2   # inferência a cada 2 frames (YOLO é pesado na CPU)
+    SKIP = 1 if fast else 2   # fast: processa todo frame
+
+    # ── AUTO-START: começa em RODANDO sem esperar sinal ───────────
+    if auto:
+        print("[MISSAO] Auto-start ativo — carro em cruzeiro", flush=True)
+        MISSAO.set_estado("RODANDO")
+        executar("STRAIGHT", _ser)
+        MISSAO.registrar_comando("STRAIGHT")
 
     frame_e = None; debug_thr = None
 
@@ -1060,4 +1112,7 @@ def main(usar_camera=False, debug=False):
 if __name__=="__main__":
     args = sys.argv[1:]
     if "--cal" in args: calibrar("--cam" in args)
-    else: main(usar_camera="--cam" in args, debug="--debug" in args)
+    else: main(usar_camera="--cam" in args,
+               debug="--debug" in args,
+               auto="--auto" in args,
+               fast="--fast" in args)

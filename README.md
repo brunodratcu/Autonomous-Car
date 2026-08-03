@@ -1,5 +1,5 @@
 # 171 Garage — Carro Autônomo
-### Challenge 2026 · Mercedes-Benz · FIAP — RM 93657
+### Challenge 2026 · Mercedes-Benz · FIAP 
 
 Sistema de visão computacional para veículo autônomo em miniatura. Detecta placas de trânsito, semáforos, pessoas e veículos via webcam, decide comandos de navegação e os transmite por serial em JSON para um Arduino Portenta H7, que aciona motor, servo de direção, freio, buzzer e LED.
 
