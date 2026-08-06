@@ -1,6 +1,37 @@
 """
 ================================================================
-  CARRO AUTÔNOMO v4.0 — PIPELINE OTIMIZADO
+  CARRO AUTÔNOMO v5.1 — PIPELINE MONO GEOMÉTRICO DE ALTO FPS
+  ─────────────────────────────────────────────────────────────
+  Webcam (backend nativo + MJPG)
+    ↓ Grayscale
+    ↓ CLAHE
+    ↓ Gaussian Blur
+    ↓ Adaptive Threshold (2 polaridades)
+    ↓ Morphological Open/Close
+    ↓ [--canny opcional — ver nota em segmentar()]
+    ↓ Contornos → ApproxPolyDP
+    ↓ Filtro geométrico: triângulo(3) · retângulo(4) · círculo/octógono(8+)
+    ↓ ROI DINÂMICO (histórico da última posição — olha onde
+    │  as placas costumam aparecer; varredura completa periódica)
+    ↓ Recorte das regiões candidatas
+    ↓ [--yolo auxiliar 320×320 a cada N frames, só no ROI]
+    ↓ PGOM — Persistent Geometric Object Manager: cada candidato
+    │  mantém uma FICHA de evidências (forma 20%% · convexidade
+    │  10%% · aspect 10%% · símbolo interno 15%% · persistência
+    │  5-8 frames 20%% · estabilidade centro/área 15%% ·
+    │  fingerprint geométrico 10%%); promoção à CNN só com ≥85%%
+    ↓ CNN 64×64 INT8 — CONFIRMADORA de alta precisão para poucos
+    │  candidatos de excelente qualidade
+    ↓ Score de decisão: 0.85 evidências + 0.15 CNN
+    ↓ Votação temporal + missão
+    ↓ Controle do veículo (Serial JSON)
+
+  Sem dependência de cor: semáforo lido pela POSIÇÃO do farol
+  aceso (cima=vermelho, baixo=verde).
+
+  Câmera: CAP_DSHOW no Windows, CAP_V4L2 no Linux (pista),
+  FOURCC MJPG + buffer 1 → captura na taxa máxima do sensor.
+  (v4.0 abaixo — histórico)
   ─────────────────────────────────────────────────────────────
   Frame BGR
     ↓ Resize 640px
@@ -48,12 +79,31 @@ OOD_FILE    = "./models/ood_thresholds.json"
 
 CNN_SIZE    = 96
 OOD_DEFAULT = 0.55
-YOLO_CONF   = 0.35
+YOLO_CONF   = 0.25    # piso global (filtro fino é por classe, abaixo)
+
+# Confiança mínima POR CLASSE (modo COCO) — implementa a prioridade:
+#   placas = muito relevante  → threshold baixo (não perder)
+#   semáforo = relevante      → threshold médio
+#   pessoa/carro = menos rel. → threshold alto (evitar falso positivo)
+COCO_CONF_MIN = {
+    "Stop":     0.28,
+    "Semaforo": 0.40,
+    "Carro":    0.55,
+    "Pessoa":   0.62,
+}
+# Área mínima por classe (px²) — pessoa "fantasma" costuma ser pequena
+COCO_AREA_MIN = {
+    "Pessoa": 2000,
+    "Carro":  1500,
+}
 YOLO_NMS    = 0.45
-YOLO_SIZE   = 640
+YOLO_SIZE   = 640     # fallback p/ ONNX dinâmico (export ideal: 320)
+YOLO_EVERY  = 5       # YOLO auxiliar roda 1x a cada N frames
 
 CLASSES = ["Stop","Esquerda","Direita","SemRetorno",
-           "Verde","Cone","Carro","Pessoa"]
+           "Verde","Cone","Carro","Pessoa","Fundo"]
+# CNN_CLASSES é sobrescrito em runtime por models/classes.txt
+CNN_CLASSES = CLASSES
 NUM_CLASSES      = len(CLASSES)
 OBSTACLE_CLASSES = {"Cone","Carro","Pessoa"}
 
@@ -141,6 +191,37 @@ COR_CLASSE = {
 #  Analisamos a fração de pixels verde/vermelho no crop.
 # ================================================================
 
+def estado_semaforo_mono(crop_gray: np.ndarray) -> str | None:
+    """
+    Estado do semáforo SEM COR: posição vertical do farol aceso.
+    Layout físico padrão: vermelho em CIMA, amarelo no MEIO,
+    verde em BAIXO. O farol aceso satura (quase branco) na
+    imagem mono → basta achar o terço mais claro do crop.
+    """
+    if crop_gray is None or crop_gray.size == 0: return None
+    if crop_gray.ndim == 3:
+        crop_gray = cv2.cvtColor(crop_gray, cv2.COLOR_BGR2GRAY)
+    g = cv2.resize(crop_gray, (30, 90))
+    tercos = [float(g[0:30].mean()),   # topo   → vermelho
+              float(g[30:60].mean()),  # meio   → amarelo
+              float(g[60:90].mean())]  # base   → verde
+    i = int(np.argmax(tercos))
+    contraste = max(tercos) - sorted(tercos)[1]
+    if contraste < 8: return None      # nenhum farol dominante
+    return ["vermelho", "amarelo", "verde"][i]
+
+
+def analisar_semaforo(crop) -> str | None:
+    """Roteia conforme a situação da fonte:
+    crop com cor → máscaras HSV | mono/cinza → posição do farol.
+    Como o pipeline v5 trabalha em cinza, o método por posição é
+    o padrão; o de cor fica disponível para fontes coloridas."""
+    if crop is None or crop.size == 0: return None
+    if crop.ndim == 2 or _sat_chk["mono"]:
+        return estado_semaforo_mono(crop)
+    return cor_semaforo(crop)
+
+
 def cor_semaforo(crop_bgr: np.ndarray) -> str | None:
     """Retorna 'verde', 'vermelho', 'amarelo' ou None."""
     if crop_bgr is None or crop_bgr.size == 0: return None
@@ -221,6 +302,37 @@ CMD  = dict(mot=0, srv=127, buz=0, led=0, brk=0, dir=0, spd=0)
 _nav = dict(cooldown=0, ultimo=None, acao_label=None,
             acao_t=0.0, acao_dur=0.0)
 _ser = None
+
+# ================================================================
+#  [3d] CÂMERA — backend nativo por plataforma + MJPG
+#
+#  cv2.VideoCapture(0) sem backend cai no autodetect (lento e,
+#  no Windows, às vezes MSMF com latência alta). Forçamos:
+#    Windows → CAP_DSHOW   |   Linux (pista) → CAP_V4L2
+#  FOURCC MJPG: a webcam envia JPEG comprimido em vez de YUY2
+#  bruto → USB deixa de ser gargalo → 30/60 fps reais em 640p.
+#  BUFFERSIZE 1: sempre o frame mais recente (menor latência).
+# ================================================================
+
+def abrir_camera(idx: int) -> cv2.VideoCapture:
+    backend = cv2.CAP_DSHOW if sys.platform.startswith("win") \
+              else cv2.CAP_V4L2
+    nome = "DSHOW" if backend == cv2.CAP_DSHOW else "V4L2"
+    cap = cv2.VideoCapture(idx, backend)
+    if not cap.isOpened():                      # fallback autodetect
+        cap = cv2.VideoCapture(idx); nome = "AUTO"
+    cap.set(cv2.CAP_PROP_FOURCC,
+            cv2.VideoWriter_fourcc(*"MJPG"))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_FPS,          30)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+    fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
+    fstr = "".join(chr((fourcc >> 8*i) & 0xFF) for i in range(4))
+    print(f"[CAM] backend={nome} fourcc={fstr} "
+          f"{cap.get(3):.0f}x{cap.get(4):.0f}@{cap.get(5):.0f}fps",
+          flush=True)
+    return cap
 
 # ================================================================
 #  [4] SERIAL
@@ -315,78 +427,501 @@ def ler_serial(ser) -> list[dict]:
 #  Threshold/morphology ficam no fallback de contornos.
 # ================================================================
 
-def preprocessar(frame_bgr: np.ndarray) -> np.ndarray:
-    """Retorna frame melhorado (BGR) pronto para YOLO e CNN."""
+_sat_chk = dict(fn=0, avisado=False, mono=False)
 
-    # 1. Resize
+def checar_camera(frame_bgr: np.ndarray):
+    """
+    Detecta fonte de vídeo SEM COR (mono/binarizada).
+    Um frame com saturação ~0 quebra todo o pipeline:
+      · COCO não reconhece a placa PARE (sem vermelho, sem texto)
+      · cor_semaforo() nunca retorna verde/vermelho (máscaras HSV vazias)
+      · blobs binários geram "pessoas" fantasmas
+    Verifica 1x a cada 90 frames (barato).
+    """
+    _sat_chk["fn"] += 1
+    if _sat_chk["fn"] % 90 != 1: return
+    hsv = cv2.cvtColor(cv2.resize(frame_bgr,(160,90)), cv2.COLOR_BGR2HSV)
+    sat = float(hsv[:,:,1].mean())
+    _sat_chk["mono"] = sat < 5.0
+    if _sat_chk["mono"] and not _sat_chk["avisado"]:
+        _sat_chk["avisado"] = True
+        print("="*60, flush=True)
+        print("[CAMERA] ⚠ VÍDEO SEM COR (saturação ~0)!", flush=True)
+        print("[CAMERA] A fonte está em modo mono/binarizado.", flush=True)
+        print("[CAMERA] Verifique: modo da webcam, filtro de captura,", flush=True)
+        print("[CAMERA] exposição/contraste. PARE e semáforo NÃO serão", flush=True)
+        print("[CAMERA] detectados corretamente sem imagem colorida.", flush=True)
+        print("="*60, flush=True)
+
+
+def preprocessar(frame_bgr: np.ndarray) -> np.ndarray:
+    """
+    v5 MONO: retorna frame em ESCALA DE CINZA (2D) pronto para o
+    detector geométrico e para a CNN.
+    Removidos (custo alto, ganho nulo em imagem mono):
+      · conversão LAB  · bilateral filter  · sharpen
+    Mantido: resize + CLAHE (barato e essencial p/ contraste).
+    ~5x mais rápido que o preprocessing v4.
+    """
     h0, w0 = frame_bgr.shape[:2]
     if w0 != IMG_W:
         scale = IMG_W / w0
         frame_bgr = cv2.resize(frame_bgr, (IMG_W, int(h0*scale)),
                                interpolation=cv2.INTER_LINEAR)
-
-    # 2. CLAHE no canal L
-    lab = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2LAB)
-    lab[:,:,0] = _CLAHE.apply(lab[:,:,0])
-    enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-
-    # 3. Bilateral filter — denoising leve (CPU-friendly)
-    denoised = cv2.bilateralFilter(enhanced, d=5, sigmaColor=40, sigmaSpace=40)
-
-    # 4. Sharpen leve
-    sharpened = cv2.filter2D(denoised, -1, K_SHARP)
-
-    return sharpened
+    gray = frame_bgr if frame_bgr.ndim == 2 else \
+           cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    return _CLAHE.apply(gray)
 
 
 # ================================================================
-#  [6] FALLBACK: DETECÇÃO POR CONTORNOS
+#  [6] DETECTOR GEOMÉTRICO (principal no modo mono)
 #
-#  Usado SOMENTE quando YOLO não retorna nenhuma detecção.
-#  Aqui sim usamos adaptive threshold + morphological ops,
-#  porque o objetivo é extrair bordas para contornos —
-#  não precisamos preservar informação visual.
+#  "verificar bordas e formatos geométricos":
+#  binariza nas DUAS polaridades (objetos escuros E claros),
+#  extrai contornos e filtra por forma:
+#    · ~quadrado + 7-9 vértices + circularidade alta → octógono (PARE)
+#    · ~quadrado + circularidade > 0.82            → círculo (placa)
+#    · retângulo vertical alto                      → semáforo
+#  Custa ~3-5 ms/frame em CPU → FPS alto.
+#  A confirmação fina fica com a CNN (etapa seguinte).
 # ================================================================
 
-def detectar_contornos_fallback(frame_enhanced: np.ndarray) -> list:
+GEO_AREA_MIN   = 400
+GEO_AREA_FRAC  = 0.25      # área máx = 25% do frame
+GEO_MAX_CANDS  = 10        # YOLO/CNN olham no máx. 10 regiões
+ROI_FULL_EVERY = 15        # varredura completa a cada N frames
+ROI_EXPAND     = 1.8       # expansão da janela ao redor do histórico
+
+def segmentar(gray: np.ndarray, usar_canny: bool = False) -> tuple:
     """
-    Pipeline de fallback:
-      Grayscale → medianBlur → Adaptive Threshold → Close → Open → Contornos
-    Retorna lista de dicts no mesmo formato do YOLO.
+    Gaussian Blur → Adaptive Threshold (2 polaridades) →
+    Morphological Open/Close.
+
+    NOTA SOBRE O CANNY (--canny, desligado por padrão):
+    após o adaptive threshold a imagem já é BINÁRIA — o
+    findContours extrai exatamente as mesmas bordas que o Canny
+    extrairia, de graça. Rodar Canny aqui duplica custo e, como
+    já observado neste projeto, reintroduz falsos positivos nas
+    bordas do frame/interface. O flag existe para demonstração
+    e comparação em aula.
     """
-    h, w = frame_enhanced.shape[:2]
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    thr_esc = cv2.adaptiveThreshold(          # objetos ESCUROS
+        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, 31, 5)
+    thr_cla = cv2.adaptiveThreshold(          # objetos CLAROS
+        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, 31, 5)
+    # Adaptive esvazia regiões grandes e uniformes (só bordas
+    # locais sobrevivem) — ótimo p/ placas, ruim p/ estruturas
+    # grandes como a carcaça do semáforo. O Otsu GLOBAL cobre
+    # essas: sólidos escuros inteiros viram um contorno só.
+    _, otsu_esc = cv2.threshold(blur, 0, 255,
+                    cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    saidas = []
+    for t in (thr_esc, thr_cla, otsu_esc):
+        t = cv2.morphologyEx(t, cv2.MORPH_OPEN,  K3)
+        t = cv2.morphologyEx(t, cv2.MORPH_CLOSE, K5)
+        if usar_canny:
+            t = cv2.Canny(t, 50, 150)
+            t = cv2.dilate(t, K3)   # religa bordas p/ contorno fechado
+        saidas.append(t)
+    return saidas
 
-    gray = cv2.cvtColor(frame_enhanced, cv2.COLOR_BGR2GRAY)
-    blur = cv2.medianBlur(gray, 5)
-    thr  = cv2.adaptiveThreshold(blur, 255,
-                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                cv2.THRESH_BINARY_INV, blockSize=15, C=4)
-    thr  = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, K5)
-    thr  = cv2.morphologyEx(thr, cv2.MORPH_OPEN,  K3)
 
-    # Aplica ROI
-    y0 = int(h * ROI_Y0); y1 = int(h * ROI_Y1)
-    thr[:y0,:] = 0; thr[y1:,:] = 0
+class ROIDinamico:
+    """
+    ROI móvel com histórico: guarda as últimas posições de
+    detecções confirmadas e concentra a busca onde as placas
+    costumam aparecer. Varredura COMPLETA periódica (e sempre
+    que o histórico esvazia) para captar objetos novos.
+    """
+    def __init__(self):
+        self.hist: deque = deque(maxlen=12)   # últimos bboxes
+        self.fn = 0
 
-    cnts,_ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    dets   = []
-    for cnt in cnts:
-        area = cv2.contourArea(cnt)
-        if not (AREA_CNT_MIN < area < AREA_CNT_MAX): continue
-        x, y, bw, bh = cv2.boundingRect(cnt)
-        prop   = bw / max(bh, 1)
-        if not (0.30 < prop < 2.50): continue
-        solidez = area / max(bw*bh, 1)
-        if solidez < 0.18: continue
-        dets.append({
-            "bbox":       (x, y, x+bw, y+bh),
-            "class_name": "?",
-            "class_id":   -1,
-            "conf":       float(solidez),
-        })
-    dets.sort(key=lambda d:(d["bbox"][2]-d["bbox"][0])*(d["bbox"][3]-d["bbox"][1]),
-              reverse=True)
-    return dets[:6]
+    def registrar(self, bbox): self.hist.append(bbox)
+
+    def janela(self, h: int, w: int) -> tuple:
+        """Retorna (x0,y0,x1,y1) da região de busca deste frame."""
+        self.fn += 1
+        if not self.hist or self.fn % ROI_FULL_EVERY == 0:
+            return (0, int(h*ROI_Y0), w, int(h*ROI_Y1))   # completa
+        xs0 = min(b[0] for b in self.hist)
+        ys0 = min(b[1] for b in self.hist)
+        xs1 = max(b[2] for b in self.hist)
+        ys1 = max(b[3] for b in self.hist)
+        cx, cy = (xs0+xs1)/2, (ys0+ys1)/2
+        bw = max(xs1-xs0, 80) * ROI_EXPAND
+        bh = max(ys1-ys0, 80) * ROI_EXPAND
+        x0 = int(max(0, cx-bw)); x1 = int(min(w, cx+bw))
+        y0 = int(max(h*ROI_Y0, cy-bh)); y1 = int(min(h*ROI_Y1, cy+bh))
+        if x1-x0 < 64 or y1-y0 < 64:
+            return (0, int(h*ROI_Y0), w, int(h*ROI_Y1))
+        return (x0, y0, x1, y1)
+
+ROI_DIN = ROIDinamico()
+
+
+def analisar_farois(crop_gray: np.ndarray) -> tuple:
+    """
+    Validação ESTRUTURAL do semáforo:
+      Retângulo → existem círculos internos? → 2? 3? →
+      alinhados VERTICALMENTE? → candidato a semáforo.
+    Retorna (n_circulos_empilhados, alinhados: bool).
+    Postes/pernas de cadeira falham aqui: não têm 2-3 círculos
+    na mesma coluna vertical.
+    """
+    if crop_gray.size == 0: return 0, False
+    g = cv2.resize(crop_gray, (36, 100))
+    circulos = []          # (cx, cy) de cada blob circular
+    for thr_img in (cv2.threshold(g,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)[1],
+                    cv2.threshold(g,0,255,cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU)[1]):
+        cnts,_ = cv2.findContours(thr_img, cv2.RETR_LIST,
+                                  cv2.CHAIN_APPROX_SIMPLE)
+        for c in cnts:
+            a = cv2.contourArea(c)
+            if a < 40 or a > 1200: continue
+            x,y,w,h = cv2.boundingRect(c)
+            if not (0.6 < w/max(h,1) < 1.7): continue
+            circ = 4*np.pi*a/max(cv2.arcLength(c,True)**2,1)
+            if circ > 0.55:
+                circulos.append((x + w/2, y + h/2))
+    if len(circulos) < 2: return len(circulos), False
+    circulos.sort(key=lambda p: p[1])
+    # empilhados: separação vertical mínima entre faróis vizinhos
+    empilhados = [circulos[0]]
+    for p in circulos[1:]:
+        if p[1] - empilhados[-1][1] > 15:
+            empilhados.append(p)
+    n = len(empilhados)
+    if n < 2: return n, False
+    # alinhados verticalmente: desvio horizontal dos centros pequeno
+    xs = [p[0] for p in empilhados]
+    alinhado = (max(xs) - min(xs)) < 12    # em px do crop 36 de largura
+    return n, alinhado
+
+
+def _tem_farois(crop_gray: np.ndarray) -> bool:
+    n, alinhado = analisar_farois(crop_gray)
+    return 2 <= n <= 3 and alinhado
+
+
+def _tem_simbolo(crop_gray: np.ndarray) -> bool:
+    """
+    Círculo → existe SÍMBOLO interno (seta, letra)? → só então CNN.
+    Mede a fração de 'tinta' no miolo do círculo: placa de direção
+    tem 8-60%% de pixels escuros no centro; um disco vazio (roda,
+    prato, mancha) tem ~0%% ou ~100%%.
+    """
+    if crop_gray.size == 0: return False
+    g = cv2.resize(crop_gray, (48, 48))
+    miolo = g[10:38, 10:38]      # ignora a borda/anel externo
+    _, t = cv2.threshold(miolo, 0, 255,
+                         cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    f = float(t.mean()) / 255.0
+    # Fase MINORITÁRIA: independe da polaridade — funciona tanto
+    # p/ seta escura em placa clara quanto p/ texto claro no PARE
+    # escuro. Disco vazio → minoria ~0; símbolo real → 8-50%.
+    minoria = min(f, 1.0 - f)
+    return minoria > 0.08
+
+
+def detectar_geometrico(gray: np.ndarray,
+                        usar_canny: bool = False) -> list:
+    """
+    Contornos → ApproxPolyDP → filtro por número de lados:
+      3       → triângulo  (placa de advertência/preferência)
+      4-5     → retângulo  (vertical alto → teste de semáforo)
+      6+      → círculo/octógono (7-9 vértices + circularidade
+                 alta = octógono → prioridade PARE)
+    Busca apenas dentro do ROI DINÂMICO (histórico de posições).
+    """
+    h, w = gray.shape[:2]
+    x0, y0, x1, y1 = ROI_DIN.janela(h, w)
+    sub = gray[y0:y1, x0:x1]
+    if sub.size == 0: return []
+
+    cands = []
+    for m in segmentar(sub, usar_canny):
+        cnts, _ = cv2.findContours(m, cv2.RETR_CCOMP,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+        for c in cnts:
+            a = cv2.contourArea(c)
+            if a < GEO_AREA_MIN or a > GEO_AREA_FRAC*h*w: continue
+            x, y, bw, bh = cv2.boundingRect(c)
+            ar    = bw / max(bh, 1)
+            solid = a / max(bw*bh, 1)
+            if solid < 0.35: continue          # contorno irregular
+            peri  = cv2.arcLength(c, True)
+            circ  = 4*np.pi*a / max(peri*peri, 1)
+            nv    = len(cv2.approxPolyDP(c, 0.02*peri, True))
+            # Convexidade: área / área do fecho convexo.
+            # Placas são convexas (~1.0); galhos/pessoas não.
+            hull  = cv2.convexHull(c)
+            convx = a / max(cv2.contourArea(hull), 1)
+
+            hint = None
+            # Semáforo: aspecto vertical + faróis internos
+            # (independe de nv — contorno grande fragmenta o polígono)
+            if 0.25 < ar < 0.62 and bh > 50:
+                if _tem_farois(sub[y:y+bh, x:x+bw]):
+                    hint = "Semaforo"
+            elif nv == 3 and 0.55 < ar < 1.80:
+                hint = "?"                                  # triângulo
+            elif nv in (4, 5) and 0.60 < ar < 1.60 and solid > 0.50:
+                hint = "?"                                  # retângulo
+            elif nv >= 6 and 0.60 < ar < 1.60:
+                if 7 <= nv <= 9 and circ > 0.62:
+                    hint = "Stop"                           # octógono
+                elif circ > 0.70 and _tem_simbolo(sub[y:y+bh, x:x+bw]):
+                    hint = "?"        # círculo COM símbolo interno
+            if hint is None: continue
+            gx, gy = x + x0, y + y0            # volta p/ coord. global
+            # Hierarquia de contornos: símbolo/estrutura interna
+            # (texto do PARE, seta da placa, faróis do semáforo)
+            simb = _tem_simbolo(sub[y:y+bh, x:x+bw]) \
+                   if hint != "Semaforo" else True
+            cands.append({"bbox": (gx, gy, gx+bw, gy+bh),
+                          "class_name": hint, "class_id": -1,
+                          "conf": float(solid), "geo": True,
+                          "lados": nv, "circ": float(circ),
+                          "ar": float(ar), "area": float(a),
+                          "convex": float(convx),
+                          "simbolo": bool(simb)})
+
+    cands.sort(key=lambda d: -(d["bbox"][2]-d["bbox"][0])
+                              *(d["bbox"][3]-d["bbox"][1]))
+    keep = []
+    for d in cands:
+        dup = False
+        for k in keep:
+            ax1,ay1,ax2,ay2 = d["bbox"]; bx1,by1,bx2,by2 = k["bbox"]
+            ix = max(0, min(ax2,bx2)-max(ax1,bx1))
+            iy = max(0, min(ay2,by2)-max(ay1,by1))
+            if ix*iy > 0.6*min((ax2-ax1)*(ay2-ay1),
+                               (bx2-bx1)*(by2-by1)):
+                dup = True; break
+        if not dup: keep.append(d)
+    return keep[:GEO_MAX_CANDS]
+
+# ================================================================
+#  [6b] PGOM — PERSISTENT GEOMETRIC OBJECT MANAGER
+#
+#  Sistema de MÚLTIPLAS EVIDÊNCIAS. Nenhuma etapa isolada tem
+#  permissão para promover um objeto à CNN: cada candidato mantém
+#  uma FICHA que acumula evidências geométricas e temporais.
+#  A promoção ocorre apenas quando a soma ponderada ultrapassa
+#  PGOM_PROMOVE. A CNN deixa de ser filtro de centenas de
+#  candidatos e vira CONFIRMADORA de alta precisão para poucos
+#  candidatos de excelente qualidade.
+#
+#  Ficha de evidências (perfil PLACA):
+#    Forma compatível ................. 20%
+#    Convexidade elevada .............. 10%
+#    Aspect ratio esperado ............ 10%
+#    Hierarquia de contornos (símbolo)  15%
+#    Persistência por 5-8 frames ...... 20%
+#    Estabilidade de centro e área .... 15%
+#    Fingerprint geométrico ........... 10%
+#
+#  Perfil SEMÁFORO: mesmo princípio, pesos ajustados à física do
+#  objeto — pequeno e trêmulo, então a persistência pesa menos e
+#  a ESTRUTURA interna (2-3 faróis alinhados, já validada no
+#  detector) pesa mais. Nenhum objeto é promovido por uma
+#  evidência só, em nenhum perfil.
+#
+#  Árvores, postes, nuvens e reflexos raramente sobrevivem: não
+#  mantêm forma + centro + proporção + estrutura interna ao mesmo
+#  tempo por vários frames. Placas e semáforos mantêm.
+# ================================================================
+
+PGOM_PROMOVE     = 0.85  # limiar de promoção — perfil PLACA
+PGOM_PROMOVE_SEM = 0.72  # perfil SEMÁFORO: objeto pequeno e
+                         # intermitente; a evidência estrutural
+                         # (faróis alinhados, 35%) é forte por
+                         # frame, mas persistência/estabilidade
+                         # rendem menos — o teto da soma é menor
+PGOM_MAX_MISS  = 3      # frames sumido → ficha zera
+PGOM_MATCH_D   = 60     # px máx. entre centros p/ ser o mesmo objeto
+PGOM_HIST      = 10     # janela de histórico da ficha
+PGOM_PERSIST_N = 8      # persistência satura em N frames (rampa 0→1)
+
+PESOS_PLACA = dict(forma=0.20, convex=0.10, aspecto=0.10,
+                   simbolo=0.15, persist=0.20, estab=0.15,
+                   fingerprint=0.10)
+PESOS_SEMAFORO = dict(forma=0.15, convex=0.05, aspecto=0.15,
+                      simbolo=0.35, persist=0.05, estab=0.15,
+                      fingerprint=0.10)
+
+class Ficha:
+    """Dossiê de um candidato: acumula evidências frame a frame."""
+    _nid = 0
+
+    def __init__(self, det):
+        self.id = Ficha._nid; Ficha._nid += 1
+        self.centros  = deque(maxlen=PGOM_HIST)
+        self.areas    = deque(maxlen=PGOM_HIST)
+        self.formas   = deque(maxlen=PGOM_HIST)  # score forma/frame
+        self.convexs  = deque(maxlen=PGOM_HIST)
+        self.aspectos = deque(maxlen=PGOM_HIST)
+        self.simbolos = deque(maxlen=PGOM_HIST)
+        self.fingerps = deque(maxlen=PGOM_HIST)  # assinatura quantizada
+        self.vistos   = 0
+        self.missed   = 0
+        self.det      = det
+        self._push(det)
+
+    @staticmethod
+    def _score_forma(det) -> float:
+        """Forma compatível com placa/sinal, graduada."""
+        nv, circ = det.get("lados",0), det.get("circ",0)
+        if det["class_name"] == "Semaforo":       return 1.0
+        if 7 <= nv <= 9 and circ > 0.62:          return 1.0   # octógono
+        if nv == 3:                               return 0.9   # triângulo
+        if nv >= 6 and circ > 0.70:               return 0.9   # círculo
+        if nv in (4,5):                           return 0.7   # retângulo
+        return 0.3
+
+    @staticmethod
+    def _fingerprint(det) -> tuple:
+        """Assinatura geométrica quantizada: (lados, circ, aspecto)
+        em buckets. Objetos reais mudam de assinatura entre frames;
+        placas rígidas mantêm a mesma."""
+        nv = det.get("lados",0)
+        # agrupa nv (4≈5, 8≈9) e usa buckets grossos p/ circ e ar —
+        # buckets finos oscilam na fronteira e punem objetos rígidos
+        grupo_nv = 3 if nv==3 else 4 if nv in (4,5) else \
+                   7 if nv in (6,7) else 9
+        return (grupo_nv,
+                int(det.get("circ",0)*3),
+                int(det.get("ar",1.0)*3))
+
+    def _push(self, det):
+        x1,y1,x2,y2 = det["bbox"]
+        self.centros.append(((x1+x2)/2, (y1+y2)/2))
+        self.areas.append(max(1.0,(x2-x1)*(y2-y1)))
+        self.formas.append(self._score_forma(det))
+        self.convexs.append(float(det.get("convex", 0.5)))
+        ideal = 0.40 if det["class_name"]=="Semaforo" else 1.00
+        ar = float(det.get("ar",1.0))
+        self.aspectos.append(float(np.clip(1.0-abs(ar-ideal)/ideal,0,1)))
+        self.simbolos.append(1.0 if det.get("simbolo") else 0.0)
+        self.fingerps.append(self._fingerprint(det))
+        self.vistos += 1
+        self.missed  = 0
+        self.det     = det
+
+    def perto_de(self, det) -> float:
+        x1,y1,x2,y2 = det["bbox"]
+        cx, cy = (x1+x2)/2, (y1+y2)/2
+        px, py = self.centros[-1]
+        return ((cx-px)**2 + (cy-py)**2) ** 0.5
+
+    def evidencias(self) -> dict:
+        """Calcula cada evidência da ficha, todas em [0,1]."""
+        # Persistência: rampa 0→1 até PGOM_PERSIST_N frames
+        e_persist = float(np.clip(self.vistos/PGOM_PERSIST_N, 0, 1))
+        # Estabilidade = SUAVIDADE, não constância. O carro se
+        # APROXIMA da placa: área cresce e centro deriva — isso é
+        # esperado. O que denuncia ruído é variação ERRÁTICA:
+        # passos de tamanho inconstante, área pulsando.
+        if len(self.centros) >= 3:
+            passos = [((self.centros[i+1][0]-self.centros[i][0])**2 +
+                       (self.centros[i+1][1]-self.centros[i][1])**2)**0.5
+                      for i in range(len(self.centros)-1)]
+            e_c = float(np.clip(1.0 - np.std(passos)/12.0, 0, 1))
+            razoes = [self.areas[i+1]/self.areas[i]
+                      for i in range(len(self.areas)-1)]
+            e_a = float(np.clip(1.0 - np.std(razoes)/0.25, 0, 1))
+            e_estab = (e_c+e_a)/2
+        else:
+            e_estab = 0.4
+        # Fingerprint: fração dos frames com a assinatura dominante
+        cnt = Counter(self.fingerps)
+        e_fp = cnt.most_common(1)[0][1]/len(self.fingerps)
+        return dict(
+            forma   = float(np.mean(self.formas)),
+            convex  = float(np.mean(self.convexs)),
+            aspecto = float(np.mean(self.aspectos)),
+            simbolo = float(np.mean(self.simbolos)),
+            persist = e_persist,
+            estab   = float(e_estab),
+            fingerprint = float(e_fp),
+        )
+
+    def total(self) -> float:
+        pesos = PESOS_SEMAFORO if self.det["class_name"]=="Semaforo" \
+                else PESOS_PLACA
+        ev = self.evidencias()
+        return sum(pesos[k]*ev[k] for k in pesos)
+
+
+class PGOM:
+    """Mantém as fichas e decide PROMOÇÃO por soma de evidências."""
+    def __init__(self):
+        self.fichas: list[Ficha] = []
+        self.stats = dict(vistos=0, promovidos=0)
+
+    def update(self, dets: list) -> list:
+        geo    = [d for d in dets if d.get("geo")]
+        outros = [d for d in dets if not d.get("geo")]   # YOLO/COCO
+        self.stats["vistos"] += len(geo)
+
+        usados = set()
+        casadas = {}
+        for d in geo:
+            melhor, dist_m = None, PGOM_MATCH_D
+            for f in self.fichas:
+                if id(f) in usados: continue
+                dist = f.perto_de(d)
+                if dist < dist_m: melhor, dist_m = f, dist
+            if melhor is not None:
+                melhor._push(d); usados.add(id(melhor))
+                casadas[id(melhor)] = d
+            else:
+                nova = Ficha(d)
+                self.fichas.append(nova)
+                # Ficha nova TAMBÉM é avaliada já neste frame: quem
+                # decide é a SOMA de evidências contra o limiar do
+                # perfil — placas não passam na 1ª visita (persistência
+                # pesa 20%), mas um semáforo estruturalmente válido sim.
+                casadas[id(nova)] = d
+                usados.add(id(nova))
+
+        for f in self.fichas:
+            if id(f) not in usados and f.vistos > 1:
+                f.missed += 1
+        # sumiu → ficha zera (o mundo real não some por 3 frames)
+        self.fichas = [f for f in self.fichas
+                       if f.missed <= PGOM_MAX_MISS]
+
+        promovidos = []
+        for f in self.fichas:
+            d = casadas.get(id(f))
+            if d is None: continue             # não visto neste frame
+            tot = f.total()
+            limiar = PGOM_PROMOVE_SEM \
+                     if f.det["class_name"] == "Semaforo" \
+                     else PGOM_PROMOVE
+            if tot >= limiar:
+                d = dict(d)
+                d["evid"]  = f.evidencias()
+                d["evtot"] = float(tot)
+                promovidos.append(d)
+                self.stats["promovidos"] += 1
+        return promovidos + outros
+
+PGOM_M = PGOM()
+
+
+def score_final(det: dict, cnn_conf: float) -> float:
+    """
+    Score de decisão: a soma de evidências geométricas/temporais
+    responde por 85%% e a CNN — confirmadora final — pelos 15%%.
+    """
+    ev = float(det.get("evtot", det.get("conf", 0.5)))
+    return 0.85*ev + 0.15*float(cnn_conf)
 
 # ================================================================
 #  [7] YOLO DETECTOR — YOLOv8n ONNX Runtime
@@ -448,6 +983,8 @@ class YOLODetector:
         return keep
 
     def detectar(self, frame_enhanced: np.ndarray) -> list:
+        if frame_enhanced.ndim == 2:   # mono → 3 canais p/ o modelo
+            frame_enhanced = cv2.cvtColor(frame_enhanced, cv2.COLOR_GRAY2BGR)
         h0,w0 = frame_enhanced.shape[:2]
         canvas,sc,px,py = self._letterbox(frame_enhanced, self.input_size)
         inp = canvas[:,:,::-1].astype(np.float32)/255.0
@@ -480,6 +1017,12 @@ class YOLODetector:
                 y2  = int(np.clip((bxs[i,3]-py)/sc, 0, h0-1))
                 # Filtra ROI vertical
                 if y1 < h0*ROI_Y0 or y2 > h0*ROI_Y1: continue
+                # Filtros por classe (só em modo COCO)
+                if self.coco_mode:
+                    if max_c[i] < COCO_CONF_MIN.get(cls_name, YOLO_CONF):
+                        continue
+                    if (x2-x1)*(y2-y1) < COCO_AREA_MIN.get(cls_name, 0):
+                        continue
                 results.append({"bbox":(x1,y1,x2,y2),"class_name":cls_name,
                                  "class_id":int(cid),"conf":float(max_c[i]),
                                  "coco":self.coco_mode})
@@ -499,7 +1042,14 @@ class CNNClassifier:
         self._in  = d["index"]
         self._out = interp.get_output_details()[0]["index"]
         self._q   = d["dtype"] == np.uint8
-        print(f"[CNN] {path}", flush=True)
+        # Lê o tamanho de entrada DO MODELO (64, 96...) — mesma
+        # lição do ONNX: nunca confiar em constante hardcoded.
+        self.size = int(d["shape"][1])
+        global CNN_SIZE
+        CNN_SIZE = self.size
+        q = "INT8" if self._q else "FP32"
+        print(f"[CNN] {path} | {self.size}x{self.size} | {q}",
+              flush=True)
 
     def predict(self, img_96: np.ndarray) -> np.ndarray:
         inp = img_96[np.newaxis].astype(np.float32)
@@ -510,22 +1060,31 @@ class CNNClassifier:
         return out.astype(np.float32)/255.0 if self._q else out
 
 
-def crop_para_cnn(crop_bgr: np.ndarray, cls_hint: str) -> np.ndarray:
+def prep_mono(crop: np.ndarray) -> np.ndarray:
     """
-    Preprocessing do crop antes da CNN (dual, por tipo de classe).
-    Placa    → grayscale + adaptive threshold (shape/bordas)
-    Obstáculo→ CLAHE + RGB normalizado (cor + silhueta)
+    Preprocessing ÚNICO do crop — IDÊNTICO ao usado no treino
+    (TRAIN_SIGN_CNN.py::prep_mono). Consistência treino↔inferência
+    é o que garante a acurácia:
+      resize 96 → gray → CLAHE → replica 3 canais → [0,1]
     """
-    img = cv2.resize(crop_bgr, (CNN_SIZE, CNN_SIZE))
-    if cls_hint in OBSTACLE_CLASSES:
-        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-        lab[:,:,0] = _CLAHE.apply(lab[:,:,0])
-        img = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32)/255.0
-    gray = cv2.GaussianBlur(cv2.cvtColor(img,cv2.COLOR_BGR2GRAY),(3,3),0)
-    thr  = cv2.adaptiveThreshold(gray,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                  cv2.THRESH_BINARY,11,2)
-    return np.stack([thr,thr,thr],axis=-1).astype(np.float32)/255.0
+    if crop.ndim == 3:
+        crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    g = cv2.resize(crop, (CNN_SIZE, CNN_SIZE))
+    g = _CLAHE.apply(g)
+    return np.stack([g, g, g], axis=-1).astype(np.float32) / 255.0
+
+
+def carregar_classes() -> list:
+    """Lê models/classes.txt (gerado no treino) para nunca haver
+    divergência entre índices do treino e do runtime."""
+    p = os.path.join(os.path.dirname(YOLO_MODEL), "classes.txt")
+    if os.path.exists(p):
+        with open(p) as f:
+            cls = [l.strip() for l in f if l.strip()]
+        if cls:
+            print(f"[CNN] classes.txt: {cls}", flush=True)
+            return cls
+    return CLASSES
 
 
 class OODRejector:
@@ -667,20 +1226,28 @@ class ByteTrackLite:
 
     @staticmethod
     def _classificar(det, frame_enhanced, cnn, ood):
-        # Modo COCO: a classe do YOLO já é confiável — usa direto no voto,
-        # sem passar pela CNN (que foi treinada em outro domínio).
+        # COCO: classe do YOLO já é confiável — voto direto
         if det.get("coco", False):
             return det["class_name"], det["conf"]
+        # Semáforo geométrico: forma basta; o ESTADO é lido depois
+        # (posição do farol aceso) — não passa pela CNN
+        if det.get("geo") and det["class_name"] == "Semaforo":
+            return "Semaforo", score_final(det, det["conf"])
         if cnn is None: return None, 0.0
         x1,y1,x2,y2 = det["bbox"]
         crop = frame_enhanced[y1:y2, x1:x2]
         if crop.size==0 or (x2-x1)<8 or (y2-y1)<8: return None, 0.0
-        img_in = crop_para_cnn(crop, det["class_name"])
-        scores = cnn.predict(img_in)
+        scores = cnn.predict(prep_mono(crop))
         max_s  = float(scores.max())
-        cls_nm = CLASSES[int(scores.argmax())]
+        cls_nm = CNN_CLASSES[int(scores.argmax())] \
+                 if int(scores.argmax()) < len(CNN_CLASSES) else None
+        # Classe negativa: candidato geométrico que não é nada
+        if cls_nm in (None, "Fundo"): return None, 0.0
         if ood and not ood.aceitar(cls_nm, max_s): return None, 0.0
-        return cls_nm, max_s
+        # Score composto: geometria + persistência + CNN
+        # (0.30 forma + 0.20 estabilidade + 0.15 circ + 0.10 área
+        #  + 0.10 aspect + 0.15 CNN)
+        return cls_nm, score_final(det, max_s)
 
 # ================================================================
 #  [10] AÇÕES
@@ -733,7 +1300,9 @@ def liberar_obstaculo(ser):
 # ================================================================
 
 def desenhar(frame_e, tracks, fps, modo, debug_thr):
-    out = frame_e.copy(); h,w = out.shape[:2]; PW = 225
+    out = cv2.cvtColor(frame_e, cv2.COLOR_GRAY2BGR) \
+          if frame_e.ndim == 2 else frame_e.copy()
+    h,w = out.shape[:2]; PW = 225
 
     cv2.rectangle(out,(0,int(h*ROI_Y0)),(w-1,int(h*ROI_Y1)),(0,200,255),1)
 
@@ -763,12 +1332,15 @@ def desenhar(frame_e, tracks, fps, modo, debug_thr):
         cv2.putText(pan,s,(5,14+ln*16),cv2.FONT_HERSHEY_SIMPLEX,sc,cor,1)
 
     t(f"FPS:{fps:.0f} [{modo}]",0,(255,255,255),0.38)
+    if _sat_chk["mono"]:
+        cv2.putText(pan,"CAM S/COR!",(120,14),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.38,(0,0,255),1)
     cor_missao = {"AGUARDANDO":(0,220,220),"RODANDO":(100,220,100),
                   "PARADO_SEM":(50,50,220),"ENTREGANDO":(220,180,0),
                   "FINALIZADO":(180,180,180)}.get(MISSAO.estado,(190,190,190))
     t(f"MISSAO: {MISSAO.estado}",1,cor_missao,0.36)
     t(f"Dest:{MISSAO.destino} {MISSAO.progresso}/{len(MISSAO.rota())} "
-      f"Trk:{len(tracks)}",2)
+      f"Trk:{len(tracks)} Fichas:{len(PGOM_M.fichas)}",2)
 
     acao = _nav["acao_label"]
     if acao:
@@ -885,8 +1457,9 @@ def calibrar(usar_camera):
 #  [13] LOOP PRINCIPAL
 # ================================================================
 
-def main(usar_camera=False, debug=False, auto=False, fast=False):
-    global _ser, _CLAHE
+def main(usar_camera=False, debug=False, auto=False, fast=False,
+         usar_yolo=False, usar_canny=False):
+    global _ser, _CLAHE, CNN_CLASSES
 
     # ── Modo FAST: inferência menor + sem pular frames ────────────
     # YOLO 416px é ~2.4x mais rápido que 640px com perda mínima de
@@ -918,31 +1491,32 @@ def main(usar_camera=False, debug=False, auto=False, fast=False):
     # CNN (obrigatória para classificar)
     cnn = ood = None
     if os.path.exists(CNN_MODEL):
-        try:   cnn=CNNClassifier(CNN_MODEL); ood=OODRejector(OOD_FILE)
+        try:
+            cnn=CNNClassifier(CNN_MODEL); ood=OODRejector(OOD_FILE)
+            CNN_CLASSES = carregar_classes()
         except Exception as e: print(f"[WARN] CNN: {e}", flush=True)
     else:
         print(f"[WARN] CNN não encontrada → execute: python TRAIN_SIGN_CNN.py",
               flush=True)
 
-    # YOLO (opcional — fallback para contornos se ausente)
-    yolo = None; modo = "CONTORNO"
-    if os.path.exists(YOLO_MODEL):
+    # YOLO agora é OPCIONAL (--yolo). No feed mono, o detector
+    # geométrico é o principal: mais rápido e sem alucinações.
+    yolo = None; modo = "GEO"
+    if usar_yolo and os.path.exists(YOLO_MODEL):
         try:   yolo=YOLODetector(YOLO_MODEL); modo="YOLO"
         except Exception as e: print(f"[WARN] YOLO: {e}", flush=True)
-    else:
-        print(f"[INFO] YOLO não encontrado → detectando por contornos\n"
-              f"       Para treinar: python TRAIN_YOLO.py", flush=True)
+    elif usar_yolo:
+        print(f"[WARN] --yolo pedido mas {YOLO_MODEL} não existe → GEO",
+              flush=True)
+    print(f"[DET] Detector principal: {modo}", flush=True)
 
     tracker = ByteTrackLite()
 
-    src = CAM_IDX if usar_camera else VIDEO
-    cap = cv2.VideoCapture(src, cv2.CAP_DSHOW if usar_camera else cv2.CAP_ANY)
-    if not cap.isOpened(): print("[ERRO] Fonte de vídeo"); sys.exit(1)
     if usar_camera:
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        cap.set(cv2.CAP_PROP_FPS,          30)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+        cap = abrir_camera(CAM_IDX)
+    else:
+        cap = cv2.VideoCapture(VIDEO)
+    if not cap.isOpened(): print("[ERRO] Fonte de vídeo"); sys.exit(1)
 
     fps_vid  = cap.get(cv2.CAP_PROP_FPS) or 30.0
     delay_ms = max(1,int(1000/fps_vid)) if not usar_camera else 1
@@ -971,37 +1545,53 @@ def main(usar_camera=False, debug=False, auto=False, fast=False):
         em_acao = tick(_ser)
 
         if fn % SKIP == 0:
+            # ── Sanity check da câmera (cor presente?) ────────────
+            checar_camera(frame_raw)
+
             # ── Preprocessing principal ────────────────────────────
             frame_e = preprocessar(frame_raw)
             h, w    = frame_e.shape[:2]
             debug_thr = None
 
             # ── Localização ────────────────────────────────────────
-            if yolo:
-                dets = yolo.detectar(frame_e)
-                det_modo = "YOLO"
-            else:
-                dets = []
-                det_modo = "CONTORNO"
-
-            # Fallback: só roda se YOLO encontrou nada
-            if not dets:
-                dets = detectar_contornos_fallback(frame_e)
-                det_modo = "CONTORNO"
-                if debug:
-                    # Gera imagem de threshold para debug
-                    gray = cv2.medianBlur(cv2.cvtColor(frame_e,cv2.COLOR_BGR2GRAY),5)
-                    debug_thr = cv2.adaptiveThreshold(
-                        gray,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                        cv2.THRESH_BINARY_INV,15,4)
+            # GEOMÉTRICO é o principal (todo frame, ~ms).
+            # YOLO é AUXILIAR: com --yolo, roda a cada YOLO_EVERY
+            # frames e SÓ dentro do ROI dinâmico → registra o que
+            # a geometria perder, sem derrubar o FPS.
+            dets = detectar_geometrico(frame_e, usar_canny)
+            det_modo = "GEO"
+            if yolo and fn % YOLO_EVERY == 0:
+                rx0, ry0, rx1, ry1 = ROI_DIN.janela(h, w)
+                sub = frame_e[ry0:ry1, rx0:rx1]
+                if sub.size:
+                    for d in yolo.detectar(sub):
+                        x1,y1,x2,y2 = d["bbox"]
+                        d["bbox"] = (x1+rx0, y1+ry0, x2+rx0, y2+ry0)
+                        dets.append(d)
+                    det_modo = "GEO+YOLO"
+            debug_thr = None
+            if debug:
+                _, debug_thr = cv2.threshold(
+                    frame_e, 0, 255,
+                    cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
             # Filtra área mínima
             dets = [d for d in dets
                     if (d["bbox"][2]-d["bbox"][0])*(d["bbox"][3]-d["bbox"][1])
                     >= AREA_MIN_EXEC]
 
-            # ── Tracker + CNN ──────────────────────────────────────
+            # ── PGOM: promoção por múltiplas evidências ───────────
+            # Nenhuma etapa isolada promove; só a SOMA ponderada
+            # das evidências da ficha ≥ PGOM_PROMOVE chega à CNN.
+            dets = PGOM_M.update(dets)
+
+            # ── Tracker + CNN (apenas candidatos estáveis) ────────
             tracks = tracker.update(dets, frame_e, cnn, ood)
+
+            # Histórico do ROI dinâmico: posições dos tracks vivos
+            for trk in tracks:
+                if trk.state == "confirmed" or trk.age >= 2:
+                    ROI_DIN.registrar(trk.bbox)
 
             # ── Lê mensagens do Arduino (ACKs, botões, sensores) ──
             for m in ler_serial(_ser):
@@ -1015,7 +1605,7 @@ def main(usar_camera=False, debug=False, auto=False, fast=False):
             for trk in tracks:
                 if trk.class_hint == "Semaforo" and trk.votar()[0]:
                     x1,y1,x2,y2 = trk.bbox
-                    sem_cor = cor_semaforo(frame_e[y1:y2, x1:x2])
+                    sem_cor = analisar_semaforo(frame_e[y1:y2, x1:x2])
                     break
 
             # ── MÁQUINA DE ESTADOS DA MISSÃO ──────────────────────
@@ -1115,4 +1705,6 @@ if __name__=="__main__":
     else: main(usar_camera="--cam" in args,
                debug="--debug" in args,
                auto="--auto" in args,
-               fast="--fast" in args)
+               fast="--fast" in args,
+               usar_yolo="--yolo" in args,
+               usar_canny="--canny" in args)

@@ -39,7 +39,8 @@ from tensorflow import keras
 #  [1] CONFIG
 # ================================================================
 OUTPUT_DIR    = "./models"
-CNN_SIZE      = 96
+CNN_SIZE      = 64    # v5.1: 64x64 (2.2x mais rápido que 96) — o
+                      # carro-autonomo.py lê o tamanho do .tflite
 BATCH_SIZE    = 32
 SEED          = 42
 VAL_SPLIT     = 0.20
@@ -49,11 +50,21 @@ UNFREEZE_LAST = 50
 OOD_PERCENTILE = 5;   OOD_MIN = 0.40;  OOD_MAX = 0.92
 
 CLASSES = ["Stop","Esquerda","Direita","SemRetorno",
-           "Verde","Cone","Carro","Pessoa"]
+           "Verde","Cone","Carro","Pessoa","Fundo"]
 NUM_CLASSES      = len(CLASSES)
 IDX              = {c:i for i,c in enumerate(CLASSES)}
-OBSTACLE_CLASSES = {"Cone","Carro","Pessoa"}
 NO_FLIP_CLASSES  = {"Esquerda","Direita","SemRetorno"}
+
+# Pastas com código-letra também são aceitas (ex.: dataset_final)
+ALIASES = {"s":"Stop","l":"Esquerda","r":"Direita","n":"SemRetorno",
+           "g":"Verde","car":"Carro","people":"Pessoa","cone":"Cone",
+           "fundo":"Fundo","background":"Fundo","nada":"Fundo"}
+
+def pasta_para_classe(nome: str) -> str | None:
+    n = nome.lower()
+    for cls in CLASSES:
+        if n == cls.lower(): return cls
+    return ALIASES.get(n)
 EXTS             = {".jpg",".jpeg",".png",".bmp",".webp"}
 
 tf.random.set_seed(SEED)
@@ -72,9 +83,8 @@ def _scan_flat(base: Path) -> dict | None:
     subdirs = [d for d in base.iterdir() if d.is_dir()]
     cls_dirs = {}
     for d in subdirs:
-        for cls in CLASSES:
-            if d.name.lower() == cls.lower():
-                cls_dirs[cls] = d; break
+        cls = pasta_para_classe(d.name)
+        if cls: cls_dirs[cls] = d
 
     if not cls_dirs:
         return None
@@ -186,26 +196,28 @@ def imprimir_diagnostico(dataset_dir: str, info: dict):
     print("-"*62)
 
 # ================================================================
-#  [3] PREPROCESSING DUAL
+#  [3] PREPROCESSING MONO UNIFICADO
+#
+#  A webcam do carro entrega imagem em PRETO E BRANCO.
+#  Regra de ouro: o preprocessing do TREINO deve ser IDÊNTICO ao
+#  da INFERÊNCIA (carro-autonomo.py::prep_mono). Uma única função
+#  para TODAS as classes:
+#     resize 96 → gray → CLAHE → replica 3 canais → [0,1]
+#  O dataset pode continuar colorido em disco — a conversão
+#  acontece aqui, garantindo consistência automática.
 # ================================================================
 
-def prep_sign(img_bgr):
-    img  = cv2.resize(img_bgr, (CNN_SIZE,CNN_SIZE))
-    gray = cv2.GaussianBlur(cv2.cvtColor(img,cv2.COLOR_BGR2GRAY),(3,3),0)
-    thr  = cv2.adaptiveThreshold(gray,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                  cv2.THRESH_BINARY,11,2)
-    return np.stack([thr,thr,thr],axis=-1).astype(np.float32)/255.0
+_CLAHE_TR = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
 
-def prep_obstacle(img_bgr):
-    img = cv2.resize(img_bgr,(CNN_SIZE,CNN_SIZE))
-    lab = cv2.cvtColor(img,cv2.COLOR_BGR2LAB)
-    clahe = cv2.createCLAHE(clipLimit=2.0,tileGridSize=(4,4))
-    lab[:,:,0] = clahe.apply(lab[:,:,0])
-    img = cv2.cvtColor(lab,cv2.COLOR_LAB2BGR)
-    return cv2.cvtColor(img,cv2.COLOR_BGR2RGB).astype(np.float32)/255.0
+def prep_mono(img_bgr):
+    if img_bgr.ndim == 3:
+        img_bgr = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    g = cv2.resize(img_bgr, (CNN_SIZE, CNN_SIZE))
+    g = _CLAHE_TR.apply(g)
+    return np.stack([g,g,g], axis=-1).astype(np.float32)/255.0
 
 def preprocess(img_bgr, cls_name):
-    return prep_obstacle(img_bgr) if cls_name in OBSTACLE_CLASSES else prep_sign(img_bgr)
+    return prep_mono(img_bgr)
 
 # ================================================================
 #  [4] AUGMENTACAO
@@ -234,10 +246,53 @@ def augmentar(img, cls_name):
     if np.random.rand() < 0.30:
         img = np.clip(img.astype(np.float32)
                       +np.random.randn(*img.shape)*8,0,255).astype(np.uint8)
+    # Emula a câmera do carro: contraste extremo / quase binário.
+    # Fecha o gap de domínio dataset (fotos normais) → pista (P/B duro)
+    if np.random.rand() < 0.35:
+        g   = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim==3 else img
+        lim = np.random.randint(90, 170)
+        _, b = cv2.threshold(g, lim, 255, cv2.THRESH_BINARY)
+        img = cv2.cvtColor(b, cv2.COLOR_GRAY2BGR)
     # Flip horizontal proibido para classes direcionais
     if cls_name not in NO_FLIP_CLASSES and np.random.rand() < 0.50:
         img = cv2.flip(img,1)
     return img
+
+# ================================================================
+#  [4b] CLASSE "FUNDO" — colheita automática de negativos
+#
+#  O detector geométrico gera candidatos que às vezes NÃO são
+#  placas (móveis, sombras, blobs). A CNN precisa saber dizer
+#  "isso não é nada" → classe Fundo.
+#  --fundo video.mp4 extrai crops aleatórios do vídeo da pista
+#  e salva em <dataset>/Fundo/ (uma vez; reutilizado depois).
+# ================================================================
+
+def colher_fundo(video_path: str, destino: Path, n_alvo: int = 300):
+    destino.mkdir(parents=True, exist_ok=True)
+    ja = len(list(destino.glob("*.jpg")))
+    if ja >= n_alvo:
+        print(f"  [FUNDO] {ja} crops ja existem em {destino} — ok")
+        return
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"  [FUNDO][ERRO] video nao abriu: {video_path}"); return
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    rng   = np.random.default_rng(SEED)
+    salvos = ja
+    while salvos < n_alvo:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(rng.integers(0, total)))
+        ret, f = cap.read()
+        if not ret: continue
+        h, w = f.shape[:2]
+        tam  = int(rng.integers(40, min(h,w)//2))
+        x    = int(rng.integers(0, w-tam))
+        y    = int(rng.integers(0, h-tam))
+        crop = f[y:y+tam, x:x+tam]
+        cv2.imwrite(str(destino/f"fundo_{salvos:04d}.jpg"), crop)
+        salvos += 1
+    cap.release()
+    print(f"  [FUNDO] {salvos} crops salvos em {destino}")
 
 # ================================================================
 #  [5] CARREGAMENTO
@@ -257,12 +312,22 @@ def carregar_flat(dataset_dir, val_frac, aug_factor):
     base = Path(dataset_dir)
     print(f"\n  Modo FLAT — auto-split {int((1-val_frac)*100)}/{int(val_frac*100)}")
     raw_imgs, raw_labels = [],[]
+    por_classe = {}
+    for d in base.iterdir():
+        if not d.is_dir(): continue
+        cls = pasta_para_classe(d.name)
+        if cls is None: continue
+        por_classe.setdefault(cls, []).extend(_ler_pasta(d))
+    # Direita ausente? Sintetiza espelhando Esquerda (flip horizontal
+    # transforma seta ← em seta →). Barato e correto geometricamente.
+    if not por_classe.get("Direita") and por_classe.get("Esquerda"):
+        por_classe["Direita"] = [cv2.flip(i,1)
+                                 for i in por_classe["Esquerda"]]
+        print("    [SINT] Direita gerada espelhando Esquerda")
     for cls in CLASSES:
-        pasta=None
-        for d in base.iterdir():
-            if d.is_dir() and d.name.lower()==cls.lower(): pasta=d; break
-        if pasta is None: print(f"    [SKIP] {cls}: pasta nao encontrada"); continue
-        imgs = _ler_pasta(pasta)
+        imgs = por_classe.get(cls, [])
+        if not imgs:
+            print(f"    [SKIP] {cls}: pasta nao encontrada"); continue
         print(f"    {cls:<14s}: {len(imgs):>4d}")
         for img in imgs:
             raw_imgs.append(img); raw_labels.append(IDX[cls])
@@ -291,7 +356,14 @@ def carregar_split(dataset_dir, aug_factor):
         X,y=[],[]
         for cls in CLASSES:
             p = base/split/cls
-            if not p.exists(): print(f"    [SKIP] [{split}] {cls}"); continue
+            if not p.exists():
+                # tenta alias (ex.: train/S para Stop)
+                p = None
+                for d in (base/split).iterdir():
+                    if d.is_dir() and pasta_para_classe(d.name)==cls:
+                        p = d; break
+                if p is None:
+                    print(f"    [SKIP] [{split}] {cls}"); continue
             imgs=_ler_pasta(p)
             print(f"    [{split}] {cls:<14s}: {len(imgs):>4d}")
             for img in imgs:
@@ -449,15 +521,31 @@ def calibrar_ood(model,X_va,y_va):
 #  [10] EXPORT
 # ================================================================
 
-def exportar(model):
+def exportar(model, X_rep=None, int8=False):
     kp=os.path.join(OUTPUT_DIR,"sign_classifier.keras")
     model.save(kp); print(f"  [OK] Keras  : {kp}")
     conv=tf.lite.TFLiteConverter.from_keras_model(model)
     conv.optimizations=[tf.lite.Optimize.DEFAULT]
+    if int8 and X_rep is not None:
+        # Quantização INT8 COMPLETA: pesos E ativações em 8 bits.
+        # Precisa de amostras representativas p/ calibrar os ranges.
+        # ~3x mais rápido em CPU; o runtime detecta o dtype sozinho.
+        def rep():
+            for i in range(min(200, len(X_rep))):
+                yield [X_rep[i:i+1].astype(np.float32)]
+        conv.representative_dataset = rep
+        conv.target_spec.supported_ops = [
+            tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+        conv.inference_input_type  = tf.uint8
+        conv.inference_output_type = tf.uint8
+        print("  [INT8] Quantizacao completa (uint8 in/out)")
     tflite=conv.convert()
     tp=os.path.join(OUTPUT_DIR,"sign_classifier.tflite")
     with open(tp,"wb") as f: f.write(tflite)
     print(f"  [OK] TFLite : {tp}  ({os.path.getsize(tp)//1024} KB)")
+    cp=os.path.join(OUTPUT_DIR,"classes.txt")
+    with open(cp,"w") as f: f.write("\n".join(CLASSES))
+    print(f"  [OK] Classes: {cp}  (lido pelo carro-autonomo.py)")
 
 # ================================================================
 #  MAIN
@@ -468,9 +556,16 @@ if __name__=="__main__":
     ap.add_argument("--dataset",  default="./dataset_v3")
     ap.add_argument("--val-split",type=float,default=VAL_SPLIT)
     ap.add_argument("--aug",      type=int,  default=3)
+    ap.add_argument("--fundo",    default=None,
+        help="video da pista p/ colher crops da classe Fundo")
+    ap.add_argument("--size",     type=int, default=CNN_SIZE,
+        help="lado da entrada da CNN (64 rapido / 96 preciso)")
+    ap.add_argument("--int8",     action="store_true",
+        help="exporta TFLite quantizado INT8 (~3x mais rapido)")
     args=ap.parse_args()
 
     t0=time.time()
+    globals()["CNN_SIZE"] = args.size
     os.makedirs(OUTPUT_DIR,exist_ok=True)
 
     print("="*62)
@@ -487,6 +582,13 @@ if __name__=="__main__":
         print(f"[GPU] {gpus[0].name}")
     else:
         print("[CPU] Sem GPU — funcional mas mais lento")
+
+    # Colheita da classe Fundo (se pedida)
+    if args.fundo:
+        base = Path(args.dataset)
+        alvo = base/"train"/"Fundo" if (base/"train").exists() \
+               else base/"Fundo"
+        colher_fundo(args.fundo, alvo)
 
     # Diagnostico
     info=diagnosticar(args.dataset)
@@ -541,7 +643,7 @@ if __name__=="__main__":
     calibrar_ood(model,X_va,y_va)
 
     print("\n"+"="*62+"\n  EXPORTANDO\n"+"="*62)
-    exportar(model)
+    exportar(model, X_rep=X_va, int8=args.int8)
 
     print(f"\n  [DONE] {(time.time()-t0)/60:.1f} min")
     print(f"  CNN_MODEL = '{OUTPUT_DIR}/sign_classifier.tflite'")
