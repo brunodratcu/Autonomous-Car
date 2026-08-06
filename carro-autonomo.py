@@ -10,7 +10,8 @@
     ↓ Morphological Open/Close
     ↓ [--canny opcional — ver nota em segmentar()]
     ↓ Contornos → ApproxPolyDP
-    ↓ Filtro geométrico: triângulo(3) · retângulo(4) · círculo/octógono(8+)
+    ↓ Filtro geométrico: SÓ octógono/8 lados (PARE) e semáforo
+    │  (retângulo vertical com 3 faróis) — nada mais é alvo
     ↓ ROI DINÂMICO (histórico da última posição — olha onde
     │  as placas costumam aparecer; varredura completa periódica)
     ↓ Recorte das regiões candidatas
@@ -68,6 +69,10 @@ from collections import deque, Counter
 
 VIDEO       = "./videoplayback.mp4"
 CAM_IDX     = 1        # câmera externa da pista (0 = webcam embutida)
+# Espelhamento da imagem da câmera (cv2.flip):
+#    None = sem flip |  1 = horizontal (efeito espelho) |
+#    0 = vertical    | -1 = ambos (gira 180°)
+CAM_FLIP    = 1        # padrão: corrige espelho horizontal
 IMG_W       = 640        # largura alvo antes de entrar no YOLO
 
 SERIAL_PORT = "COM3"
@@ -193,21 +198,27 @@ COR_CLASSE = {
 
 def estado_semaforo_mono(crop_gray: np.ndarray) -> str | None:
     """
-    Estado do semáforo SEM COR: posição vertical do farol aceso.
-    Layout físico padrão: vermelho em CIMA, amarelo no MEIO,
-    verde em BAIXO. O farol aceso satura (quase branco) na
-    imagem mono → basta achar o terço mais claro do crop.
+    Estado do semáforo SEM COR: posição vertical do farol ACESO.
+    Layout FÍSICO da pista (3 faróis, de cima p/ baixo):
+        ┌─────┐
+        │  ●  │  topo  → VERMELHO  → PARA
+        │  ○  │  meio  → AMARELO   → atenção
+        │  ○  │  base  → VERDE     → ANDA
+        └─────┘
+    O farol aceso satura (quase branco) na imagem mono, então
+    basta achar em qual dos 3 terços verticais está a zona mais
+    clara. Retorna 'vermelho' | 'amarelo' | 'verde' | None.
     """
     if crop_gray is None or crop_gray.size == 0: return None
     if crop_gray.ndim == 3:
         crop_gray = cv2.cvtColor(crop_gray, cv2.COLOR_BGR2GRAY)
     g = cv2.resize(crop_gray, (30, 90))
-    tercos = [float(g[0:30].mean()),   # topo   → vermelho
-              float(g[30:60].mean()),  # meio   → amarelo
-              float(g[60:90].mean())]  # base   → verde
+    tercos = [float(g[0:30].mean()),   # topo → VERMELHO (para)
+              float(g[30:60].mean()),  # meio → AMARELO
+              float(g[60:90].mean())]  # base → VERDE (anda)
     i = int(np.argmax(tercos))
     contraste = max(tercos) - sorted(tercos)[1]
-    if contraste < 8: return None      # nenhum farol dominante
+    if contraste < 8: return None      # nenhum farol claramente aceso
     return ["vermelho", "amarelo", "verde"][i]
 
 
@@ -636,16 +647,20 @@ def analisar_farois(crop_gray: np.ndarray) -> tuple:
 
 
 def _tem_farois(crop_gray: np.ndarray) -> bool:
+    # Semáforo da pista tem 3 faróis (vermelho/amarelo/verde).
+    # Aceita 2 como tolerância: se um farol estiver apagado e não
+    # gerar contorno, ainda reconhece a estrutura. Nunca aceita
+    # 1 (poste) nem 4+ (padrão de fundo aleatório).
     n, alinhado = analisar_farois(crop_gray)
     return 2 <= n <= 3 and alinhado
 
 
 def _tem_simbolo(crop_gray: np.ndarray) -> bool:
     """
-    Círculo → existe SÍMBOLO interno (seta, letra)? → só então CNN.
-    Mede a fração de 'tinta' no miolo do círculo: placa de direção
-    tem 8-60%% de pixels escuros no centro; um disco vazio (roda,
-    prato, mancha) tem ~0%% ou ~100%%.
+    Existe SÍMBOLO/texto interno? Evidência para o PGOM: o PARE
+    tem 'PARE'/'STOP' escrito dentro do octógono. Mede a fração
+    da fase minoritária no miolo — superfície lisa (parede, placa
+    em branco, disco vazio) dá ~0; texto real dá 8-50%%.
     """
     if crop_gray.size == 0: return False
     g = cv2.resize(crop_gray, (48, 48))
@@ -695,20 +710,19 @@ def detectar_geometrico(gray: np.ndarray,
             convx = a / max(cv2.contourArea(hull), 1)
 
             hint = None
-            # Semáforo: aspecto vertical + faróis internos
-            # (independe de nv — contorno grande fragmenta o polígono)
+            # ── APENAS DOIS ALVOS NA PISTA ──────────────────────
+            #  1) PARE   = OCTÓGONO (8 lados)
+            #  2) SEMÁFORO = retângulo vertical com 3 faróis
+            # Círculos soltos, triângulos e retângulos NÃO são
+            # alvos → não viram candidatos (eliminam falso positivo).
             if 0.25 < ar < 0.62 and bh > 50:
+                # Semáforo: aspecto vertical + faróis empilhados
                 if _tem_farois(sub[y:y+bh, x:x+bw]):
                     hint = "Semaforo"
-            elif nv == 3 and 0.55 < ar < 1.80:
-                hint = "?"                                  # triângulo
-            elif nv in (4, 5) and 0.60 < ar < 1.60 and solid > 0.50:
-                hint = "?"                                  # retângulo
-            elif nv >= 6 and 0.60 < ar < 1.60:
-                if 7 <= nv <= 9 and circ > 0.62:
-                    hint = "Stop"                           # octógono
-                elif circ > 0.70 and _tem_simbolo(sub[y:y+bh, x:x+bw]):
-                    hint = "?"        # círculo COM símbolo interno
+            elif 7 <= nv <= 9 and circ > 0.62 and 0.70 < ar < 1.40:
+                # Octógono do PARE: 8 lados (tolera 7-9 por ruído),
+                # circularidade alta e proporção ~quadrada
+                hint = "Stop"
             if hint is None: continue
             gx, gy = x + x0, y + y0            # volta p/ coord. global
             # Hierarquia de contornos: símbolo/estrutura interna
@@ -1120,6 +1134,69 @@ def carregar_classes() -> list:
     return CLASSES
 
 
+class VerificadorPlaca:
+    """
+    ETAPA 1 — "Isso é REALMENTE uma placa?" (verificação binária,
+    independente de qual classe seria). Separada da ETAPA 2
+    ("qual placa?", que é a CNN). Três testes que uma placa real
+    passa e um objeto qualquer de forma parecida NÃO passa:
+
+      1. MARGEM de decisão da CNN (top1 - top2): uma placa real
+         gera um pico claro; ruído gera distribuição achatada,
+         com 1º e 2º lugares empatados. Isso é MUITO mais robusto
+         que o MaxSoftmax sozinho — uma rede confia alto até em
+         lixo, mas raramente confia alto em UMA classe só.
+      2. ENTROPIA da distribuição: baixa = decisão limpa (placa);
+         alta = incerteza espalhada (não-placa).
+      3. Coerência com a GEOMETRIA: a forma detectada (octógono,
+         triângulo...) tem que ser compatível com a classe que a
+         CNN escolheu. Um octógono classificado como "Esquerda"
+         é contradição → rejeita.
+    """
+    # Forma geométrica esperada por classe (compatibilidade)
+    # Na pista só existem PARE (octógono) e semáforo. As demais
+    # classes ficam listadas por segurança, mas não aparecem.
+    FORMA_CLASSE = {
+        "Stop": {"octogono"},
+    }
+
+    def __init__(self, margem=0.25, entropia_max=1.30):
+        self.margem_min   = margem        # top1 - top2 mínimo
+        self.entropia_max = entropia_max  # nats; ln(9)=2.20 é o máx.
+
+    @staticmethod
+    def _forma_geo(det) -> str:
+        nv, circ = det.get("lados",0), det.get("circ",0)
+        if 7 <= nv <= 9 and circ > 0.62: return "octogono"
+        if nv == 3:                      return "triangulo"
+        if nv >= 6 and circ > 0.70:      return "circulo"
+        if nv in (4,5):                  return "retangulo"
+        return "?"
+
+    def e_placa(self, scores: np.ndarray, cls_nm: str,
+                det: dict) -> tuple:
+        """Retorna (aceita: bool, motivo: str, margem: float)."""
+        ordenado = np.sort(scores)[::-1]
+        top1 = float(ordenado[0])
+        top2 = float(ordenado[1]) if len(ordenado) > 1 else 0.0
+        margem = top1 - top2
+        # entropia da distribuição
+        p = np.clip(scores, 1e-9, 1.0)
+        entropia = float(-(p*np.log(p)).sum())
+
+        if margem < self.margem_min:
+            return False, f"margem baixa {margem:.2f}", margem
+        if entropia > self.entropia_max:
+            return False, f"entropia alta {entropia:.2f}", margem
+        # coerência forma×classe (só p/ classes com forma definida)
+        esperadas = self.FORMA_CLASSE.get(cls_nm)
+        if esperadas is not None:
+            fg = self._forma_geo(det)
+            if fg != "?" and fg not in esperadas:
+                return False, f"forma {fg}!={cls_nm}", margem
+        return True, "ok", margem
+
+
 class OODRejector:
     def __init__(self, path):
         self._t = {}
@@ -1217,8 +1294,8 @@ class ByteTrackLite:
         return matched, unmatched_t, unmatched_d
 
     def update(self, dets: list, frame_enhanced: np.ndarray,
-               cnn: "CNNClassifier | None", ood: "OODRejector | None"
-               ) -> list:
+               cnn: "CNNClassifier | None", ood: "OODRejector | None",
+               verif: "VerificadorPlaca | None" = None) -> list:
         """Atualiza tracks com novas detecções. Retorna tracks vivos."""
 
         # Separa dets por confiança
@@ -1237,7 +1314,7 @@ class ByteTrackLite:
         # ── Atualiza tracks matchados ────────────────────────────
         for ti, di in matched1 + matched2:
             d   = dets[di]
-            lbl, conf_cnn = self._classificar(d, frame_enhanced, cnn, ood)
+            lbl, conf_cnn = self._classificar(d, frame_enhanced, cnn, ood, verif)
             self.tracks[ti].atualizar(
                 d["bbox"], d["class_name"], d["conf"], lbl, conf_cnn)
 
@@ -1248,7 +1325,7 @@ class ByteTrackLite:
         # ── Cria novos tracks para dets de alta conf não matchadas
         for di in unm_d_hi:
             d   = dets[di]
-            lbl, conf_cnn = self._classificar(d, frame_enhanced, cnn, ood)
+            lbl, conf_cnn = self._classificar(d, frame_enhanced, cnn, ood, verif)
             t = Track(d["bbox"], d["class_name"], d["conf"])
             if lbl: t.buf.append((lbl, conf_cnn))
             self.tracks.append(t)
@@ -1258,7 +1335,7 @@ class ByteTrackLite:
         return self.tracks
 
     @staticmethod
-    def _classificar(det, frame_enhanced, cnn, ood):
+    def _classificar(det, frame_enhanced, cnn, ood, verif=None):
         # COCO: classe do YOLO já é confiável — voto direto
         if det.get("coco", False):
             return det["class_name"], det["conf"]
@@ -1274,12 +1351,29 @@ class ByteTrackLite:
         max_s  = float(scores.max())
         cls_nm = CNN_CLASSES[int(scores.argmax())] \
                  if int(scores.argmax()) < len(CNN_CLASSES) else None
-        # Classe negativa: candidato geométrico que não é nada
+
+        # ══ ETAPA 2 responde "qual placa?"; mas ANTES a ETAPA 1
+        #    tem poder de veto: "isso é REALMENTE uma placa?" ══
+
+        # 1a) A própria rede tem uma saída para "não é placa"
+        #     (classe Fundo). Se venceu, encerra.
         if cls_nm in (None, "Fundo"): return None, 0.0
+
+        # 1b) Verificador binário (margem + entropia + coerência
+        #     forma×classe) — independente de qual classe seria.
+        if verif is not None:
+            ok, motivo, _ = verif.e_placa(scores, cls_nm, det)
+            if not ok:
+                if det.get("_dbg"):
+                    print(f"[VERIF] rejeitado {cls_nm}: {motivo}",
+                          flush=True)
+                return None, 0.0
+
+        # 1c) Limiar de confiança por classe (OOD clássico)
         if ood and not ood.aceitar(cls_nm, max_s): return None, 0.0
-        # Score composto: geometria + persistência + CNN
-        # (0.30 forma + 0.20 estabilidade + 0.15 circ + 0.10 área
-        #  + 0.10 aspect + 0.15 CNN)
+
+        # ══ Passou nas 3 barreiras → É placa. Score final combina
+        #    evidência geométrica/temporal (PGOM) + CNN ══
         return cls_nm, score_final(det, max_s)
 
 # ================================================================
@@ -1492,7 +1586,7 @@ def calibrar(usar_camera):
 
 def main(usar_camera=False, debug=False, auto=False, fast=False,
          usar_yolo=False, usar_canny=False, cam_idx=None):
-    global _ser, _CLAHE, CNN_CLASSES
+    global _ser, _CLAHE, CNN_CLASSES, CAM_FLIP
 
     # ── Modo FAST: inferência menor + sem pular frames ────────────
     # YOLO 416px é ~2.4x mais rápido que 640px com perda mínima de
@@ -1522,10 +1616,11 @@ def main(usar_camera=False, debug=False, auto=False, fast=False,
         print(f"[PRE] Config: {_cfg}", flush=True)
 
     # CNN (obrigatória para classificar)
-    cnn = ood = None
+    cnn = ood = verif = None
     if os.path.exists(CNN_MODEL):
         try:
             cnn=CNNClassifier(CNN_MODEL); ood=OODRejector(OOD_FILE)
+            verif=VerificadorPlaca()
             CNN_CLASSES = carregar_classes()
         except Exception as e: print(f"[WARN] CNN: {e}", flush=True)
     else:
@@ -1571,6 +1666,8 @@ def main(usar_camera=False, debug=False, auto=False, fast=False,
 
     while True:
         ret, frame_raw = cap.read()
+        if ret and usar_camera and CAM_FLIP is not None:
+            frame_raw = cv2.flip(frame_raw, CAM_FLIP)
         if not ret: cap.set(cv2.CAP_PROP_POS_FRAMES,0); continue
         fn += 1
 
@@ -1619,7 +1716,7 @@ def main(usar_camera=False, debug=False, auto=False, fast=False,
             dets = PGOM_M.update(dets)
 
             # ── Tracker + CNN (apenas candidatos estáveis) ────────
-            tracks = tracker.update(dets, frame_e, cnn, ood)
+            tracks = tracker.update(dets, frame_e, cnn, ood, verif)
 
             # Histórico do ROI dinâmico: posições dos tracks vivos
             for trk in tracks:
@@ -1720,6 +1817,11 @@ def main(usar_camera=False, debug=False, auto=False, fast=False,
             MISSAO.set_estado("RODANDO")
             executar("STRAIGHT", _ser)
             MISSAO.registrar_comando("STRAIGHT")
+        elif k==ord('f'):
+            _ciclo = [None, 1, 0, -1]
+            CAM_FLIP = _ciclo[(_ciclo.index(CAM_FLIP)+1) % 4]
+            print(f"[CAM] flip = {CAM_FLIP} "
+                  f"(None/1=horiz/0=vert/-1=180)", flush=True)
         elif k in (ord('1'),ord('2'),ord('3')) and MISSAO.estado=="AGUARDANDO":
             MISSAO.destino = {ord('1'):"A",ord('2'):"B",ord('3'):"C"}[k]
             print(f"[MISSAO] Destino: {MISSAO.destino} — rota: "

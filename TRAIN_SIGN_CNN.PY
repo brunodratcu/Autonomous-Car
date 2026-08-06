@@ -382,7 +382,17 @@ def carregar_split(dataset_dir, aug_factor):
 #  [6] MODELO
 # ================================================================
 
-def build_model():
+def build_model(objectness=False):
+    """
+    objectness=False (padrão): 1 saída softmax (compatível com o
+    runtime atual). objectness=True: DUAS saídas —
+      · output      : softmax das classes (ETAPA 2, "qual placa?")
+      · objectness  : sigmoid binário (ETAPA 1, "é placa?"),
+                       treinado com Fundo=0 e placas=1
+    A separação em duas cabeças é a versão IDEAL da arquitetura
+    de dois estágios: a rede aprende explicitamente a distinguir
+    placa de não-placa, em vez de ser forçada a escolher classe.
+    """
     base=keras.applications.MobileNetV3Small(
         input_shape=(CNN_SIZE,CNN_SIZE,3),include_top=False,
         weights="imagenet",include_preprocessing=False)
@@ -396,7 +406,10 @@ def build_model():
                           kernel_regularizer=keras.regularizers.l2(1e-4))(x)
     x=keras.layers.Dropout(0.20)(x)
     out=keras.layers.Dense(NUM_CLASSES,activation="softmax",name="output")(x)
-    return keras.Model(inp,out,name="MobileNetV3Small_sign"),base
+    if not objectness:
+        return keras.Model(inp,out,name="MobileNetV3Small_sign"),base
+    obj=keras.layers.Dense(1,activation="sigmoid",name="objectness")(x)
+    return keras.Model(inp,[out,obj],name="MobileNetV3Small_2head"),base
 
 # ================================================================
 #  [7] TREINO 2 FASES
