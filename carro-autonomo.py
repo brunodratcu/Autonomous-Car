@@ -67,7 +67,7 @@ from collections import deque, Counter
 # ================================================================
 
 VIDEO       = "./videoplayback.mp4"
-CAM_IDX     = 0
+CAM_IDX     = 1        # câmera externa da pista (0 = webcam embutida)
 IMG_W       = 640        # largura alvo antes de entrar no YOLO
 
 SERIAL_PORT = "COM3"
@@ -314,13 +314,46 @@ _ser = None
 #  BUFFERSIZE 1: sempre o frame mais recente (menor latência).
 # ================================================================
 
-def abrir_camera(idx: int) -> cv2.VideoCapture:
+def _abrir_idx(idx: int):
+    """Tenta abrir UM índice com o backend nativo da plataforma."""
     backend = cv2.CAP_DSHOW if sys.platform.startswith("win") \
               else cv2.CAP_V4L2
     nome = "DSHOW" if backend == cv2.CAP_DSHOW else "V4L2"
     cap = cv2.VideoCapture(idx, backend)
     if not cap.isOpened():                      # fallback autodetect
         cap = cv2.VideoCapture(idx); nome = "AUTO"
+    if not cap.isOpened():
+        return None, nome
+    ret, _ = cap.read()                         # confirma que ENTREGA frame
+    if not ret:
+        cap.release(); return None, nome
+    return cap, nome
+
+
+def abrir_camera(idx: int) -> cv2.VideoCapture:
+    """
+    Abre a câmera do índice pedido. Se ela não responder, VARRE
+    os índices 0..5 e usa a primeira que entregar imagem — assim
+    o sistema nunca cai calado na webcam errada, e avisa qual
+    índice acabou usando.
+    """
+    cap, nome = _abrir_idx(idx)
+    if cap is None:
+        print(f"[CAM] índice {idx} não respondeu — varrendo 0..5...",
+              flush=True)
+        for alt in range(6):
+            if alt == idx: continue
+            cap, nome = _abrir_idx(alt)
+            if cap is not None:
+                print(f"[CAM] usando índice {alt} (troque CAM_IDX ou "
+                      f"passe --cam-idx {alt})", flush=True)
+                idx = alt; break
+    if cap is None:
+        print("[CAM][ERRO] Nenhuma câmera respondeu. Rode "
+              "SCAN_CAMERAS.py e verifique cabo / se outro app "
+              "está usando a câmera.", flush=True)
+        sys.exit(1)
+
     cap.set(cv2.CAP_PROP_FOURCC,
             cv2.VideoWriter_fourcc(*"MJPG"))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
@@ -329,7 +362,7 @@ def abrir_camera(idx: int) -> cv2.VideoCapture:
     cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
     fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
     fstr = "".join(chr((fourcc >> 8*i) & 0xFF) for i in range(4))
-    print(f"[CAM] backend={nome} fourcc={fstr} "
+    print(f"[CAM] idx={idx} backend={nome} fourcc={fstr} "
           f"{cap.get(3):.0f}x{cap.get(4):.0f}@{cap.get(5):.0f}fps",
           flush=True)
     return cap
@@ -1458,7 +1491,7 @@ def calibrar(usar_camera):
 # ================================================================
 
 def main(usar_camera=False, debug=False, auto=False, fast=False,
-         usar_yolo=False, usar_canny=False):
+         usar_yolo=False, usar_canny=False, cam_idx=None):
     global _ser, _CLAHE, CNN_CLASSES
 
     # ── Modo FAST: inferência menor + sem pular frames ────────────
@@ -1513,7 +1546,7 @@ def main(usar_camera=False, debug=False, auto=False, fast=False,
     tracker = ByteTrackLite()
 
     if usar_camera:
-        cap = abrir_camera(CAM_IDX)
+        cap = abrir_camera(CAM_IDX if cam_idx is None else cam_idx)
     else:
         cap = cv2.VideoCapture(VIDEO)
     if not cap.isOpened(): print("[ERRO] Fonte de vídeo"); sys.exit(1)
@@ -1702,9 +1735,17 @@ def main(usar_camera=False, debug=False, auto=False, fast=False,
 if __name__=="__main__":
     args = sys.argv[1:]
     if "--cal" in args: calibrar("--cam" in args)
-    else: main(usar_camera="--cam" in args,
-               debug="--debug" in args,
-               auto="--auto" in args,
-               fast="--fast" in args,
-               usar_yolo="--yolo" in args,
-               usar_canny="--canny" in args)
+    else:
+        cam_idx = None
+        if "--cam-idx" in args:
+            try:    cam_idx = int(args[args.index("--cam-idx")+1])
+            except (IndexError, ValueError):
+                print("[ERRO] use: --cam-idx N  (ex.: --cam-idx 1)")
+                sys.exit(1)
+        main(usar_camera="--cam" in args,
+             debug="--debug" in args,
+             auto="--auto" in args,
+             fast="--fast" in args,
+             usar_yolo="--yolo" in args,
+             usar_canny="--canny" in args,
+             cam_idx=cam_idx)
