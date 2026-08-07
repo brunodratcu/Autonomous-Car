@@ -675,6 +675,74 @@ def _tem_simbolo(crop_gray: np.ndarray) -> bool:
     return minoria > 0.08
 
 
+# ================================================================
+#  [6a] PENEIRA DE QUALIDADE DE ROI — descarte precoce
+#
+#  Antes de gastar geometria/CNN, elimina regiões que NÃO podem
+#  ser uma placa legível. Cada teste é O(1) sobre um crop pequeno
+#  (~micro-segundos). Uma placa real passa nos 7; ruído cai já
+#  no primeiro que falhar. Retorna (ok: bool, motivo: str).
+# ================================================================
+
+# Limiares — ajustáveis; pensados p/ crop em escala de cinza [0,255]
+# Limiares calibrados sobre o octógono real do PARE (medido em
+# vídeo). A imagem da pista é P/B de alto contraste: placas são
+# escuras e cheias de borda, então os limites são TOLERANTES —
+# a peneira corta o lixo óbvio (sombra chapada, ruído sem
+# estrutura), não a placa legítima. A geometria + PGOM + CNN
+# fazem o corte fino depois.
+ROI_ESCURA_MIN   = 12     # brilho médio mínimo (buraco preto real)
+ROI_ESCURA_MAX   = 248    # brilho médio máximo (branco estourado)
+ROI_FOCO_MIN     = 25.0   # variância do Laplaciano (mín. do PARE = 32)
+ROI_BORDA_MIN    = 0.03   # fração mínima de borda (Sobel)
+ROI_TEXTURA_MAX  = 0.72   # densidade máx. de borda (PARE chega a 0.50)
+ROI_AREA_FRAC_MIN= 0.0008 # área mín. relativa ao frame
+ROI_AREA_FRAC_MAX= 0.25   # área máx. relativa ao frame
+
+_dbg_roi = dict(on=False, rej={})   # diagnóstico: motivos de descarte
+
+def peneira_roi(crop_gray: np.ndarray, area_rel: float,
+                exige_simbolo: bool = True) -> tuple:
+    """
+    7 descartes na ordem: tamanho → escura → clara → foco →
+    bordas fracas → textura complexa → sem símbolo interno.
+    """
+    if crop_gray is None or crop_gray.size == 0:
+        return False, "vazia"
+    h, w = crop_gray.shape[:2]
+    if h < 10 or w < 10:
+        return False, "muito pequena (px)"
+
+    # (1) tamanho relativo ao frame
+    if area_rel < ROI_AREA_FRAC_MIN:  return False, "muito pequena"
+    if area_rel > ROI_AREA_FRAC_MAX:  return False, "muito grande"
+
+    # (2) brilho médio — escura demais ou estourada
+    m = float(crop_gray.mean())
+    if m < ROI_ESCURA_MIN:            return False, "muito escura"
+    if m > ROI_ESCURA_MAX:            return False, "muito clara/estourada"
+
+    g = cv2.resize(crop_gray, (48, 48))
+
+    # (3) foco — variância do Laplaciano (nitidez)
+    foco = float(cv2.Laplacian(g, cv2.CV_64F).var())
+    if foco < ROI_FOCO_MIN:          return False, f"desfocada ({foco:.0f})"
+
+    # (4/5) densidade de bordas via Sobel
+    gx = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3)
+    mag = cv2.magnitude(gx, gy)
+    dens = float((mag > 60).mean())
+    if dens < ROI_BORDA_MIN:         return False, "sem bordas fortes"
+    if dens > ROI_TEXTURA_MAX:       return False, f"textura complexa ({dens:.2f})"
+
+    # (6) símbolo/estrutura interna (placa tem miolo; parede lisa não)
+    if exige_simbolo and not _tem_simbolo(crop_gray):
+        return False, "sem símbolo interno"
+
+    return True, "ok"
+
+
 def detectar_geometrico(gray: np.ndarray,
                         usar_canny: bool = False) -> list:
     """
@@ -724,11 +792,25 @@ def detectar_geometrico(gray: np.ndarray,
                 # circularidade alta e proporção ~quadrada
                 hint = "Stop"
             if hint is None: continue
+
+            # ── PENEIRA DE QUALIDADE DE ROI ──────────────────────
+            # Descarte precoce: escura/desfocada/sem borda/textura
+            # complexa/tamanho errado/sem símbolo → fora, antes da
+            # CNN. Semáforo dispensa o teste de símbolo (o miolo
+            # dele são os 3 faróis, não texto).
+            crop_roi = sub[y:y+bh, x:x+bw]
+            area_rel = (bw*bh) / float(h*w)
+            ok, motivo = peneira_roi(crop_roi, area_rel,
+                                     exige_simbolo=(hint != "Semaforo"))
+            if not ok:
+                if usar_canny is False and _dbg_roi["on"]:
+                    _dbg_roi["rej"][motivo] = _dbg_roi["rej"].get(motivo,0)+1
+                continue
+
             gx, gy = x + x0, y + y0            # volta p/ coord. global
-            # Hierarquia de contornos: símbolo/estrutura interna
-            # (texto do PARE, seta da placa, faróis do semáforo)
-            simb = _tem_simbolo(sub[y:y+bh, x:x+bw]) \
-                   if hint != "Semaforo" else True
+            # Símbolo interno já validado pela peneira (placas);
+            # semáforo entra como True.
+            simb = (hint == "Semaforo") or True
             cands.append({"bbox": (gx, gy, gx+bw, gy+bh),
                           "class_name": hint, "class_id": -1,
                           "conf": float(solid), "geo": True,
