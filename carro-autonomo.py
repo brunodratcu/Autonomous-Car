@@ -1110,17 +1110,16 @@ def desenhar(frame_e, tracks, fps, modo, debug_thr):
     t("── ÚLTIMO ──",18,(60,60,60))
     ult = _nav["ultimo"] or "-"
     t(f" {ult}",19,COR_ACAO.get(ult,(160,160,160)))
-    # O mesmo QR do trajeto aparece em TODA parada do carro
-    parado = MISSAO.estado in ("ESPERA_QR","SELECIONANDO","PARADO_PARE",
-                               "PARADO_SEM","PARADO_OBST","ENTREGANDO")
-    if parado and MISSAO.qr_img is not None:
+    # O QR existe SÓ enquanto não há destino. Assim que o pedido chega
+    # ele some e não reaparece nas paradas do trajeto (semáforo, PARE,
+    # obstáculo) — só volta depois que a entrega é concluída.
+    if MISSAO.destino is None and MISSAO.qr_img is not None \
+       and MISSAO.estado in ("ESPERA_QR", "SELECIONANDO"):
         q = MISSAO.qr_img; qh, qw = q.shape[:2]
         qy, qx = (h-qh)//2, (w-qw)//2
         if qy >= 0 and qx >= 0:
-            rot = ("ESCANEIE — destino A/B/C" if MISSAO.destino is None
-                   else f"ENTREGA: PONTO {MISSAO.destino}")
             cv2.rectangle(out,(qx-14,qy-40),(qx+qw+14,qy+qh+14),(255,255,255),-1)
-            cv2.putText(out,rot,(qx-10,qy-14),
+            cv2.putText(out,"ESCANEIE — destino A/B/C",(qx-10,qy-14),
                         cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,0,0),2)
             out[qy:qy+qh, qx:qx+qw] = q
     vis = np.empty((h,w+PW,3),np.uint8)
@@ -1226,6 +1225,8 @@ def main(usar_camera=False, debug=False, auto=False, fast=False, usar_yolo=False
         print("[MISSAO] Auto-start — pula a espera do QR", flush=True)
         MISSAO.destino = "A"
         MISSAO.set_estado("RODANDO"); seguir(_ser, com_buzzer=False)
+    else:
+        MISSAO.nova_sessao()   # carro liga → uma sessão, um token, um QR
     frame_e = None; debug_thr = None
     print("[OK] Q=sair  SPACE=pausa  1/2/3=destino A/B/C (fallback)  "
           "R=reset missão  F=flip câmera", flush=True)
@@ -1298,9 +1299,9 @@ def main(usar_camera=False, debug=False, auto=False, fast=False, usar_yolo=False
                 MISSAO.set_estado("ESPERA_QR")
 
             elif est == "ESPERA_QR":
-                # 7 segundos parado antes de oferecer a seleção
+                # 7 segundos parado antes de exibir o QR já gerado
                 if MISSAO.tempo_no_estado() >= ESPERA_QR_S:
-                    if MISSAO.sessao is None:      # um QR por trajeto
+                    if MISSAO.sessao is None:
                         MISSAO.nova_sessao()
                     enviar_telemetria(None, "qr_exibido")
                     MISSAO.set_estado("SELECIONANDO")
@@ -1347,9 +1348,10 @@ def main(usar_camera=False, debug=False, auto=False, fast=False, usar_yolo=False
                     print(f"[MISSAO] ✅ Pacote entregue em {MISSAO.destino} "
                           f"(total: {MISSAO.entregas})", flush=True)
                     MISSAO.destino = None
-                    MISSAO.sessao  = None    # trajeto encerrado → QR novo
+                    MISSAO.sessao  = None
                     MISSAO.qr_img  = None
-                    MISSAO.set_estado("ESPERA_QR")   # pronto p/ próximo pedido
+                    MISSAO.nova_sessao()   # missão nova → QR novo
+                    MISSAO.set_estado("ESPERA_QR")
                     parar(_ser, "(aguardando novo pedido)")
             modo = det_modo
         disp = frame_e if frame_e is not None else cv2.resize(frame_raw,(IMG_W,int(frame_raw.shape[0]*IMG_W/frame_raw.shape[1])))
