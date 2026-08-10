@@ -66,14 +66,14 @@ AREA_CNT_MAX = 55_000
 # esperando rede.
 MQTT_BROKER      = "broker.hivemq.com"        # broker público genérico p/ teste
 MQTT_PORT        = 1883
-MQTT_TOPIC_DEST  = "171garage/carro/destino"  # payload esperado: {"destino":"A"}
+MQTT_TOPIC_DEST  = "171garage/k7f2x9/destino"  # payload esperado: {"destino":"A"}
 MQTT_USER        = None
 MQTT_PASS        = None
 
-TELEMETRY_URL    = "https://httpbin.org/post" # placeholder — troque pela URL real
+TELEMETRY_URL    = "https://171-garage-production.up.railway.app/telemtria" # placeholder — troque pela URL real
 TELEMETRY_TIMEOUT_S = 2.0
 
-QR_BASE_URL      = "https://171garage.example.com/select"  # placeholder
+QR_BASE_URL      = "https://171-garage-production.up.railway.app/select"  # placeholder
 CAR_ID           = "171"
 
 ESPERA_QR_S      = 7.0    # segundos parado antes de mostrar o QR
