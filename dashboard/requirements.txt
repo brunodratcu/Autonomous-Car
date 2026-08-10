@@ -1,0 +1,3 @@
+Flask==3.0.3
+paho-mqtt==1.6.1
+gunicorn==22.0.0
