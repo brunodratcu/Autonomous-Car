@@ -70,7 +70,7 @@ MQTT_TOPIC_DEST  = "171garage/k7f2x9/destino"  # payload esperado: {"destino":"A
 MQTT_USER        = None
 MQTT_PASS        = None
 
-TELEMETRY_URL    = "https://171-garage-production.up.railway.app/telemtria" # placeholder — troque pela URL real
+TELEMETRY_URL    = "https://171-garage-production.up.railway.app/api/telemtria" # placeholder — troque pela URL real
 TELEMETRY_TIMEOUT_S = 2.0
 
 QR_BASE_URL      = "https://171-garage-production.up.railway.app/select"  # placeholder
