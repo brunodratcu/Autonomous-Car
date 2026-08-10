@@ -70,7 +70,7 @@ MQTT_TOPIC_DEST  = "171garage/k7f2x9/destino"  # payload esperado: {"destino":"A
 MQTT_USER        = None
 MQTT_PASS        = None
 
-TELEMETRY_URL    = "https://171-garage-production.up.railway.app/api/telemtria" # placeholder — troque pela URL real
+TELEMETRY_URL    = "https://171-garage-production.up.railway.app/api/telemetria" # placeholder — troque pela URL real
 TELEMETRY_TIMEOUT_S = 2.0
 
 QR_BASE_URL      = "https://171-garage-production.up.railway.app/select"  # placeholder
@@ -178,6 +178,16 @@ class Missao:
         self.t_estado  = time.monotonic()
         self.entregas  = 0
         self.qr_img    = None
+        self.sessao    = None
+
+    def nova_sessao(self):
+        """Um QR por trajeto: gera o token e a imagem UMA vez.
+        O mesmo QR é reexibido em todas as paradas até a entrega."""
+        import secrets
+        self.sessao = secrets.token_urlsafe(5)
+        url = f"{QR_BASE_URL}?car={CAR_ID}&s={self.sessao}"
+        self.qr_img = gerar_qr(url)
+        print(f"[QR] sessão {self.sessao} → {url}", flush=True)
 
     def set_estado(self, novo):
         if novo != self.estado:
@@ -1100,13 +1110,17 @@ def desenhar(frame_e, tracks, fps, modo, debug_thr):
     t("── ÚLTIMO ──",18,(60,60,60))
     ult = _nav["ultimo"] or "-"
     t(f" {ult}",19,COR_ACAO.get(ult,(160,160,160)))
-    # QR sobreposto no centro quando aguardando seleção de destino
-    if MISSAO.estado == "SELECIONANDO" and MISSAO.qr_img is not None:
+    # O mesmo QR do trajeto aparece em TODA parada do carro
+    parado = MISSAO.estado in ("ESPERA_QR","SELECIONANDO","PARADO_PARE",
+                               "PARADO_SEM","PARADO_OBST","ENTREGANDO")
+    if parado and MISSAO.qr_img is not None:
         q = MISSAO.qr_img; qh, qw = q.shape[:2]
         qy, qx = (h-qh)//2, (w-qw)//2
         if qy >= 0 and qx >= 0:
+            rot = ("ESCANEIE — destino A/B/C" if MISSAO.destino is None
+                   else f"ENTREGA: PONTO {MISSAO.destino}")
             cv2.rectangle(out,(qx-14,qy-40),(qx+qw+14,qy+qh+14),(255,255,255),-1)
-            cv2.putText(out,"ESCANEIE — destino A/B/C",(qx-10,qy-14),
+            cv2.putText(out,rot,(qx-10,qy-14),
                         cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,0,0),2)
             out[qy:qy+qh, qx:qx+qw] = q
     vis = np.empty((h,w+PW,3),np.uint8)
@@ -1192,6 +1206,11 @@ def main(usar_camera=False, debug=False, auto=False, fast=False, usar_yolo=False
         except Exception as e: print(f"[WARN] YOLO: {e}", flush=True)
     elif usar_yolo: print(f"[WARN] --yolo pedido mas {YOLO_MODEL} não existe → GEO", flush=True)
     print(f"[DET] Detector principal: {modo}", flush=True)
+    print(f"[CFG] MQTT     : {MQTT_BROKER}:{MQTT_PORT} → {MQTT_TOPIC_DEST}", flush=True)
+    print(f"[CFG] TELEMETRIA: {TELEMETRY_URL}", flush=True)
+    print(f"[CFG] QR        : {QR_BASE_URL}", flush=True)
+    if "example.com" in QR_BASE_URL or "httpbin" in TELEMETRY_URL:
+        print("[CFG] ⚠ AINDA HÁ PLACEHOLDER — troque as linhas 73/76!", flush=True)
     abc    = DetectorABC()      # marcadores A/B/C (geométrico, sem CNN)
     canal  = CanalDestino()     # destino via MQTT do app externo
     tracker = ByteTrackLite()
@@ -1281,7 +1300,8 @@ def main(usar_camera=False, debug=False, auto=False, fast=False, usar_yolo=False
             elif est == "ESPERA_QR":
                 # 7 segundos parado antes de oferecer a seleção
                 if MISSAO.tempo_no_estado() >= ESPERA_QR_S:
-                    MISSAO.qr_img = gerar_qr(f"{QR_BASE_URL}?car={CAR_ID}&t={int(time.time())}")
+                    if MISSAO.sessao is None:      # um QR por trajeto
+                        MISSAO.nova_sessao()
                     enviar_telemetria(None, "qr_exibido")
                     MISSAO.set_estado("SELECIONANDO")
 
@@ -1327,6 +1347,8 @@ def main(usar_camera=False, debug=False, auto=False, fast=False, usar_yolo=False
                     print(f"[MISSAO] ✅ Pacote entregue em {MISSAO.destino} "
                           f"(total: {MISSAO.entregas})", flush=True)
                     MISSAO.destino = None
+                    MISSAO.sessao  = None    # trajeto encerrado → QR novo
+                    MISSAO.qr_img  = None
                     MISSAO.set_estado("ESPERA_QR")   # pronto p/ próximo pedido
                     parar(_ser, "(aguardando novo pedido)")
             modo = det_modo
@@ -1371,5 +1393,3 @@ if __name__=="__main__":
                 print("[ERRO] use: --cam-idx N  (ex.: --cam-idx 1)"); sys.exit(1)
         main(usar_camera="--cam" in args, debug="--debug" in args, auto="--auto" in args,
              fast="--fast" in args, usar_yolo="--yolo" in args, usar_canny="--canny" in args, cam_idx=cam_idx)
-
-       
