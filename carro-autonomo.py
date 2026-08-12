@@ -57,35 +57,80 @@ ROI_Y1 = 0.92
 AREA_CNT_MIN = 500
 AREA_CNT_MAX = 55_000
 
-# ── DELIVERY / MQTT / TELEMETRIA / QR ──────────────────────────
-# Valores GENÉRICOS de exemplo — troque pelos dados reais do seu
-# sistema (broker MQTT, endpoint REST, URL do app de seleção).
-# Nada aqui trava o carro se o sistema externo estiver fora do ar:
-# MQTT e telemetria rodam em thread própria, com timeout curto e
-# fallback silencioso (best-effort) — a missão NUNCA fica presa
-# esperando rede.
-MQTT_BROKER      = "broker.hivemq.com"        # broker público genérico p/ teste
-MQTT_PORT        = 1883
-MQTT_TOPIC_DEST  = "171garage/k7f2x9/destino"  # payload esperado: {"destino":"A"}
-MQTT_USER        = None
-MQTT_PASS        = None
+# ── PAINEL LOCAL — abre só de escanear o QR, sem instalar nada ──
+# O laptop (ou o roteador de viagem) cria uma rede Wi-Fi local e o
+# script sobe um servidor HTTP nela. Não usa internet — o QR guarda
+# a URL local; o celular escaneia, o navegador abre sozinho.
+PAINEL_PORTA = 8000
+CAR_ID       = "171"
 
-TELEMETRY_URL    = "https://171-garage-production.up.railway.app/api/telemetria" # placeholder — troque pela URL real
-TELEMETRY_TIMEOUT_S = 2.0
+# ── PERFIL DE REDE — troque SÓ ESTA LINHA para alternar entre os
+# dois cenários. Nada mais no código muda.
+#
+#   "notebook" → Hotspot Móvel do próprio Windows.
+#                Configurações → Rede e Internet → Ponto de acesso
+#                móvel → Editar → mesmo SSID/senha daqui embaixo.
+#                Gateway sempre 192.168.137.1, em qualquer notebook.
+#
+#   "tplink"   → roteador de viagem TP-Link TL-MR3020 (ou similar),
+#                interruptor físico no modo AP. Configure o SSID/
+#                senha pela página 192.168.0.254 (ou tplinkwifi.net)
+#                uma vez; gateway de fábrica é 192.168.0.1.
+#
+# Nos dois casos o script descobre o IP real sozinho a cada boot —
+# só o "gateway_chute" abaixo muda pra achar a interface certa mais
+# rápido quando o notebook tem mais de uma rede ativa ao mesmo tempo.
+REDE_PERFIL = "notebook"
 
-QR_BASE_URL      = "https://171-garage-production.up.railway.app/select"  # placeholder
-CAR_ID           = "171"
+_PERFIS_REDE = {
+    "notebook": dict(ssid="DESKTOP-9KJT2OQ 1785", senha="3o@7U973",
+                     gateway_chute="192.168.137.1"),
+    "tplink":   dict(ssid="171Garage", senha="garagem171",
+                     gateway_chute="192.168.0.1"),
+}
+if REDE_PERFIL not in _PERFIS_REDE:
+    raise SystemExit(f"[CFG] REDE_PERFIL={REDE_PERFIL!r} inválido — "
+                     f"use um de {list(_PERFIS_REDE)}")
+WIFI_SSID = _PERFIS_REDE[REDE_PERFIL]["ssid"]
+WIFI_PASS = _PERFIS_REDE[REDE_PERFIL]["senha"]
+
+
 
 ESPERA_QR_S      = 7.0    # segundos parado antes de mostrar o QR
 ESPERA_ENTREGA_S = 7.0    # segundos parado entregando o pacote
 BUZ_PARTIDA_S    = 0.4    # beep curto ao sair
 BUZ_ENTREGA_S    = 1.2    # beep longo ao entregar
 
+# ── PLACAS DE LETRA A/B/C (pontos de entrega) ──────────────────
+# Placa CIRCULAR branca, anel preto, letra preta ao centro.
+# Reconhecimento por TEMPLATE MATCHING: os moldes são gerados com
+# a MESMA fonte usada na impressão, então o casamento é direto.
+# Sem OCR: Tesseract acertou 73% e levou 123ms; template acerta
+# ~100% em 0.4ms (medido com desfoque, rotação e escala da pista).
+LETRA_FONTE      = cv2.FONT_HERSHEY_SIMPLEX
+LETRA_ESCALA     = 4.5     # usada na geração do molde e da impressão
+LETRA_ESPESSURA  = 12
+LETRAS_PONTOS    = ["A", "B", "C"]
+
+# ── PONTOS A/B/C ───────────────────────────────────────────────
+# "aruco": marcadores binários ArUco (IDs 0/1/2 → A/B/C) — modo atual
+# "letras": placa circular com letra (template matching) — para depois
+PONTO_MODO        = "aruco"
 ARUCO_DICT        = "DICT_4X4_50"
 ARUCO_ID_TO_PONTO = {0: "A", 1: "B", 2: "C"}
-ARUCO_MATCH_DIST  = 40    # px — considera "chegou no marcador" com o
-                          # centro do marcador dentro dessa distância
-                          # do centro do frame (marcador bem à frente)
+
+AREA_MIN_LETRA   = 900     # área mínima da placa p/ considerar "cheguei"
+# Leitura da letra (o portão de forma está em FORMA_* mais abaixo).
+# Limiares MEDIDOS (placa real x distrator circular aleatório):
+#   score: real ≥0.720 · distrator ≤0.675  ·  tinta: real 0.33–0.47
+LETRA_SCORE_MIN  = 0.70    # casamento mínimo com o molde
+LETRA_SCORE_FORTE= 0.80    # acima disto a letra vence o veto de forma
+LETRA_MARGEM_MIN = 0.06    # vantagem sobre a 2ª letra (o "C" fica em 0.08)
+LETRA_TINTA_MIN  = 0.20    # fração de preto no miolo — uma letra ocupa
+LETRA_TINTA_MAX  = 0.55    # ~1/3; disco liso fica fora da faixa
+LETRA_MAX_CANDS  = 6       # teto de leituras de letra por frame
+LETRA_VOTOS_N    = 5       # janela de votação temporal
+LETRA_VOTOS_MIN  = 3       # confirmações necessárias dentro da janela
 
 K_SHARP = np.array([[0,-1,0],[-1,5,-1],[0,-1,0]], dtype=np.float32)
 K3 = np.ones((3,3), np.uint8)
@@ -162,32 +207,52 @@ def cor_semaforo(crop_bgr):
 
 class Missao:
     """
-    Estados:
-      AGUARDANDO   — parado, ainda sem contar o tempo do QR
-      ESPERA_QR    — parado, contando ESPERA_QR_S antes de exibir o QR
-      SELECIONANDO — QR na tela, aguardando destino (MQTT ou 1/2/3)
-      RODANDO      — em cruzeiro rumo ao destino
-      PARADO_PARE  — parado por placa PARE (regra absoluta)
-      PARADO_SEM   — parado por semáforo vermelho (regra absoluta)
-      PARADO_OBST  — parado por obstáculo (regra absoluta)
-      ENTREGANDO   — no ponto de destino, 7s parado entregando
+    ESTADOS:
+      AGUARDANDO       parado, QR no canto, sem retirada definida
+      IND_RETIRADA     rodando até o ponto de retirada
+      RETIRANDO        parado 7s pegando o pacote
+      AGUARDA_ENTREGA  parado na retirada, esperando escolha da entrega
+                       (o MESMO QR/sessão continua valendo)
+      IND_ENTREGA      rodando até o ponto de entrega
+      ENTREGANDO       parado 7s entregando
+      LIVRE            missão cumprida — CONTINUA ANDANDO em cruzeiro,
+                       aceitando nova missão a qualquer momento
+      PARADO_PARE / PARADO_SEM / PARADO_OBST   regras absolutas;
+                       guardam o estado de retorno para retomar a rota
+      DESLIGADO        motores cortados por comando (LIGAR religa)
     """
+    RODANDO_STATES = ("IND_RETIRADA", "IND_ENTREGA", "LIVRE")
+
     def __init__(self):
         self.estado    = "AGUARDANDO"
-        self.destino   = None
+        self.retirada  = None
+        self.entrega   = None
+        self.fase      = "retirada"      # o que falta cumprir
+        self.retorno   = "LIVRE"         # p/ onde voltar após parada absoluta
         self.t_estado  = time.monotonic()
         self.entregas  = 0
-        self.qr_img    = None
+        self.qr_img    = None      # QR 2: abre o painel (URL local)
+        self.qr_wifi   = None      # QR 1: entra na rede (sem senha digitada)
         self.sessao    = None
 
     def nova_sessao(self):
-        """Um QR por trajeto: gera o token e a imagem UMA vez.
-        O mesmo QR é reexibido em todas as paradas até a entrega."""
+        """UMA sessão por ligada do carro. Dois QRs ficam no canto do
+        display o tempo todo:
+          1) Wi-Fi  — a Câmera do celular reconhece o formato WIFI:
+             nativamente e oferece 'Entrar na rede?' sem app nenhum.
+          2) Painel — depois de conectado, abre a URL local com os
+             botões de retirada/entrega.
+        Não existe um único QR que faça as duas coisas numa ação só
+        (são padrões diferentes); dois QRs pequenos lado a lado é o
+        caminho mais confiável nos dois sistemas (iOS e Android)."""
         import secrets
-        self.sessao = secrets.token_urlsafe(5)
-        url = f"{QR_BASE_URL}?car={CAR_ID}&s={self.sessao}"
-        self.qr_img = gerar_qr(url)
-        print(f"[QR] sessão {self.sessao} → {url}", flush=True)
+        self.sessao = secrets.token_urlsafe(4)
+        url = BT.url if (BT is not None and getattr(BT, "url", None)) \
+              else f"http://{PainelLocal._meu_ip()}:{PAINEL_PORTA}/"
+        self.qr_wifi = gerar_qr_wifi(WIFI_SSID, WIFI_PASS, lado=120)
+        self.qr_img  = gerar_qr(url, lado=120)
+        print(f"[QR] sessão {self.sessao} — Wi-Fi '{WIFI_SSID}' → painel {url}",
+              flush=True)
 
     def set_estado(self, novo):
         if novo != self.estado:
@@ -201,19 +266,35 @@ class Missao:
     def parado_por_regra(self):
         return self.estado in ("PARADO_PARE", "PARADO_SEM", "PARADO_OBST")
 
-    @staticmethod
-    def regra_absoluta(percep):
-        """Retorna o motivo de parada obrigatória, ou None.
-        Ordem de severidade: obstáculo > vermelho > PARE."""
-        if percep.get("obstaculo"):            return "PARADO_OBST"
-        if percep.get("semaforo") == "vermelho": return "PARADO_SEM"
-        if percep.get("pare"):                 return "PARADO_PARE"
+    def alvo(self):
+        """Qual marcador interessa AGORA (o resto é ignorado)."""
+        if self.fase == "retirada" and self.retirada: return self.retirada
+        if self.fase == "entrega"  and self.entrega:  return self.entrega
         return None
 
-    def regra_ponto(self, ponto_visto):
-        """A/B/C: entrega se for o destino, senão continua."""
-        if ponto_visto is None or self.destino is None: return "continuar"
-        return "entregar" if ponto_visto == self.destino else "continuar"
+    def rota_txt(self):
+        r = self.retirada or "?"
+        e = self.entrega  or "?"
+        return f"{r}→{e}" + (f" [falta {self.fase}]" if self.alvo() or self.fase else "")
+
+    @staticmethod
+    def regra_absoluta(percep):
+        """obstáculo > vermelho > PARE — prioridade sobre a rota."""
+        if percep.get("obstaculo"):              return "PARADO_OBST"
+        if percep.get("semaforo") == "vermelho": return "PARADO_SEM"
+        if percep.get("pare"):                   return "PARADO_PARE"
+        return None
+
+    def status(self):
+        """As cinco perguntas do protocolo, numa linha só."""
+        posso   = "sim" if self.retirada else "nao (envie R:<ponto>)"
+        chegou  = "sim" if self.estado in ("RETIRANDO","ENTREGANDO") else "nao"
+        parado  = "sim" if (self.parado_por_regra() or
+                            self.estado in ("AGUARDANDO","AGUARDA_ENTREGA",
+                                            "RETIRANDO","ENTREGANDO","DESLIGADO")) else "nao"
+        return (f"ST;estado={self.estado};rota={self.retirada or '-'}"
+                f">{self.entrega or '-'};fase={self.fase};posso_iniciar={posso};"
+                f"cheguei={chegou};parado={parado};entregas={self.entregas}")
 
 MISSAO = Missao()
 COR_ACAO = {"STOP":(50,50,220),"OBSTACLE":(0,0,200),"STRAIGHT":(50,220,50)}
@@ -269,6 +350,7 @@ def conectar_serial():
         print(f"[SER] Simulação — {e}", flush=True); return None
 
 _seq = dict(n=0, pendente=None, t_envio=0.0)
+_ultimo_ponto = [None]   # última placa logada (evita repetir a linha)
 
 def enviar(cmd, ser):
     _seq["n"] += 1
@@ -471,71 +553,420 @@ def score_simetria(crop_gray) -> float:
     return float(np.clip(1.0 - diff*2.2, 0, 1))
 
 
+# ================================================================
+#  [2] PLACAS A/B/C — geometria + template matching, ZERO OCR
+#      Cada ponto de entrega tem uma placa quadrada impressa com
+#      a letra A, B ou C. O reconhecimento tem três estágios:
+#        1. acha o quadrado (contorno, 4 vértices, aspecto ~1)
+#        2. casa o miolo com os moldes A/B/C (matchTemplate)
+#        3. confirma por votação temporal (3 de 5 frames)
+#      Sem CNN e sem OCR — determinístico e ~0.4ms por frame.
+# ================================================================
+
+# ================================================================
+#  CLASSIFICADOR DE FORMA — árbitro único de toda a visão
+#  ─────────────────────────────────────────────────────────────
+#      CÍRCULO  → placa de delivery (A/B/C)
+#      OCTÓGONO → placa PARE
+#
+#  Por que não basta contar vértices: um círculo aproximado por
+#  approxPolyDP com eps=0.02*perímetro devolve EXATAMENTE 8 lados,
+#  igual ao octógono (medido). Circularidade e preenchimento também
+#  se sobrepõem sob desfoque. O que separa de verdade é o 8º
+#  HARMÔNICO do raio: o octógono tem 8 lóbulos periódicos, o
+#  círculo não tem nenhum.
+#      medido:  círculo  0.0033–0.0212
+#               octógono 0.0266–0.0335   (estável até 22° de giro)
+#  Entre as duas faixas há uma ZONA MORTA: ali a função devolve
+#  "?" em vez de chutar — melhor não classificar do que errar.
+# ================================================================
+
+# Portão de entrada LARGO: a placa chega inclinada, borrada, lavada.
+FORMA_AR_MIN     = 0.55    # inclinada de lado achata a bbox
+FORMA_AR_MAX     = 1.80
+FORMA_CIRC_MIN   = 0.68    # redondo "o suficiente"
+FORMA_CONVEX_MIN = 0.85    # descarta contorno recortado/irregular
+# Decisão entre as duas classes (8º harmônico do raio):
+FORMA_H8_CIRCULO = 0.022   # ≤ isto → círculo
+FORMA_H8_OCTOG   = 0.025   # ≥ isto → octógono   (entre os dois: "?")
+FORMA_CIRC_OCTOG = 0.85    # octógono só é declarado com contorno bem
+                           # formado (senão folha quadrada vira PARE)
+
+
+def harmonico_8(c, N=64):
+    """Força do 8º harmônico do raio r(θ). Exige contorno obtido com
+    CHAIN_APPROX_NONE — o SIMPLE guarda só os cantos e a medida perde
+    o sentido."""
+    if c is None or len(c) < 16: return None
+    M = cv2.moments(c)
+    if M["m00"] == 0: return None
+    cx, cy = M["m10"]/M["m00"], M["m01"]/M["m00"]
+    p  = c.reshape(-1, 2)
+    if len(p) > 360:                    # subamostra: 360 pontos bastam
+        p = p[::max(1, len(p)//360)]
+    p  = p.astype(np.float64)
+    th = np.arctan2(p[:,1]-cy, p[:,0]-cx)
+    r  = np.hypot(p[:,0]-cx, p[:,1]-cy)
+    o  = np.argsort(th); th, r = th[o], r[o]
+    grade = np.linspace(-np.pi, np.pi, N, endpoint=False)
+    rr = np.interp(grade, th, r, period=2*np.pi)
+    med = rr.mean()
+    if med <= 1e-6: return None
+    F = np.abs(np.fft.rfft(rr - med))
+    return float(F[8] / (med * N / 2))
+
+
+def classificar_forma(c, bw, bh, peri=None, area=None, circ=None):
+    """-> 'circulo' | 'octogono' | '?'   ÁRBITRO ÚNICO da visão.
+
+    O portão de entrada é LARGO de propósito: a placa pode chegar
+    inclinada (vira elipse), desfocada, lavada ou meio tapada. Quem
+    decide entre as duas classes é o 8º HARMÔNICO do raio, não a
+    contagem de vértices — um círculo também devolve 8 lados no
+    approxPolyDP, e era essa a origem do conflito PARE↔delivery.
+
+    Entre as duas faixas há uma ZONA MORTA que devolve '?'. Nela o
+    candidato ainda pode virar delivery, desde que a LETRA case com
+    folga: conteúdo vence forma duvidosa.
+    """
+    if peri is None: peri = cv2.arcLength(c, True)
+    if peri <= 0: return "?"
+    if area is None: area = cv2.contourArea(c)
+    ar = bw / max(bh, 1)
+    if not (FORMA_AR_MIN <= ar <= FORMA_AR_MAX): return "?"
+    if circ is None: circ = 4*np.pi*area / (peri*peri)
+    if circ < FORMA_CIRC_MIN: return "?"
+    convex = area / max(cv2.contourArea(cv2.convexHull(c)), 1)
+    if convex < FORMA_CONVEX_MIN: return "?"
+    h8 = harmonico_8(c)
+    if h8 is None: return "?"
+    # o octógono só é declarado com contorno bem formado — senão uma
+    # folha quadrada meio arredondada viraria PARE
+    if h8 >= FORMA_H8_OCTOG and circ >= FORMA_CIRC_OCTOG: return "octogono"
+    if h8 <= FORMA_H8_CIRCULO: return "circulo"
+    return "?"
+
+
 def detectar_geometrico(gray, usar_canny=False):
+    """VARREDURA ÚNICA:
+
+        segmentação → contornos → classificar_forma
+                            │
+              ┌─────────────┴─────────────┐
+           OCTÓGONO                    CÍRCULO
+              │                           │
+          candidato STOP            procurar letra
+        (perspectiva, simetria)      no miolo → A/B/C
+              │                           │
+              └──────► PGOM / votação ◄───┘
+
+    Devolve candidatos com class_name em {'Stop','Semaforo','Delivery'}.
+    Os de Delivery trazem também 'ponto' (A/B/C) e 'score'.
+    """
     h, w = gray.shape[:2]
     x0, y0, x1, y1 = ROI_DIN.janela(h, w)
     sub = gray[y0:y1, x0:x1]
     if sub.size == 0: return []
+
     cands = []
+    n_letra = [0]        # teto de leituras de letra por frame (custo)
     for m in segmentar(sub, usar_canny):
-        cnts, _ = cv2.findContours(m, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        # CHAIN_APPROX_NONE: classificar_forma() precisa da borda inteira
+        cnts, _ = cv2.findContours(m, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
         for c in cnts:
             a = cv2.contourArea(c)
             if a < GEO_AREA_MIN or a > GEO_AREA_FRAC*h*w: continue
             x, y, bw, bh = cv2.boundingRect(c)
+            if bw < 20 or bh < 20: continue
             ar = bw / max(bh, 1); solid = a / max(bw*bh, 1)
             if solid < 0.35: continue
             peri = cv2.arcLength(c, True)
             circ = 4*np.pi*a / max(peri*peri, 1)
-            approx = cv2.approxPolyDP(c, 0.02*peri, True)
-            nv = len(approx)
-            hull = cv2.convexHull(c)
-            convx = a / max(cv2.contourArea(hull), 1)
-            hint = None
-            if 0.25 < ar < 0.62 and bh > 50:
-                if _tem_farois(sub[y:y+bh, x:x+bw]): hint = "Semaforo"
-            elif 7 <= nv <= 9 and circ > 0.62 and 0.70 < ar < 1.40:
-                hint = "Stop"
-            if hint is None: continue
             crop_roi = sub[y:y+bh, x:x+bw]
+
+            # ── SEMÁFORO: retângulo vertical com faróis empilhados ──
+            if 0.25 < ar < 0.62 and bh > 50 and _tem_farois(crop_roi):
+                hint, forma, ponto, score = "Semaforo", "?", None, 0.0
+
+            else:
+                forma = classificar_forma(c, bw, bh, peri, a, circ)
+
+                # ── OCTÓGONO → PARE ────────────────────────────────
+                if forma == "octogono":
+                    hint, ponto, score = "Stop", None, 0.0
+
+                # ── CÍRCULO (ou forma duvidosa) → DELIVERY ─────────
+                elif forma in ("circulo", "?") and a >= AREA_MIN_LETRA:
+                    n_letra[0] += 1
+                    if n_letra[0] > LETRA_MAX_CANDS: continue
+                    ponto, score = LEITOR.ler(sub, c, (x, y, bw, bh))
+                    if ponto is None: continue
+                    # forma duvidosa só passa com letra FORTE
+                    if forma == "?" and score < LETRA_SCORE_FORTE: continue
+                    hint, forma = "Delivery", "circulo"
+                else:
+                    continue
+
+            # ── peneira comum (foco, brilho, bordas, símbolo) ──────
             area_rel = (bw*bh) / float(h*w)
-            ok, motivo = peneira_roi(crop_roi, area_rel, exige_simbolo=(hint != "Semaforo"))
+            ok, motivo = peneira_roi(crop_roi, area_rel,
+                                     exige_simbolo=(hint == "Stop"))
             if not ok:
                 if usar_canny is False and _dbg_roi["on"]:
                     _dbg_roi["rej"][motivo] = _dbg_roi["rej"].get(motivo,0)+1
                 continue
+
             gx, gy = x + x0, y + y0
-            simb = (hint == "Semaforo") or True
+            approx = cv2.approxPolyDP(c, 0.02*peri, True)
+            nv = len(approx)
+            convx = a / max(cv2.contourArea(cv2.convexHull(c)), 1)
             poly_l = approx.reshape(-1,2).tolist()
             if hint == "Stop":
                 s_persp = score_perspectiva_octogono(poly_l)
                 s_simet = score_simetria(crop_roi)
             else:
-                s_persp = s_simet = 1.0   # semáforo não usa esses testes
-            cands.append({"bbox": (gx, gy, gx+bw, gy+bh), "class_name": hint, "class_id": -1,
-                          "conf": float(solid), "geo": True, "lados": nv, "circ": float(circ),
-                          "ar": float(ar), "area": float(a), "convex": float(convx),
-                          "simbolo": bool(simb), "poly": poly_l,
-                          "persp": float(s_persp), "simet": float(s_simet)})
-    cands.sort(key=lambda d: -(d["bbox"][2]-d["bbox"][0])*(d["bbox"][3]-d["bbox"][1]))
+                s_persp = s_simet = 1.0
+            d = {"bbox": (gx, gy, gx+bw, gy+bh), "class_name": hint, "class_id": -1,
+                 "conf": float(solid), "geo": True, "lados": nv, "circ": float(circ),
+                 "ar": float(ar), "area": float(a), "convex": float(convx),
+                 "simbolo": True, "poly": poly_l, "forma": forma,
+                 "persp": float(s_persp), "simet": float(s_simet)}
+            if hint == "Delivery":
+                d["ponto"] = ponto; d["score"] = float(score)
+            cands.append(d)
+
+    # dedup por IoU sobre a UNIÃO — nunca por contenção, senão a folha
+    # branca (maior) engoliria o disco que está dentro dela
+    cands.sort(key=lambda d: -d["circ"])
     keep = []
     for d in cands:
+        ax1,ay1,ax2,ay2 = d["bbox"]
         dup = False
         for k in keep:
-            ax1,ay1,ax2,ay2 = d["bbox"]; bx1,by1,bx2,by2 = k["bbox"]
-            ix = max(0, min(ax2,bx2)-max(ax1,bx1)); iy = max(0, min(ay2,by2)-max(ay1,by1))
-            if ix*iy > 0.6*min((ax2-ax1)*(ay2-ay1), (bx2-bx1)*(by2-by1)): dup = True; break
+            bx1,by1,bx2,by2 = k["bbox"]
+            ix = max(0, min(ax2,bx2)-max(ax1,bx1))
+            iy = max(0, min(ay2,by2)-max(ay1,by1))
+            inter = ix*iy
+            uniao = (ax2-ax1)*(ay2-ay1) + (bx2-bx1)*(by2-by1) - inter
+            if inter > 0.70*max(uniao,1): dup = True; break
         if not dup: keep.append(d)
     return keep[:GEO_MAX_CANDS]
 
+
 # ================================================================
-#  [2] MARCADORES A/B/C — ArUco, 100% geométrico, ZERO CNN
-#      Cada ponto de entrega recebe um marcador impresso:
-#      ID 0 = ponto A · ID 1 = ponto B · ID 2 = ponto C
-#      Detecção determinística, robusta a rotação/escala/perspectiva.
+#  [2] PLACAS A/B/C — geometria + template matching, ZERO OCR
+#      Cada ponto de entrega tem uma placa quadrada impressa com
+#      a letra A, B ou C. O reconhecimento tem três estágios:
+#        1. acha o quadrado (contorno, 4 vértices, aspecto ~1)
+#        2. casa o miolo com os moldes A/B/C (matchTemplate)
+#        3. confirma por votação temporal (3 de 5 frames)
+#      Sem CNN e sem OCR — determinístico e ~0.4ms por frame.
 # ================================================================
 
+# ================================================================
+#  CLASSIFICADOR DE FORMA — árbitro único de toda a visão
+#  ─────────────────────────────────────────────────────────────
+#      CÍRCULO  → placa de delivery (A/B/C)
+#      OCTÓGONO → placa PARE
+#
+#  Por que não basta contar vértices: um círculo aproximado por
+#  approxPolyDP com eps=0.02*perímetro devolve EXATAMENTE 8 lados,
+#  igual ao octógono (medido). Circularidade e preenchimento também
+#  se sobrepõem sob desfoque. O que separa de verdade é o 8º
+#  HARMÔNICO do raio: o octógono tem 8 lóbulos periódicos, o
+#  círculo não tem nenhum.
+#      medido:  círculo  0.0033–0.0212
+#               octógono 0.0266–0.0335   (estável até 22° de giro)
+#  Entre as duas faixas há uma ZONA MORTA: ali a função devolve
+#  "?" em vez de chutar — melhor não classificar do que errar.
+# ================================================================
+
+# Portão de entrada LARGO: a placa chega inclinada, borrada, lavada.
+FORMA_AR_MIN     = 0.55    # inclinada de lado achata a bbox
+FORMA_AR_MAX     = 1.80
+FORMA_CIRC_MIN   = 0.68    # redondo "o suficiente"
+FORMA_CONVEX_MIN = 0.85    # descarta contorno recortado/irregular
+# Decisão entre as duas classes (8º harmônico do raio):
+FORMA_H8_CIRCULO = 0.022   # ≤ isto → círculo
+FORMA_H8_OCTOG   = 0.025   # ≥ isto → octógono   (entre os dois: "?")
+FORMA_CIRC_OCTOG = 0.85    # octógono só é declarado com contorno bem
+                           # formado (senão folha quadrada vira PARE)
+
+
+def harmonico_8(c, N=64):
+    """Força do 8º harmônico do raio r(θ). Exige contorno obtido com
+    CHAIN_APPROX_NONE — o SIMPLE guarda só os cantos e a medida perde
+    o sentido."""
+    if c is None or len(c) < 16: return None
+    M = cv2.moments(c)
+    if M["m00"] == 0: return None
+    cx, cy = M["m10"]/M["m00"], M["m01"]/M["m00"]
+    p  = c.reshape(-1, 2)
+    if len(p) > 360:                    # subamostra: 360 pontos bastam
+        p = p[::max(1, len(p)//360)]
+    p  = p.astype(np.float64)
+    th = np.arctan2(p[:,1]-cy, p[:,0]-cx)
+    r  = np.hypot(p[:,0]-cx, p[:,1]-cy)
+    o  = np.argsort(th); th, r = th[o], r[o]
+    grade = np.linspace(-np.pi, np.pi, N, endpoint=False)
+    rr = np.interp(grade, th, r, period=2*np.pi)
+    med = rr.mean()
+    if med <= 1e-6: return None
+    F = np.abs(np.fft.rfft(rr - med))
+    return float(F[8] / (med * N / 2))
+
+
+def _molde_letra(letra, lado=200, com_moldura=True):
+    """Placa CIRCULAR branca com anel preto e a letra ao centro.
+    Usada tanto para gerar o molde quanto o PNG de impressão.
+    A escala da fonte é PROPORCIONAL ao lado — sem isso o molde
+    (200px) e a impressão (700px) teriam proporções diferentes e
+    o template matching falharia na placa real."""
+    img = np.full((lado, lado), 255, np.uint8)
+    k    = lado / 200.0
+    c    = lado // 2
+    if com_moldura:
+        # disco branco com anel preto; fora do disco fica branco
+        cv2.circle(img, (c, c), int(c*0.94), 0, max(2, int(round(5*k))))
+    esc  = LETRA_ESCALA * k
+    espl = max(1, int(round(LETRA_ESPESSURA * k)))
+    (w, h), _ = cv2.getTextSize(letra, LETRA_FONTE, esc, espl)
+    cv2.putText(img, letra, ((lado-w)//2, (lado+h)//2),
+                LETRA_FONTE, esc, 0, espl)
+    return img
+
+
+def _mascara_circular(n=64, raio_frac=0.68):
+    """Máscara do miolo do disco — descarta o anel, que é igual
+    nas três placas e só polui o casamento."""
+    m = np.zeros((n, n), np.uint8)
+    cv2.circle(m, (n//2, n//2), int(n*raio_frac/2), 255, -1)
+    return m
+
+
+_MASC_CIRC = None
+
+def _binarizar_miolo(crop, n=64):
+    """Normaliza o recorte: 64x64, Otsu, e mantém só o miolo do
+    disco — o anel externo é idêntico nas três placas."""
+    global _MASC_CIRC
+    if _MASC_CIRC is None or _MASC_CIRC.shape[0] != n:
+        _MASC_CIRC = _mascara_circular(n)
+    g = cv2.resize(crop, (n, n))
+    _, b = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    b[_MASC_CIRC == 0] = 255      # tudo fora do miolo vira branco
+    return b
+
+
+class LeitorLetras:
+    """Lê a letra DENTRO de um candidato circular já encontrado pelo
+    detector geométrico. Não procura contornos — essa varredura é
+    única e vive em detectar_geometrico().
+
+        círculo → anel externo → miolo → letra → persistência
+    """
+
+    def __init__(self, debug=False):
+        self.moldes = {L: _binarizar_miolo(_molde_letra(L)) for L in LETRAS_PONTOS}
+        self.votos  = deque(maxlen=LETRA_VOTOS_N)
+        self.debug  = debug
+        self._fn    = 0
+        print(f"[ABC] Leitor de placas circulares — letras {LETRAS_PONTOS}", flush=True)
+
+    @staticmethod
+    def _retificar(sub, c, bbox, n=96):
+        """Elipse → círculo. Corrige a placa vista de lado antes de
+        casar com o molde. Só age quando o achatamento compensa: em
+        elipse leve + imagem borrada o fitEllipse erra e o esticamento
+        piora o casamento (medido: score cai de 0.86 para 0.42)."""
+        x, y, bw, bh = bbox
+        if len(c) >= 5:
+            try:
+                (cx, cy), (d1, d2), ang = cv2.fitEllipse(c)
+                maior, menor = max(d1, d2), max(min(d1, d2), 1.0)
+                if maior/menor > 1.15:
+                    if d1 < d2: ang += 90.0
+                    R = cv2.getRotationMatrix2D((cx, cy), ang, 1.0)
+                    borda = int(sub.mean())
+                    alin = cv2.warpAffine(sub, R, (sub.shape[1], sub.shape[0]),
+                                          borderValue=borda)
+                    k = maior/menor
+                    S = np.float32([[1, 0, 0], [0, k, (1-k)*cy]])
+                    circ = cv2.warpAffine(alin, S, (sub.shape[1], sub.shape[0]),
+                                          borderValue=borda)
+                    r = maior/2
+                    ax0, ay0 = max(0,int(cx-r)), max(0,int(cy-r))
+                    ax1 = min(circ.shape[1], int(cx+r)); ay1 = min(circ.shape[0], int(cy+r))
+                    crop = circ[ay0:ay1, ax0:ax1]
+                    if crop.size and crop.shape[0] > 15 and crop.shape[1] > 15:
+                        return cv2.resize(crop, (n, n))
+            except cv2.error:
+                pass
+        return None
+
+    def _casar(self, crop96):
+        """-> (letra, score, margem, tinta)"""
+        if crop96 is None or crop96.size == 0: return None, 0.0, 0.0, 0.0
+        b = _binarizar_miolo(crop96)
+        tinta = float((b[_MASC_CIRC > 0] == 0).mean())
+        notas = sorted(((float(cv2.matchTemplate(b, mo, cv2.TM_CCOEFF_NORMED).max()), L)
+                        for L, mo in self.moldes.items()), reverse=True)
+        (s1, L1), (s2, _) = notas[0], notas[1]
+        margem = s1 - s2
+        if not (LETRA_TINTA_MIN < tinta < LETRA_TINTA_MAX): return None, s1, margem, tinta
+        if s1 < LETRA_SCORE_MIN:      return None, s1, margem, tinta
+        if margem < LETRA_MARGEM_MIN: return None, s1, margem, tinta
+        return L1, s1, margem, tinta
+
+    def ler(self, sub, c, bbox):
+        """-> (letra, score).
+
+        Ordem pensada para o CUSTO: a retificação usa warpAffine, que
+        era 55% do tempo do detector quando rodava em todo candidato.
+        Agora ela só entra se o recorte cru já mostrou que ali existe
+        algo com cara de letra e mesmo assim não casou bem."""
+        x, y, bw, bh = bbox
+        cru = sub[y:y+bh, x:x+bw]
+        if cru.size == 0: return None, 0.0
+        cru = cv2.resize(cru, (96, 96))
+
+        # filtro barato: sem tinta de letra no miolo, nem tenta casar
+        tinta = float((_binarizar_miolo(cru)[_MASC_CIRC > 0] == 0).mean())
+        if not (LETRA_TINTA_MIN < tinta < LETRA_TINTA_MAX):
+            return None, 0.0
+
+        melhor = self._casar(cru)
+        if melhor[0] is None:              # cru não resolveu → retifica
+            ret = self._retificar(sub, c, bbox)
+            if ret is not None:
+                alt = self._casar(ret)
+                if alt[1] > melhor[1]: melhor = alt
+        L, sc, mg, ti = melhor
+        if self.debug:
+            self._fn += 1
+            if self._fn % 12 == 1:
+                print(f"[ABC?] {bw}x{bh} tinta={ti:.2f} score={sc:.2f} "
+                      f"margem={mg:.2f} → {L or 'rejeitado'}", flush=True)
+        return L, sc
+
+    def votar(self, entregas):
+        """Persistência: confirma a letra com LETRA_VOTOS_MIN de
+        LETRA_VOTOS_N frames. -> dict do candidato ou None."""
+        melhor = max(entregas, key=lambda d: d["area"]) if entregas else None
+        self.votos.append(melhor["ponto"] if melhor else None)
+        if melhor is None: return None
+        if list(self.votos).count(melhor["ponto"]) < LETRA_VOTOS_MIN: return None
+        return melhor
+
+
+LEITOR = LeitorLetras.__new__(LeitorLetras)   # substituído em main()
+
+
 class DetectorABC:
+    """Marcadores ArUco (IDs 0/1/2 → A/B/C) — modo binário atual.
+    Zero CNN, detecção determinística. Interface:
+    detectar(gray) -> [{'ponto','bbox','centro','area'}]"""
+
     def __init__(self):
         self.ok = False
         try:
@@ -543,17 +974,16 @@ class DetectorABC:
             try:   # OpenCV >= 4.7
                 self._det = cv2.aruco.ArucoDetector(d, cv2.aruco.DetectorParameters())
                 self._novo = True
-            except AttributeError:  # OpenCV < 4.7
+            except AttributeError:
                 self._dict = d
                 self._par  = cv2.aruco.DetectorParameters_create()
                 self._novo = False
             self.ok = True
             print(f"[ABC] ArUco {ARUCO_DICT} — IDs {ARUCO_ID_TO_PONTO}", flush=True)
         except Exception as e:
-            print(f"[ABC][WARN] ArUco indisponível ({e}) — pontos A/B/C desligados", flush=True)
+            print(f"[ABC][WARN] ArUco indisponível ({e})", flush=True)
 
-    def detectar(self, gray) -> list:
-        """Retorna [{'ponto':'A','bbox':(x1,y1,x2,y2),'centro':(cx,cy),'area':n}]"""
+    def detectar(self, gray):
         if not self.ok: return []
         try:
             if self._novo: corners, ids, _ = self._det.detectMarkers(gray)
@@ -565,34 +995,50 @@ class DetectorABC:
         for c, i in zip(corners, ids.flatten()):
             ponto = ARUCO_ID_TO_PONTO.get(int(i))
             if ponto is None: continue
-            p = c.reshape(-1, 2)
-            x1, y1 = p.min(axis=0); x2, y2 = p.max(axis=0)
+            pts = c.reshape(-1, 2)
+            x1, y1 = pts.min(axis=0); x2, y2 = pts.max(axis=0)
             saida.append({"ponto": ponto,
                           "bbox": (int(x1), int(y1), int(x2), int(y2)),
-                          "centro": (float(p[:,0].mean()), float(p[:,1].mean())),
+                          "centro": (float(pts[:,0].mean()), float(pts[:,1].mean())),
                           "area": float((x2-x1)*(y2-y1))})
         return saida
 
 
 def gerar_marcadores_abc(pasta="./marcadores_abc", px=700):
-    """python carro-autonomo.py --gerar-abc → PNGs prontos para imprimir."""
+    """python carro-autonomo.py --gerar-aruco → PNGs para imprimir."""
     os.makedirs(pasta, exist_ok=True)
     d = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, ARUCO_DICT))
     for mid, ponto in ARUCO_ID_TO_PONTO.items():
         try:   img = cv2.aruco.generateImageMarker(d, mid, px)
         except AttributeError: img = cv2.aruco.drawMarker(d, mid, px)
-        borda = px // 8   # margem branca obrigatória p/ detecção
+        borda = px // 8
         canvas = np.full((px+2*borda, px+2*borda), 255, np.uint8)
         canvas[borda:borda+px, borda:borda+px] = img
         canvas = cv2.copyMakeBorder(canvas, 0, 90, 0, 0, cv2.BORDER_CONSTANT, value=255)
         cv2.putText(canvas, f"PONTO {ponto}  (ID {mid})",
                     (borda, canvas.shape[0]-28), cv2.FONT_HERSHEY_SIMPLEX, 1.4, 0, 3)
-        caminho = os.path.join(pasta, f"ponto_{ponto}_id{mid}.png")
+        cv2.imwrite(os.path.join(pasta, f"ponto_{ponto}_id{mid}.png"), canvas)
+        print(f"[ABC] {pasta}/ponto_{ponto}_id{mid}.png", flush=True)
+    print("[ABC] margem branca faz parte do marcador — não corte.", flush=True)
+
+ABC = None   # instanciado em main()
+
+def gerar_placas_abc(pasta="./placas_abc", px=700):
+    """python carro-autonomo.py --gerar-abc → PNGs para imprimir."""
+    os.makedirs(pasta, exist_ok=True)
+    for L in LETRAS_PONTOS:
+        img = _molde_letra(L, lado=px)
+        canvas = cv2.copyMakeBorder(img, 40, 110, 40, 40,
+                                    cv2.BORDER_CONSTANT, value=255)
+        cv2.putText(canvas, f"PONTO {L}", (46, canvas.shape[0]-34),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.5, 0, 3)
+        caminho = os.path.join(pasta, f"ponto_{L}.png")
         cv2.imwrite(caminho, canvas)
         print(f"[ABC] {caminho}", flush=True)
-    print(f"\n[ABC] Imprima em ~10x10cm. Mantenha a margem branca — ela é\n"
-          f"      parte do marcador. Fixe na altura da câmera, perpendicular\n"
-          f"      à pista, num ponto onde o carro passe de frente.", flush=True)
+    print("\n[ABC] Imprima em ~15cm de DIÂMETRO, papel FOSCO.\n"
+          "      Recorte no QUADRADO (fundo branco em volta) ou deixe\n"
+          "      a folha inteira — NÃO recorte rente ao anel preto.\n"
+          "      Fixe na altura da câmera, perpendicular à pista.", flush=True)
 
 PGOM_PROMOVE = 0.85
 PGOM_PROMOVE_SEM = 0.72
@@ -821,17 +1267,24 @@ def carregar_classes():
     return CLASSES
 
 class VerificadorPlaca:
-    FORMA_CLASSE = {"Stop": {"octogono"}}
+    # Contrato forma ↔ classe. Uma classe só é aceita se a geometria
+    # concordar. Delivery (A/B/C) não passa pela CNN — está aqui como
+    # documentação do contrato e para validar candidatos do YOLO.
+    FORMA_CLASSE = {
+        "Stop": {"octogono"},
+        "A":    {"circulo"},
+        "B":    {"circulo"},
+        "C":    {"circulo"},
+    }
+
     def __init__(self, margem=0.25, entropia_max=1.30):
         self.margem_min = margem; self.entropia_max = entropia_max
+
     @staticmethod
     def _forma_geo(det):
-        nv, circ = det.get("lados",0), det.get("circ",0)
-        if 7 <= nv <= 9 and circ > 0.62: return "octogono"
-        if nv == 3: return "triangulo"
-        if nv >= 6 and circ > 0.70: return "circulo"
-        if nv in (4,5): return "retangulo"
-        return "?"
+        """A forma já foi decidida por classificar_forma() na detecção.
+        Não reclassifica aqui — árbitro único."""
+        return det.get("forma", "?")
     def e_placa(self, scores, cls_nm, det):
         ordenado = np.sort(scores)[::-1]
         top1 = float(ordenado[0]); top2 = float(ordenado[1]) if len(ordenado) > 1 else 0.0
@@ -845,6 +1298,32 @@ class VerificadorPlaca:
             fg = self._forma_geo(det)
             if fg != "?" and fg not in esperadas: return False, f"forma {fg}!={cls_nm}", margem
         return True, "ok", margem
+
+def geometria_concorda(gray, det) -> bool:
+    """YOLO auxiliar: a geometria valida ou descarta o candidato.
+
+        YOLO diz STOP → é octógono? NÃO → descarta · SIM → aceita
+
+    Classes sem contrato de forma (Carro, Pessoa, Cone, Semaforo)
+    passam direto — não são placas e não têm forma esperada."""
+    esperadas = VerificadorPlaca.FORMA_CLASSE.get(det.get("class_name"))
+    if esperadas is None: return True
+    x1, y1, x2, y2 = det["bbox"]
+    m = 4                                  # folga: o box do YOLO corta a borda
+    x1 = max(0, x1-m); y1 = max(0, y1-m)
+    x2 = min(gray.shape[1], x2+m); y2 = min(gray.shape[0], y2+m)
+    crop = gray[y1:y2, x1:x2]
+    if crop.size == 0 or crop.shape[0] < 16 or crop.shape[1] < 16: return False
+    _, b = cv2.threshold(crop, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    b = cv2.morphologyEx(b, cv2.MORPH_CLOSE, K5)
+    cnts, _ = cv2.findContours(b, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not cnts: return False
+    c = max(cnts, key=cv2.contourArea)
+    _, _, bw, bh = cv2.boundingRect(c)
+    forma = classificar_forma(c, bw, bh)
+    det["forma"] = forma
+    return forma in esperadas
+
 
 class OODRejector:
     def __init__(self, path):
@@ -945,73 +1424,175 @@ class ByteTrackLite:
 #      continua operando normalmente (fallback: teclas 1/2/3).
 # ================================================================
 
-class CanalDestino:
-    """Escuta o destino escolhido no app externo, via MQTT."""
-    def __init__(self):
-        self.destino = None
-        self.conectado = False
-        self._cli = None
+PAGINA = """<!doctype html><html lang=pt-BR><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>171 Garage</title><style>
+body{background:#141414;color:#f2f2f2;font-family:system-ui,sans-serif;
+     margin:0;padding:24px 18px;max-width:420px;margin:auto}
+h2{font-size:15px;color:#8a8a8a;font-weight:600;margin:26px 0 10px;
+   letter-spacing:.04em;text-transform:uppercase}
+.eq{text-align:center;font-size:12px;letter-spacing:.2em;color:#8a8a8a;
+    text-transform:uppercase;padding-bottom:14px;border-bottom:1px solid #333}
+.g{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+button{background:#1e1e1e;color:#f2f2f2;border:1px solid #333;border-radius:12px;
+   padding:22px 0;font-size:26px;font-weight:700;font-family:inherit;cursor:pointer}
+button:active{background:#262626}
+button.on{background:#22a45d;border-color:#22a45d}
+.off{grid-column:1/-1;font-size:15px;padding:15px 0;border-color:#c4341c;color:#c4341c}
+#st{margin-top:22px;padding-top:14px;border-top:1px solid #333;
+    font-size:13px;color:#8a8a8a;line-height:1.7;white-space:pre-line}
+</style>
+<div class=eq>171 Garage &middot; Carro CAR_ID_AQUI</div>
+<h2>Retirar o pacote em</h2>
+<div class=g id=r></div>
+<h2>Entregar em</h2>
+<div class=g id=e></div>
+<div class=g style="margin-top:18px">
+  <button class=off onclick="cmd('off')">Desligar motores</button>
+</div>
+<div id=st>carregando...</div>
+<script>
+for (const [id,tipo] of [['r','R'],['e','E']])
+  for (const L of ['A','B','C']) {
+    const b=document.createElement('button');
+    b.textContent=L; b.id=tipo+L;
+    b.onclick=()=>cmd(tipo.toLowerCase(),L);
+    document.getElementById(id).appendChild(b);
+  }
+async function cmd(a,p){
+  try{ pinta(await (await fetch(`/cmd?a=${a}&p=${p||''}`)).json()); }
+  catch(e){ document.getElementById('st').textContent='sem conexao com o carro'; }
+}
+function pinta(d){
+  for(const b of document.querySelectorAll('button')) b.classList.remove('on');
+  if(d.retirada) document.getElementById('R'+d.retirada)?.classList.add('on');
+  if(d.entrega)  document.getElementById('E'+d.entrega)?.classList.add('on');
+  document.getElementById('st').textContent =
+    `estado: ${d.estado}\nrota: ${d.retirada||'-'} para ${d.entrega||'-'}`+
+    `\nfalta: ${d.fase}\nentregas: ${d.entregas}`;
+}
+setInterval(()=>cmd('status'),1500); cmd('status');
+</script></html>"""
+
+
+class PainelLocal:
+    """Servidor HTTP na rede do próprio laptop (ponto de acesso, sem
+    internet). O celular escaneia o QR, o navegador abre a página
+    sozinho — zero app, zero configuração do lado do usuário.
+
+    Roda em thread separada; NUNCA bloqueia o loop de visão."""
+
+    def __init__(self, porta=PAINEL_PORTA):
+        import threading, queue
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from urllib.parse import urlparse, parse_qs
+        self.fila = queue.Queue()
+        self.ip   = self._meu_ip()
+        self.url  = f"http://{self.ip}:{porta}/"
+        painel = self
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a): pass          # silencia o log HTTP
+            def _envia(self, corpo, tipo="text/html; charset=utf-8"):
+                b = corpo.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", tipo)
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers(); self.wfile.write(b)
+            def do_GET(self):
+                u = urlparse(self.path)
+                if u.path == "/cmd":
+                    q = parse_qs(u.query)
+                    a = (q.get("a", [""])[0] or "").lower()
+                    p = (q.get("p", [""])[0] or "").upper()[:1]
+                    if a in ("r", "e") and p in ("A", "B", "C"):
+                        painel.fila.put((a.upper(), p))
+                    elif a == "off":
+                        painel.fila.put(("DESLIGAR", None))
+                    self._envia(json.dumps(dict(estado=MISSAO.estado,
+                        retirada=MISSAO.retirada, entrega=MISSAO.entrega,
+                        fase=MISSAO.fase, entregas=MISSAO.entregas)),
+                        "application/json")
+                else:
+                    self._envia(PAGINA.replace("CAR_ID_AQUI", CAR_ID))
+
         try:
-            import paho.mqtt.client as mqtt
-        except ImportError:
-            print("[MQTT] paho-mqtt não instalado (pip install paho-mqtt) — "
-                  "use teclas 1/2/3 como fallback", flush=True)
-            return
-        try:
-            self._cli = mqtt.Client()
-            if MQTT_USER: self._cli.username_pw_set(MQTT_USER, MQTT_PASS)
-            self._cli.on_connect = self._on_connect
-            self._cli.on_message = self._on_message
-            self._cli.connect_async(MQTT_BROKER, MQTT_PORT, keepalive=30)
-            self._cli.loop_start()      # thread própria do paho
-            print(f"[MQTT] conectando a {MQTT_BROKER}:{MQTT_PORT} → {MQTT_TOPIC_DEST}", flush=True)
+            self.srv = ThreadingHTTPServer(("0.0.0.0", porta), H)
+            threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+            print(f"[PAINEL] {self.url}  (o QR já aponta pra cá)", flush=True)
         except Exception as e:
-            print(f"[MQTT][WARN] {e} — fallback teclas 1/2/3", flush=True)
+            self.srv = None
+            print(f"[PAINEL][WARN] não subiu ({e}) — use as teclas 1/2/3", flush=True)
 
-    def _on_connect(self, cli, userdata, flags, rc):
-        self.conectado = (rc == 0)
-        if self.conectado:
-            cli.subscribe(MQTT_TOPIC_DEST)
-            print(f"[MQTT] conectado — inscrito em {MQTT_TOPIC_DEST}", flush=True)
+    @staticmethod
+    def _meu_ip():
+        """IP do notebook NA REDE ATIVA — é esse endereço que vai no QR,
+        nunca 127.0.0.1 (que só o próprio notebook alcança).
 
-    def _on_message(self, cli, userdata, msg):
-        try:
-            txt = msg.payload.decode(errors="ignore").strip()
-            try:    dest = json.loads(txt).get("destino", "")
-            except json.JSONDecodeError: dest = txt
-            dest = str(dest).strip().upper()[:1]
-            if dest in ("A", "B", "C"):
-                self.destino = dest
-                print(f"[MQTT] ✔ destino recebido: {dest}", flush=True)
-        except Exception: pass
+        Truque: perguntamos ao SO qual interface seria usada para
+        alcançar um IP candidato — o socket UDP não chega a enviar
+        nada, só consulta a tabela de rotas. Funciona mesmo que o
+        candidato não seja alcançável de verdade.
 
-    def consumir(self):
-        """Devolve o destino UMA vez e limpa (evita re-disparo)."""
-        d, self.destino = self.destino, None
-        return d
+        Tenta primeiro o gateway típico do REDE_PERFIL ativo (evita
+        escolher a interface errada quando o notebook tem mais de
+        uma rede up ao mesmo tempo, ex.: Wi-Fi do TP-Link + Ethernet
+        de uma rede antiga); os outros perfis entram como reserva."""
+        import socket
+        candidatos = [_PERFIS_REDE[REDE_PERFIL]["gateway_chute"]]
+        candidatos += [p["gateway_chute"] for p in _PERFIS_REDE.values()
+                       if p["gateway_chute"] not in candidatos]
+        candidatos.append("192.168.1.1")   # gateway doméstico comum, último recurso
+        for alvo in candidatos:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect((alvo, 80))
+                ip = s.getsockname()[0]; s.close()
+                if ip and ip != "0.0.0.0":
+                    return ip
+            except Exception:
+                continue
+        return "127.0.0.1"   # nenhuma rede ativa — o QR vai apontar errado
+
+    def poll(self):
+        """-> lista de comandos pendentes, sem bloquear."""
+        import queue
+        cmds = []
+        while True:
+            try: cmds.append(self.fila.get_nowait())
+            except queue.Empty: break
+        return cmds
+
+    def responder(self, txt):
+        print(f"[EVT] {txt}", flush=True)
 
     def fechar(self):
         try:
-            if self._cli: self._cli.loop_stop(); self._cli.disconnect()
+            if self.srv: self.srv.shutdown()
         except Exception: pass
 
 
 def enviar_telemetria(destino, evento):
-    """POST JSON {destino, evento} — thread separada, nunca bloqueia."""
-    import threading
-    payload = {"carro": CAR_ID, "destino": destino, "evento": evento,
-               "timestamp": time.time()}
-    def _post():
-        try:
-            import urllib.request
-            req = urllib.request.Request(
-                TELEMETRY_URL, data=json.dumps(payload).encode(),
-                headers={"Content-Type": "application/json"}, method="POST")
-            urllib.request.urlopen(req, timeout=TELEMETRY_TIMEOUT_S)
-            print(f"[TELEM] ✔ {evento} destino={destino}", flush=True)
-        except Exception as e:
-            print(f"[TELEM][WARN] falhou ({e}) — payload: {payload}", flush=True)
-    threading.Thread(target=_post, daemon=True).start()
+    """Sem internet: o evento vai só para o console."""
+    if BT: BT.responder(f"{evento};{destino or '-'}")
+
+BT = None   # painel; instanciado em main()
+
+
+def _wifi_escape(txt):
+    """Escapa barra invertida, ponto-e-vírgula, vírgula, dois-pontos
+    e aspas — exigência do payload WIFI:. Sem isso, SSID/senha com
+    esses caracteres quebram o parser do celular."""
+    import re
+    return re.sub(r'([\\;,:"])', r'\\\1', txt)
+
+
+def gerar_qr_wifi(ssid, senha, lado=150):
+    """QR no formato que iOS/Android reconhecem NATIVAMENTE pela
+    Câmera — sem app nenhum. Ao escanear, o sistema mostra 'Entrar
+    na rede X?'; o usuário toca em aceitar e já está conectado."""
+    payload = f"WIFI:T:WPA;S:{_wifi_escape(ssid)};P:{_wifi_escape(senha)};H:false;;"
+    return gerar_qr(payload, lado=lado)
 
 
 def gerar_qr(url, lado=260):
@@ -1086,15 +1667,17 @@ def desenhar(frame_e, tracks, fps, modo, debug_thr):
     t(f"FPS:{fps:.0f} [{modo}]",0,(255,255,255),0.38)
     if _sat_chk["mono"]:
         cv2.putText(pan,"CAM S/COR!",(120,14), cv2.FONT_HERSHEY_SIMPLEX,0.38,(0,0,255),1)
-    cor_missao = {"AGUARDANDO":(0,220,220),"ESPERA_QR":(0,200,220),"SELECIONANDO":(220,220,0),
-                  "RODANDO":(100,220,100),"PARADO_SEM":(50,50,220),"PARADO_PARE":(50,50,220),
-                  "PARADO_OBST":(0,0,200),"ENTREGANDO":(220,180,0)}.get(MISSAO.estado,(190,190,190))
+    cor_missao = {"AGUARDANDO":(0,220,220),"AGUARDA_ENTREGA":(220,220,0),
+                  "IND_RETIRADA":(100,220,100),"IND_ENTREGA":(100,220,100),
+                  "LIVRE":(160,220,160),"PARADO_SEM":(50,50,220),"PARADO_PARE":(50,50,220),
+                  "PARADO_OBST":(0,0,200),"RETIRANDO":(220,180,0),
+                  "ENTREGANDO":(220,180,0),"DESLIGADO":(120,120,120)}.get(MISSAO.estado,(190,190,190))
     t(f"MISSAO: {MISSAO.estado}",1,cor_missao,0.36)
-    t(f"Destino:{MISSAO.destino or '-'}  Entregas:{MISSAO.entregas}",2,(200,200,120))
+    t(f"Rota:{MISSAO.retirada or '-'}>{MISSAO.entrega or '-'}  "
+      f"fase:{MISSAO.fase[:4]}  Entregas:{MISSAO.entregas}",2,(200,200,120))
     t(f"Trk:{len(tracks)} Fichas:{len(PGOM_M.fichas)}",3)
-    if MISSAO.estado in ("ESPERA_QR","ENTREGANDO"):
-        alvo = ESPERA_QR_S if MISSAO.estado=="ESPERA_QR" else ESPERA_ENTREGA_S
-        t(f"  {MISSAO.tempo_no_estado():.1f}/{alvo:.0f}s",4,cor_missao,0.40)
+    if MISSAO.estado in ("RETIRANDO","ENTREGANDO"):
+        t(f"  {MISSAO.tempo_no_estado():.1f}/{ESPERA_ENTREGA_S:.0f}s",4,cor_missao,0.40)
     elif MISSAO.parado_por_regra():
         t("  PARADO (regra absoluta)",4,(50,50,220),0.36)
     else:
@@ -1110,18 +1693,23 @@ def desenhar(frame_e, tracks, fps, modo, debug_thr):
     t("── ÚLTIMO ──",18,(60,60,60))
     ult = _nav["ultimo"] or "-"
     t(f" {ult}",19,COR_ACAO.get(ult,(160,160,160)))
-    # O QR existe SÓ enquanto não há destino. Assim que o pedido chega
-    # ele some e não reaparece nas paradas do trajeto (semáforo, PARE,
-    # obstáculo) — só volta depois que a entrega é concluída.
-    if MISSAO.destino is None and MISSAO.qr_img is not None \
-       and MISSAO.estado in ("ESPERA_QR", "SELECIONANDO"):
-        q = MISSAO.qr_img; qh, qw = q.shape[:2]
-        qy, qx = (h-qh)//2, (w-qw)//2
-        if qy >= 0 and qx >= 0:
-            cv2.rectangle(out,(qx-14,qy-40),(qx+qw+14,qy+qh+14),(255,255,255),-1)
-            cv2.putText(out,"ESCANEIE — destino A/B/C",(qx-10,qy-14),
-                        cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,0,0),2)
-            out[qy:qy+qh, qx:qx+qw] = q
+    # DOIS QRs NO CANTO, sempre visíveis — a sessão fica aberta a
+    # missão inteira, porque a entrega pode ser escolhida a qualquer
+    # momento (inclusive depois que o carro já retirou o pacote).
+    #   1) Wi-Fi   — toque em "Entrar na rede" (sem senha, sem app)
+    #   2) Painel  — abre a tela de retirada/entrega
+    if MISSAO.qr_wifi is not None and MISSAO.qr_img is not None:
+        q1, q2 = MISSAO.qr_wifi, MISSAO.qr_img
+        qh, qw = q1.shape[:2]
+        gap = 14
+        qx2, qy = w - qw - 10, h - qh - 20
+        qx1 = qx2 - qw - gap
+        if qx1 > 0 and qy > 0:
+            cv2.rectangle(out,(qx1-6,qy-20),(qx2+qw+6,qy+qh+6),(255,255,255),-1)
+            cv2.putText(out,"1. Wi-Fi",(qx1,qy-6),cv2.FONT_HERSHEY_SIMPLEX,0.42,(0,0,0),1)
+            cv2.putText(out,"2. Painel",(qx2,qy-6),cv2.FONT_HERSHEY_SIMPLEX,0.42,(0,0,0),1)
+            out[qy:qy+qh, qx1:qx1+qw] = q1
+            out[qy:qy+qh, qx2:qx2+qw] = q2
     vis = np.empty((h,w+PW,3),np.uint8)
     vis[:,:w]=out; vis[:,w:]=pan
     if debug_thr is not None:
@@ -1180,7 +1768,7 @@ def calibrar(usar_camera):
             print(f"[CAL] Salvo: {path}\n{cfg}", flush=True)
     cap.release(); cv2.destroyAllWindows()
 
-def main(usar_camera=False, debug=False, auto=False, fast=False, usar_yolo=False, usar_canny=False, cam_idx=None):
+def main(usar_camera=False, debug=False, auto=False, fast=False, usar_yolo=False, usar_canny=False, cam_idx=None, debug_abc=False):
     global _ser, _CLAHE, CNN_CLASSES, CAM_FLIP
     if fast:
         print("[FAST] Processando todo frame (sem pular) + voting rápido", flush=True)
@@ -1205,13 +1793,16 @@ def main(usar_camera=False, debug=False, auto=False, fast=False, usar_yolo=False
         except Exception as e: print(f"[WARN] YOLO: {e}", flush=True)
     elif usar_yolo: print(f"[WARN] --yolo pedido mas {YOLO_MODEL} não existe → GEO", flush=True)
     print(f"[DET] Detector principal: {modo}", flush=True)
-    print(f"[CFG] MQTT     : {MQTT_BROKER}:{MQTT_PORT} → {MQTT_TOPIC_DEST}", flush=True)
-    print(f"[CFG] TELEMETRIA: {TELEMETRY_URL}", flush=True)
-    print(f"[CFG] QR        : {QR_BASE_URL}", flush=True)
-    if "example.com" in QR_BASE_URL or "httpbin" in TELEMETRY_URL:
-        print("[CFG] ⚠ AINDA HÁ PLACEHOLDER — troque as linhas 73/76!", flush=True)
-    abc    = DetectorABC()      # marcadores A/B/C (geométrico, sem CNN)
-    canal  = CanalDestino()     # destino via MQTT do app externo
+    _dica_rede = ("ative o Hotspot Móvel do Windows antes de ligar"
+                  if REDE_PERFIL == "notebook" else
+                  "ligue o roteador TP-Link no modo AP antes de ligar")
+    print(f"[CFG] Painel   : porta {PAINEL_PORTA} — perfil='{REDE_PERFIL}' "
+          f"SSID='{WIFI_SSID}' ({_dica_rede})", flush=True)
+    print(f"[CFG] Pontos   : {PONTO_MODO}", flush=True)
+    global LEITOR, ABC, BT
+    LEITOR = LeitorLetras(debug=debug_abc)
+    ABC    = DetectorABC() if PONTO_MODO == "aruco" else None
+    BT     = PainelLocal()
     tracker = ByteTrackLite()
     if usar_camera: cap = abrir_camera(CAM_IDX if cam_idx is None else cam_idx)
     else: cap = cv2.VideoCapture(VIDEO)
@@ -1223,13 +1814,12 @@ def main(usar_camera=False, debug=False, auto=False, fast=False, usar_yolo=False
     SKIP = 1 if fast else 2
     if auto:
         print("[MISSAO] Auto-start — pula a espera do QR", flush=True)
-        MISSAO.destino = "A"
-        MISSAO.set_estado("RODANDO"); seguir(_ser, com_buzzer=False)
-    else:
-        MISSAO.nova_sessao()   # carro liga → uma sessão, um token, um QR
+        MISSAO.retirada = "A"; MISSAO.entrega = "B"; MISSAO.fase = "retirada"
+        MISSAO.set_estado("IND_RETIRADA"); seguir(_ser, com_buzzer=False)
+    MISSAO.nova_sessao()   # UMA sessão por ligada — QR fica no canto
     frame_e = None; debug_thr = None
-    print("[OK] Q=sair  SPACE=pausa  1/2/3=destino A/B/C (fallback)  "
-          "R=reset missão  F=flip câmera", flush=True)
+    print("[OK] Q=sair · SPACE=pausa · 1/2/3=retirada, depois entrega · "
+          "S=status · D=desliga/liga · R=reset · F=flip", flush=True)
     while True:
         ret, frame_raw = cap.read()
         if ret and usar_camera and CAM_FLIP is not None: frame_raw = cv2.flip(frame_raw, CAM_FLIP)
@@ -1249,10 +1839,19 @@ def main(usar_camera=False, debug=False, auto=False, fast=False, usar_yolo=False
                     for d in yolo.detectar(sub):
                         x1,y1,x2,y2 = d["bbox"]
                         d["bbox"] = (x1+rx0, y1+ry0, x2+rx0, y2+ry0)
+                        # YOLO é AUXILIAR: a geometria tem a palavra final.
+                        # Se o YOLO diz "Stop" mas a forma não é octógono,
+                        # o candidato é descartado.
+                        if not geometria_concorda(frame_e, d):
+                            continue
                         dets.append(d)
                     det_modo = "GEO+YOLO"
             debug_thr = None
             if debug: _, debug_thr = cv2.threshold(frame_e, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            # Delivery NÃO passa por PGOM/CNN — é decidido por geometria
+            # + template + votação. Só Stop e Semáforo seguem adiante.
+            entregas = [d for d in dets if d["class_name"] == "Delivery"]
+            dets     = [d for d in dets if d["class_name"] != "Delivery"]
             dets = [d for d in dets if (d["bbox"][2]-d["bbox"][0])*(d["bbox"][3]-d["bbox"][1]) >= AREA_MIN_EXEC]
             dets = PGOM_M.update(dets)
             tracks = tracker.update(dets, frame_e, cnn, ood, verif)
@@ -1273,86 +1872,131 @@ def main(usar_camera=False, debug=False, auto=False, fast=False, usar_yolo=False
                     percep["pare"] = True
                 elif CLASS_TO_ACTION.get(lbl) == "OBSTACLE":
                     percep["obstaculo"] = True
-            marcadores = abc.detectar(frame_e)
-            if marcadores:
-                # o marcador mais próximo/frontal é o relevante
-                m0 = max(marcadores, key=lambda m: m["area"])
-                if m0["area"] >= AREA_MIN_EXEC:
+            # ─── PONTO A/B/C visto neste frame ───────────────────
+            if PONTO_MODO == "aruco":
+                marcadores = ABC.detectar(frame_e) if ABC else []
+                m0 = max(marcadores, key=lambda m: m["area"]) if marcadores else None
+            else:
+                m0 = LEITOR.votar(entregas)
+            if m0 is not None:
+                bx1,by1,bx2,by2 = m0["bbox"]
+                area_bbox = (bx2-bx1)*(by2-by1)
+                if area_bbox >= AREA_MIN_LETRA:
                     percep["ponto"] = m0["ponto"]
+                if m0["ponto"] != _ultimo_ponto[0]:
+                    _ultimo_ponto[0] = m0["ponto"]
+                    perto = area_bbox >= AREA_MIN_LETRA
+                    print(f"[ABC] ponto '{m0['ponto']}' visto — área={area_bbox:.0f} "
+                          f"({'perto' if perto else 'longe, min='+str(AREA_MIN_LETRA)})"
+                          f"  alvo={MISSAO.alvo()}", flush=True)
+            elif _ultimo_ponto[0] is not None:
+                _ultimo_ponto[0] = None
 
-            for m in ler_serial(_ser):
-                if m.get("btn") == "start" and MISSAO.estado == "AGUARDANDO":
-                    MISSAO.set_estado("ESPERA_QR"); parar(_ser, "(aguardando pedido)")
-
-            dest_mqtt = canal.consumir()
-            if dest_mqtt and MISSAO.estado in ("ESPERA_QR", "SELECIONANDO"):
-                MISSAO.destino = dest_mqtt
-                enviar_telemetria(dest_mqtt, "pedido_recebido")
-                print(f"[MISSAO] 📦 Pedido: entregar em {dest_mqtt}", flush=True)
-                MISSAO.set_estado("RODANDO"); seguir(_ser)
+            # ─── COMANDOS BLUETOOTH (a qualquer momento) ─────────
+            for cmd, arg in BT.poll():
+                if cmd == "R":
+                    MISSAO.retirada = arg
+                    MISSAO.fase = "retirada"
+                    if MISSAO.estado == "DESLIGADO":
+                        MISSAO.set_estado("AGUARDANDO")   # novo pedido religa
+                    enviar_telemetria(arg, "retirada_definida")
+                    if MISSAO.estado in ("AGUARDANDO", "LIVRE"):
+                        MISSAO.set_estado("IND_RETIRADA"); seguir(_ser)
+                elif cmd == "E":
+                    MISSAO.entrega = arg
+                    enviar_telemetria(arg, "entrega_definida")
+                    # se estava esperando na retirada, já parte
+                    if MISSAO.estado == "AGUARDA_ENTREGA":
+                        MISSAO.fase = "entrega"
+                        MISSAO.set_estado("IND_ENTREGA"); seguir(_ser)
+                elif cmd == "DESLIGAR":
+                    MISSAO.set_estado("DESLIGADO")
+                    parar(_ser, "(comando DESLIGAR)")
 
             # ─── MISSÃO: "o que isso significa?" ─────────────────
-            est = MISSAO.estado
+            est   = MISSAO.estado
+            alvo  = MISSAO.alvo()
+            chegou = (alvo is not None and percep["ponto"] == alvo)
+
+            def _chegada(ser):
+                """Transição comum de chegada ao alvo da fase atual."""
+                if MISSAO.fase == "retirada":
+                    MISSAO.set_estado("RETIRANDO")
+                    parar(ser, f"(retirada {MISSAO.retirada})")
+                    buzinar(ser, BUZ_ENTREGA_S)
+                    enviar_telemetria(MISSAO.retirada, "chegou_retirada")
+                else:
+                    MISSAO.set_estado("ENTREGANDO")
+                    parar(ser, f"(entrega {MISSAO.entrega})")
+                    buzinar(ser, BUZ_ENTREGA_S)
+                    enviar_telemetria(MISSAO.entrega, "chegou_entrega")
 
             if est == "AGUARDANDO":
-                parar(_ser, "(inicial)")
-                MISSAO.set_estado("ESPERA_QR")
+                parar(_ser, "(aguardando pedido)")
 
-            elif est == "ESPERA_QR":
-                # 7 segundos parado antes de exibir o QR já gerado
-                if MISSAO.tempo_no_estado() >= ESPERA_QR_S:
-                    if MISSAO.sessao is None:
-                        MISSAO.nova_sessao()
-                    enviar_telemetria(None, "qr_exibido")
-                    MISSAO.set_estado("SELECIONANDO")
-
-            elif est == "SELECIONANDO":
-                pass  # espera destino via MQTT (ou teclas 1/2/3)
-
-            elif est == "RODANDO":
-                motivo = MISSAO.regra_absoluta(percep)      # PRIORIDADE MÁXIMA
+            elif est in ("IND_RETIRADA", "IND_ENTREGA", "LIVRE"):
+                motivo = MISSAO.regra_absoluta(percep)   # PRIORIDADE MÁXIMA
                 if motivo:
+                    MISSAO.retorno = est                 # p/ retomar a rota
                     MISSAO.set_estado(motivo); parar(_ser, f"({motivo})")
-                    enviar_telemetria(MISSAO.destino, motivo.lower())
-                elif MISSAO.regra_ponto(percep["ponto"]) == "entregar":
-                    MISSAO.set_estado("ENTREGANDO")
-                    parar(_ser, f"(ponto {MISSAO.destino})")
-                    buzinar(_ser, BUZ_ENTREGA_S)            # chegada
-                    enviar_telemetria(MISSAO.destino, "chegou_no_ponto")
+                    enviar_telemetria(alvo, motivo.lower())
+                elif chegou:
+                    _chegada(_ser)
 
-            elif est == "PARADO_SEM":
-                # semáforo: só sai no verde
-                if percep["semaforo"] == "verde":
-                    MISSAO.set_estado("RODANDO"); seguir(_ser)
-                    enviar_telemetria(MISSAO.destino, "retomou_verde")
-
-            elif est == "PARADO_PARE":
-                # PARE: para 2.5s e segue se a via estiver livre
-                if (MISSAO.tempo_no_estado() >= 2.5
+            elif MISSAO.parado_por_regra():
+                # chegada vale mesmo parado por regra — o ponto costuma
+                # ficar junto de um cruzamento
+                if chegou:
+                    print(f"[MISSAO] alvo {alvo} avistado durante parada", flush=True)
+                    _chegada(_ser)
+                elif est == "PARADO_SEM" and percep["semaforo"] == "verde":
+                    MISSAO.set_estado(MISSAO.retorno); seguir(_ser)
+                    enviar_telemetria(alvo, "retomou_verde")
+                elif est == "PARADO_PARE" and (MISSAO.tempo_no_estado() >= 2.5
                         and not percep["obstaculo"]
                         and percep["semaforo"] != "vermelho"):
-                    MISSAO.set_estado("RODANDO"); seguir(_ser)
-                    enviar_telemetria(MISSAO.destino, "retomou_pare")
+                    MISSAO.set_estado(MISSAO.retorno); seguir(_ser)
+                    enviar_telemetria(alvo, "retomou_pare")
+                elif est == "PARADO_OBST" and (not percep["obstaculo"]
+                        and percep["semaforo"] != "vermelho"):
+                    MISSAO.set_estado(MISSAO.retorno); seguir(_ser)
+                    enviar_telemetria(alvo, "retomou_obstaculo")
 
-            elif est == "PARADO_OBST":
-                # obstáculo: só sai quando a via limpar
-                if not percep["obstaculo"] and percep["semaforo"] != "vermelho":
-                    MISSAO.set_estado("RODANDO"); seguir(_ser)
-                    enviar_telemetria(MISSAO.destino, "retomou_obstaculo")
+            elif est == "RETIRANDO":
+                if MISSAO.tempo_no_estado() >= ESPERA_ENTREGA_S:
+                    enviar_telemetria(MISSAO.retirada, "pacote_retirado")
+                    print(f"[MISSAO] 📦 Pacote retirado em {MISSAO.retirada}", flush=True)
+                    MISSAO.fase = "entrega"
+                    if MISSAO.entrega:
+                        if MISSAO.entrega == MISSAO.retirada:
+                            _chegada(_ser)          # entrega no mesmo ponto
+                        else:
+                            MISSAO.set_estado("IND_ENTREGA"); seguir(_ser)
+                    else:
+                        # entrega ainda não escolhida — espera aqui;
+                        # o MESMO QR/sessão continua valendo
+                        MISSAO.set_estado("AGUARDA_ENTREGA")
+                        print("[MISSAO] pacote a bordo — aguardando escolha da entrega", flush=True)
+
+            elif est == "AGUARDA_ENTREGA":
+                pass    # sai pelo comando E: (tratado acima)
 
             elif est == "ENTREGANDO":
-                # 7 segundos parado entregando o pacote
                 if MISSAO.tempo_no_estado() >= ESPERA_ENTREGA_S:
                     MISSAO.entregas += 1
-                    enviar_telemetria(MISSAO.destino, "entregue")
-                    print(f"[MISSAO] ✅ Pacote entregue em {MISSAO.destino} "
+                    enviar_telemetria(MISSAO.entrega, "entregue")
+                    print(f"[MISSAO] ✅ Entregue em {MISSAO.entrega} "
                           f"(total: {MISSAO.entregas})", flush=True)
-                    MISSAO.destino = None
-                    MISSAO.sessao  = None
-                    MISSAO.qr_img  = None
-                    MISSAO.nova_sessao()   # missão nova → QR novo
-                    MISSAO.set_estado("ESPERA_QR")
-                    parar(_ser, "(aguardando novo pedido)")
+                    # missão cumprida — o carro CONTINUA ANDANDO até
+                    # nova missão (R:) ou comando DESLIGAR
+                    MISSAO.retirada = None
+                    MISSAO.entrega  = None
+                    MISSAO.fase     = "retirada"
+                    MISSAO.retorno  = "LIVRE"
+                    MISSAO.set_estado("LIVRE"); seguir(_ser)
+
+            elif est == "DESLIGADO":
+                pass    # só sai pelo comando LIGAR
             modo = det_modo
         disp = frame_e if frame_e is not None else cv2.resize(frame_raw,(IMG_W,int(frame_raw.shape[0]*IMG_W/frame_raw.shape[1])))
         vis = desenhar(disp, tracker.tracks, fps, modo, debug_thr)
@@ -1368,24 +2012,41 @@ def main(usar_camera=False, debug=False, auto=False, fast=False, usar_yolo=False
             _ciclo = [None, 1, 0, -1]; CAM_FLIP = _ciclo[(_ciclo.index(CAM_FLIP)+1) % 4]
             print(f"[CAM] flip = {CAM_FLIP}", flush=True)
         elif k==ord('r'):
-            MISSAO.destino = None; MISSAO.qr_img = None
-            MISSAO.set_estado("ESPERA_QR"); parar(_ser, "(reset)")
+            MISSAO.retirada = MISSAO.entrega = None
+            MISSAO.fase = "retirada"; MISSAO.retorno = "LIVRE"
+            MISSAO.set_estado("AGUARDANDO"); parar(_ser, "(reset)")
+        elif k==ord('s'):
+            print(MISSAO.status(), flush=True)
+        elif k==ord('d'):
+            if MISSAO.estado == "DESLIGADO":
+                MISSAO.set_estado("AGUARDANDO"); print("[MISSAO] religado", flush=True)
+            else:
+                MISSAO.set_estado("DESLIGADO"); parar(_ser, "(tecla D)")
         elif k in (ord('1'),ord('2'),ord('3')):
-            # fallback manual caso o MQTT esteja indisponível
-            if MISSAO.estado in ("ESPERA_QR","SELECIONANDO"):
-                MISSAO.destino = {ord('1'):"A",ord('2'):"B",ord('3'):"C"}[k]
-                enviar_telemetria(MISSAO.destino, "pedido_manual")
-                print(f"[MISSAO] 📦 Destino manual: {MISSAO.destino}", flush=True)
-                MISSAO.set_estado("RODANDO"); seguir(_ser)
+            # Fallback sem Bluetooth: 1/2/3 define a RETIRADA; se ela já
+            # existe, define a ENTREGA. Mesma semântica de R: e E:.
+            p = {ord('1'):"A",ord('2'):"B",ord('3'):"C"}[k]
+            if MISSAO.retirada is None:
+                MISSAO.retirada = p; MISSAO.fase = "retirada"
+                print(f"[MISSAO] retirada = {p} (tecla)", flush=True)
+                if MISSAO.estado in ("AGUARDANDO","LIVRE"):
+                    MISSAO.set_estado("IND_RETIRADA"); seguir(_ser)
+            else:
+                MISSAO.entrega = p
+                print(f"[MISSAO] entrega = {p} (tecla)", flush=True)
+                if MISSAO.estado == "AGUARDA_ENTREGA":
+                    MISSAO.fase = "entrega"
+                    MISSAO.set_estado("IND_ENTREGA"); seguir(_ser)
     CMD.update(mot=0,srv=127,buz=0,led=0,brk=1,dir=0); enviar(CMD,_ser)
-    canal.fechar()
+    BT.fechar()
     if _ser: _ser.close()
     cap.release(); cv2.destroyAllWindows()
     print("[OK] Encerrado.", flush=True)
 
 if __name__=="__main__":
     args = sys.argv[1:]
-    if "--gerar-abc" in args: gerar_marcadores_abc()
+    if "--gerar-abc" in args: gerar_placas_abc()
+    elif "--gerar-aruco" in args: gerar_marcadores_abc()
     elif "--cal" in args: calibrar("--cam" in args)
     else:
         cam_idx = None
@@ -1394,4 +2055,5 @@ if __name__=="__main__":
             except (IndexError, ValueError):
                 print("[ERRO] use: --cam-idx N  (ex.: --cam-idx 1)"); sys.exit(1)
         main(usar_camera="--cam" in args, debug="--debug" in args, auto="--auto" in args,
-             fast="--fast" in args, usar_yolo="--yolo" in args, usar_canny="--canny" in args, cam_idx=cam_idx)
+             fast="--fast" in args, usar_yolo="--yolo" in args, usar_canny="--canny" in args,
+             cam_idx=cam_idx, debug_abc="--debug-abc" in args)
