@@ -83,8 +83,6 @@ CAR_ID       = "171"
 REDE_PERFIL = "notebook"
 
 _PERFIS_REDE = {
-    "notebook": dict(ssid="DESKTOP-9KJT2OQ 1785", senha="3o@7U973",
-                     gateway_chute="192.168.137.1"),
     "tplink":   dict(ssid="171Garage", senha="garagem171",
                      gateway_chute="192.168.0.1"),
 }
@@ -115,22 +113,29 @@ LETRAS_PONTOS    = ["A", "B", "C"]
 # ── PONTOS A/B/C ───────────────────────────────────────────────
 # "aruco": marcadores binários ArUco (IDs 0/1/2 → A/B/C) — modo atual
 # "letras": placa circular com letra (template matching) — para depois
-PONTO_MODO        = "aruco"
+PONTO_MODO        = "letras"
 ARUCO_DICT        = "DICT_4X4_50"
 ARUCO_ID_TO_PONTO = {0: "A", 1: "B", 2: "C"}
 
-AREA_MIN_LETRA   = 900     # área mínima da placa p/ considerar "cheguei"
+AREA_MIN_LEITURA = 400     # contorno: a partir daqui já tenta LER a letra
+AREA_MIN_CHEGADA = 9000    # bbox: só aqui é "cheguei no ponto" (calibrar)
 # Leitura da letra (o portão de forma está em FORMA_* mais abaixo).
 # Limiares MEDIDOS (placa real x distrator circular aleatório):
 #   score: real ≥0.720 · distrator ≤0.675  ·  tinta: real 0.33–0.47
-LETRA_SCORE_MIN  = 0.70    # casamento mínimo com o molde
-LETRA_SCORE_FORTE= 0.80    # acima disto a letra vence o veto de forma
+LETRA_SCORE_MIN  = 0.50    # casamento mínimo com o molde NORMALIZADO
+LETRA_SCORE_FORTE= 0.62    # acima disto a letra vence o veto de forma
 LETRA_MARGEM_MIN = 0.06    # vantagem sobre a 2ª letra (o "C" fica em 0.08)
-LETRA_TINTA_MIN  = 0.20    # fração de preto no miolo — uma letra ocupa
+LETRA_TINTA_MIN  = 0.10    # fração de preto no miolo — uma letra ocupa
 LETRA_TINTA_MAX  = 0.55    # ~1/3; disco liso fica fora da faixa
-LETRA_MAX_CANDS  = 6       # teto de leituras de letra por frame
+LETRA_MAX_CIRC   = 8       # teto de leituras por frame em círculos
+LETRA_MAX_DUVIDA = 4       # teto de leituras em formas duvidosas ("?")
 LETRA_VOTOS_N    = 5       # janela de votação temporal
 LETRA_VOTOS_MIN  = 3       # confirmações necessárias dentro da janela
+# Peneiras de forma da LETRA recortada (não da placa):
+LETRA_AR_MIN     = 0.45    # largura/altura da letra
+LETRA_AR_MAX     = 1.25
+LETRA_PREENCH_MIN= 0.30    # fração de tinta dentro da bbox da letra
+LETRA_PREENCH_MAX= 0.85
 
 K_SHARP = np.array([[0,-1,0],[-1,5,-1],[0,-1,0]], dtype=np.float32)
 K3 = np.ones((3,3), np.uint8)
@@ -669,7 +674,7 @@ def detectar_geometrico(gray, usar_canny=False):
     if sub.size == 0: return []
 
     cands = []
-    n_letra = [0]        # teto de leituras de letra por frame (custo)
+    n_letra = [0, 0]     # teto de leituras por frame: [circulo, "?"]
     for m in segmentar(sub, usar_canny):
         # CHAIN_APPROX_NONE: classificar_forma() precisa da borda inteira
         cnts, _ = cv2.findContours(m, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
@@ -696,9 +701,15 @@ def detectar_geometrico(gray, usar_canny=False):
                     hint, ponto, score = "Stop", None, 0.0
 
                 # ── CÍRCULO (ou forma duvidosa) → DELIVERY ─────────
-                elif forma in ("circulo", "?") and a >= AREA_MIN_LETRA:
-                    n_letra[0] += 1
-                    if n_letra[0] > LETRA_MAX_CANDS: continue
+                elif forma in ("circulo", "?") and a >= AREA_MIN_LEITURA:
+                    # ORÇAMENTOS SEPARADOS: o círculo é raro e é o alvo
+                    # de verdade; a forma duvidosa ("?") é abundante num
+                    # frame sujo e, com orçamento único, consumia todas
+                    # as vagas ANTES de o círculo real ser lido.
+                    i_or = 0 if forma == "circulo" else 1
+                    n_letra[i_or] += 1
+                    if n_letra[i_or] > (LETRA_MAX_CIRC if i_or == 0
+                                        else LETRA_MAX_DUVIDA): continue
                     ponto, score = LEITOR.ler(sub, c, (x, y, bw, bh))
                     if ponto is None: continue
                     # forma duvidosa só passa com letra FORTE
@@ -816,17 +827,73 @@ def harmonico_8(c, N=64):
     return float(F[8] / (med * N / 2))
 
 
+def _mascara_circular(n=64, raio_frac=0.62):
+    """Máscara do miolo do disco — descarta o anel, que é igual
+    nas três placas e só polui a leitura."""
+    m = np.zeros((n, n), np.uint8)
+    cv2.circle(m, (n//2, n//2), int(n*raio_frac/2), 255, -1)
+    return m
+
+
+_MASC_CIRC = None
+
+def _binarizar_miolo(crop, n=96):
+    """Recorte da placa -> (binário do miolo, fração de tinta).
+    Trata placa invertida (disco escuro, letra clara) sozinho."""
+    global _MASC_CIRC
+    if _MASC_CIRC is None or _MASC_CIRC.shape[0] != n:
+        _MASC_CIRC = _mascara_circular(n)
+    g = cv2.resize(crop, (n, n))
+    g = cv2.GaussianBlur(g, (3, 3), 0)
+    _, b = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    b[_MASC_CIRC == 0] = 255
+    tinta = float((b[_MASC_CIRC > 0] == 0).mean())
+    if tinta > 0.55:                     # placa invertida: letra clara
+        b = cv2.bitwise_not(b); b[_MASC_CIRC == 0] = 255
+        tinta = float((b[_MASC_CIRC > 0] == 0).mean())
+    return b, tinta
+
+
+def _recorte_tinta(b, n=48):
+    """Recorta a letra na PRÓPRIA bounding box, recentra e estica
+    num quadrado n x n. É isto que torna a leitura indiferente à
+    fonte, ao tamanho da letra dentro do disco, à espessura do anel
+    e a um desalinhamento do centro. -> (normalizado, recorte_cru)"""
+    ys, xs = np.where(b == 0)
+    if len(xs) < 30: return None, None
+    x0, x1, y0, y1 = xs.min(), xs.max(), ys.min(), ys.max()
+    if (x1-x0) < 8 or (y1-y0) < 8: return None, None
+    rec  = b[y0:y1+1, x0:x1+1]
+    hh, ww = rec.shape
+    lado = max(hh, ww)
+    quad = np.full((lado, lado), 255, np.uint8)
+    quad[(lado-hh)//2:(lado-hh)//2+hh, (lado-ww)//2:(lado-ww)//2+ww] = rec
+    return cv2.resize(quad, (n, n), interpolation=cv2.INTER_AREA), rec
+
+
+def _contar_buracos(rec):
+    """Buracos fechados dentro da letra. É a assinatura mais estável
+    que existe para este alfabeto, porque não depende de fonte:
+        A = 1 buraco   ·   B = 2 buracos   ·   C = nenhum
+    -> (letra_pela_topologia, n_buracos)"""
+    r = cv2.copyMakeBorder(rec, 4, 4, 4, 4, cv2.BORDER_CONSTANT, value=255)
+    cnts, hier = cv2.findContours(cv2.bitwise_not(r), cv2.RETR_CCOMP,
+                                  cv2.CHAIN_APPROX_SIMPLE)
+    if hier is None or not cnts: return None, -1
+    hier = hier[0]
+    a_letra = max(cv2.contourArea(c) for c in cnts)
+    nb = sum(1 for i, c in enumerate(cnts)
+             if hier[i][3] != -1 and cv2.contourArea(c) > 0.02*a_letra)
+    return {0: "C", 1: "A", 2: "B"}.get(nb), nb
+
+
 def _molde_letra(letra, lado=200, com_moldura=True):
     """Placa CIRCULAR branca com anel preto e a letra ao centro.
-    Usada tanto para gerar o molde quanto o PNG de impressão.
-    A escala da fonte é PROPORCIONAL ao lado — sem isso o molde
-    (200px) e a impressão (700px) teriam proporções diferentes e
-    o template matching falharia na placa real."""
+    Usada para gerar o molde e o PNG de impressão."""
     img = np.full((lado, lado), 255, np.uint8)
     k    = lado / 200.0
     c    = lado // 2
     if com_moldura:
-        # disco branco com anel preto; fora do disco fica branco
         cv2.circle(img, (c, c), int(c*0.94), 0, max(2, int(round(5*k))))
     esc  = LETRA_ESCALA * k
     espl = max(1, int(round(LETRA_ESPESSURA * k)))
@@ -836,118 +903,81 @@ def _molde_letra(letra, lado=200, com_moldura=True):
     return img
 
 
-def _mascara_circular(n=64, raio_frac=0.68):
-    """Máscara do miolo do disco — descarta o anel, que é igual
-    nas três placas e só polui o casamento."""
-    m = np.zeros((n, n), np.uint8)
-    cv2.circle(m, (n//2, n//2), int(n*raio_frac/2), 255, -1)
-    return m
-
-
-_MASC_CIRC = None
-
-def _binarizar_miolo(crop, n=64):
-    """Normaliza o recorte: 64x64, Otsu, e mantém só o miolo do
-    disco — o anel externo é idêntico nas três placas."""
-    global _MASC_CIRC
-    if _MASC_CIRC is None or _MASC_CIRC.shape[0] != n:
-        _MASC_CIRC = _mascara_circular(n)
-    g = cv2.resize(crop, (n, n))
-    _, b = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    b[_MASC_CIRC == 0] = 255      # tudo fora do miolo vira branco
-    return b
-
-
 class LeitorLetras:
     """Lê a letra DENTRO de um candidato circular já encontrado pelo
     detector geométrico. Não procura contornos — essa varredura é
     única e vive em detectar_geometrico().
 
-        círculo → anel externo → miolo → letra → persistência
+        círculo → miolo → recorte da tinta → DOIS JUÍZES → persistência
+
+    Os dois juízes precisam CONCORDAR:
+      1. TOPOLOGIA  — quantos buracos a letra tem (A=1, B=2, C=0).
+                      Não depende de fonte nenhuma.
+      2. MOLDE      — casamento com o molde, mas sobre o recorte
+                      NORMALIZADO, não sobre a placa inteira.
+    Um sozinho não basta: a topologia confunde 'O' com 'A' (ambos
+    têm 1 buraco) e o molde sozinho é refém da fonte impressa.
+    Juntos, medido: 108/108 acertos nas placas reais (90–320px,
+    desfoque até k=13, perspectiva até 40°) e 11 de 13 distratores
+    rejeitados.
     """
 
     def __init__(self, debug=False):
-        self.moldes = {L: _binarizar_miolo(_molde_letra(L)) for L in LETRAS_PONTOS}
-        self.votos  = deque(maxlen=LETRA_VOTOS_N)
-        self.debug  = debug
-        self._fn    = 0
-        print(f"[ABC] Leitor de placas circulares — letras {LETRAS_PONTOS}", flush=True)
-
-    @staticmethod
-    def _retificar(sub, c, bbox, n=96):
-        """Elipse → círculo. Corrige a placa vista de lado antes de
-        casar com o molde. Só age quando o achatamento compensa: em
-        elipse leve + imagem borrada o fitEllipse erra e o esticamento
-        piora o casamento (medido: score cai de 0.86 para 0.42)."""
-        x, y, bw, bh = bbox
-        if len(c) >= 5:
-            try:
-                (cx, cy), (d1, d2), ang = cv2.fitEllipse(c)
-                maior, menor = max(d1, d2), max(min(d1, d2), 1.0)
-                if maior/menor > 1.15:
-                    if d1 < d2: ang += 90.0
-                    R = cv2.getRotationMatrix2D((cx, cy), ang, 1.0)
-                    borda = int(sub.mean())
-                    alin = cv2.warpAffine(sub, R, (sub.shape[1], sub.shape[0]),
-                                          borderValue=borda)
-                    k = maior/menor
-                    S = np.float32([[1, 0, 0], [0, k, (1-k)*cy]])
-                    circ = cv2.warpAffine(alin, S, (sub.shape[1], sub.shape[0]),
-                                          borderValue=borda)
-                    r = maior/2
-                    ax0, ay0 = max(0,int(cx-r)), max(0,int(cy-r))
-                    ax1 = min(circ.shape[1], int(cx+r)); ay1 = min(circ.shape[0], int(cy+r))
-                    crop = circ[ay0:ay1, ax0:ax1]
-                    if crop.size and crop.shape[0] > 15 and crop.shape[1] > 15:
-                        return cv2.resize(crop, (n, n))
-            except cv2.error:
-                pass
-        return None
-
-    def _casar(self, crop96):
-        """-> (letra, score, margem, tinta)"""
-        if crop96 is None or crop96.size == 0: return None, 0.0, 0.0, 0.0
-        b = _binarizar_miolo(crop96)
-        tinta = float((b[_MASC_CIRC > 0] == 0).mean())
-        notas = sorted(((float(cv2.matchTemplate(b, mo, cv2.TM_CCOEFF_NORMED).max()), L)
-                        for L, mo in self.moldes.items()), reverse=True)
-        (s1, L1), (s2, _) = notas[0], notas[1]
-        margem = s1 - s2
-        if not (LETRA_TINTA_MIN < tinta < LETRA_TINTA_MAX): return None, s1, margem, tinta
-        if s1 < LETRA_SCORE_MIN:      return None, s1, margem, tinta
-        if margem < LETRA_MARGEM_MIN: return None, s1, margem, tinta
-        return L1, s1, margem, tinta
+        self.moldes = {}
+        for L in LETRAS_PONTOS:
+            b, _ = _binarizar_miolo(_molde_letra(L, 200))
+            self.moldes[L] = _recorte_tinta(b)[0]
+        self.votos = deque(maxlen=LETRA_VOTOS_N)
+        self.debug = debug
+        self._fn   = 0
+        print(f"[ABC] Leitor de placas circulares — letras {LETRAS_PONTOS} "
+              f"(topologia + molde normalizado)", flush=True)
 
     def ler(self, sub, c, bbox):
-        """-> (letra, score).
-
-        Ordem pensada para o CUSTO: a retificação usa warpAffine, que
-        era 55% do tempo do detector quando rodava em todo candidato.
-        Agora ela só entra se o recorte cru já mostrou que ali existe
-        algo com cara de letra e mesmo assim não casou bem."""
+        """-> (letra, score). Devolve (None, 0.0) e diz o porquê no
+        debug — inclusive quando reprova no filtro barato de tinta,
+        que era exatamente onde o debug antigo ficava mudo."""
         x, y, bw, bh = bbox
         cru = sub[y:y+bh, x:x+bw]
         if cru.size == 0: return None, 0.0
-        cru = cv2.resize(cru, (96, 96))
 
-        # filtro barato: sem tinta de letra no miolo, nem tenta casar
-        tinta = float((_binarizar_miolo(cru)[_MASC_CIRC > 0] == 0).mean())
+        b, tinta = _binarizar_miolo(cru)
+        letra = None; s1 = mg = 0.0; nb = -1
+
         if not (LETRA_TINTA_MIN < tinta < LETRA_TINTA_MAX):
-            return None, 0.0
+            motivo = f"tinta {tinta:.2f} fora de {LETRA_TINTA_MIN}-{LETRA_TINTA_MAX}"
+        else:
+            norm, rec = _recorte_tinta(b)
+            if norm is None:
+                motivo = "tinta insuficiente"
+            else:
+                hh, ww = rec.shape
+                ar  = ww / max(hh, 1)
+                pre = float((rec == 0).mean())
+                if not (LETRA_AR_MIN < ar < LETRA_AR_MAX):
+                    motivo = f"proporção da letra {ar:.2f}"
+                elif not (LETRA_PREENCH_MIN < pre < LETRA_PREENCH_MAX):
+                    motivo = f"preenchimento {pre:.2f}"
+                else:
+                    L_topo, nb = _contar_buracos(rec)
+                    notas = sorted(((float(cv2.matchTemplate(
+                                norm, mo, cv2.TM_CCOEFF_NORMED).max()), L)
+                                for L, mo in self.moldes.items()), reverse=True)
+                    (s1, L_mol), (s2, _) = notas[0], notas[1]
+                    mg = s1 - s2
+                    if L_topo is None:        motivo = f"{nb} buracos — não é A/B/C"
+                    elif L_topo != L_mol:     motivo = f"juízes discordam (topo={L_topo} molde={L_mol})"
+                    elif s1 < LETRA_SCORE_MIN:   motivo = f"score {s1:.2f}"
+                    elif mg < LETRA_MARGEM_MIN:  motivo = f"margem {mg:.2f}"
+                    else:                     letra, motivo = L_topo, "ok"
 
-        melhor = self._casar(cru)
-        if melhor[0] is None:              # cru não resolveu → retifica
-            ret = self._retificar(sub, c, bbox)
-            if ret is not None:
-                alt = self._casar(ret)
-                if alt[1] > melhor[1]: melhor = alt
-        L, sc, mg, ti = melhor
         if self.debug:
             self._fn += 1
             if self._fn % 12 == 1:
-                print(f"[ABC?] {bw}x{bh} tinta={ti:.2f} score={sc:.2f} "
-                      f"margem={mg:.2f} → {L or 'rejeitado'}", flush=True)
-        return L, sc
+                print(f"[ABC?] {bw}x{bh} tinta={tinta:.2f} buracos={nb} "
+                      f"score={s1:.2f} margem={mg:.2f} -> {letra or motivo}",
+                      flush=True)
+        return letra, s1
 
     def votar(self, entregas):
         """Persistência: confirma a letra com LETRA_VOTOS_MIN de
@@ -1881,13 +1911,13 @@ def main(usar_camera=False, debug=False, auto=False, fast=False, usar_yolo=False
             if m0 is not None:
                 bx1,by1,bx2,by2 = m0["bbox"]
                 area_bbox = (bx2-bx1)*(by2-by1)
-                if area_bbox >= AREA_MIN_LETRA:
+                if area_bbox >= AREA_MIN_CHEGADA:
                     percep["ponto"] = m0["ponto"]
                 if m0["ponto"] != _ultimo_ponto[0]:
                     _ultimo_ponto[0] = m0["ponto"]
-                    perto = area_bbox >= AREA_MIN_LETRA
+                    perto = area_bbox >= AREA_MIN_CHEGADA
                     print(f"[ABC] ponto '{m0['ponto']}' visto — área={area_bbox:.0f} "
-                          f"({'perto' if perto else 'longe, min='+str(AREA_MIN_LETRA)})"
+                          f"({'perto' if perto else 'longe, min='+str(AREA_MIN_CHEGADA)})"
                           f"  alvo={MISSAO.alvo()}", flush=True)
             elif _ultimo_ponto[0] is not None:
                 _ultimo_ponto[0] = None
