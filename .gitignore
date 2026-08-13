@@ -7,6 +7,7 @@ dataset_v3/
 *.zip
 yolo_dataset/
 models/
+TRAIN/
 
 sign_model.tflite
 sign_model.keras
@@ -17,12 +18,6 @@ yolo8n.onnx
 yolo8n.pt
 
 
-__pycache__/
-*.pyc
-*.pyo
-.venv/
-venv/
-
 
 logs/
 checkpoints/
@@ -30,3 +25,4 @@ checkpoints/
 
 .DS_Store
 Thumbs.db
+
