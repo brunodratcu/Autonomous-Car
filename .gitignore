@@ -7,7 +7,7 @@ dataset_v3/
 *.zip
 yolo_dataset/
 models/
-TRAIN/
+train/
 
 sign_model.tflite
 sign_model.keras

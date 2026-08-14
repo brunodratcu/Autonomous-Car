@@ -30,9 +30,6 @@ webcam → mono + CLAHE → varredura única de contornos
 - [Protocolo serial](#protocolo-serial)
 - [Estrutura de arquivos](#estrutura-de-arquivos)
 - [Calibração](#calibração)
-- [Decisões de projeto e porquês](#decisões-de-projeto-e-porquês)
-- [Limitações conhecidas](#limitações-conhecidas)
-- [Roadmap](#roadmap)
 
 ---
 
