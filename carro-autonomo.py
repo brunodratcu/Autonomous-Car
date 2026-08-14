@@ -34,7 +34,7 @@ from collections import deque, Counter
 #  [0] CONFIGURAÇÃO
 # ================================================================
 
-CAM_IDX     = 1                      # webcam externa (a integrada costuma ser 0)
+CAM_IDX     = 0                      # webcam externa (a integrada costuma ser 0)
 CAM_FLIP    = 1
 IMG_W       = 640
 
@@ -77,9 +77,9 @@ ROI_Y0, ROI_Y1 = 0.05, 0.92          # faixa vertical útil do frame
 # ── Rede e painel — TP-Link TL-MR3020 em modo AP, sem internet ──
 PAINEL_PORTA = 8000
 CAR_ID       = "171"
-WIFI_SSID    = "171Garage"
+WIFI_SSID    = "171garage"
 WIFI_PASS    = "garagem171"
-WIFI_GATEWAY = "192.168.0.1"         # gateway de fábrica do TL-MR3020
+WIFI_GATEWAY = "192.168.1.100"         # gateway de fábrica do TL-MR3020
 
 # ── Tempos da missão ───────────────────────────────────────────
 ESPERA_ENTREGA_S = 7.0               # parado retirando / entregando
