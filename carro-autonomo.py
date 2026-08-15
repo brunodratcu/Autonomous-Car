@@ -82,6 +82,7 @@ VOTE_MIN_DETS  = 3          # era 5 — 3 votos já é maioria qualificada com V
 VOTE_FRAC      = 0.60
 
 AREA_MIN_EXEC = 800                  # bbox mínima p/ um track valer decisão
+AREA_MIN_PROX = 350                  # bbox mínima p/ avisar "aproximando" (menor que EXEC — avisa antes)
 ROI_Y0, ROI_Y1 = 0.05, 0.92          # faixa vertical útil do frame
 
 # ── Rede e painel — TP-Link TL-MR3020 em modo AP, sem internet ──
@@ -107,6 +108,7 @@ LETRA_ESPESSURA = 12
 
 AREA_MIN_LEITURA = 400               # contorno mínimo p/ tentar LER a letra
 AREA_MIN_CHEGADA = 9000              # bbox mínima p/ declarar "cheguei" (calibrar na pista)
+AREA_MIN_PROX_ENTREGA = 3000         # bbox mínima p/ avisar "aproximando do ponto" (calibrar na pista)
 
 LETRA_SCORE_MIN   = 0.50             # casamento mínimo com o molde normalizado
 LETRA_SCORE_FORTE = 0.62             # acima disto a letra vence forma duvidosa
@@ -908,18 +910,40 @@ def geometria_concorda(gray, det) -> bool:
 
 class Track:
     _nid = 0
+    N_CONSECUTIVO = 3   # "uns três frames consecutivos" pedido pro Portenta confiar na cor/PARE
 
     def __init__(self, bbox, hint, conf):
         self.id = Track._nid; Track._nid += 1
         self.bbox = bbox; self.class_hint = hint; self.conf = conf
         self.buf = deque(maxlen=VOTE_BUFFER); self.age = 0; self.missed = 0
         self.state = "tentative"
+        self.evt_prox_enviado = False   # já avisou "aproximando" pro Portenta?
+        self.evt_conf_enviado = None    # já confirmou (e qual valor) pro Portenta?
+        self.cor_buf = deque(maxlen=5)  # histórico de cor do semáforo (separado do buf de classe)
 
     def atualizar(self, bbox, hint, conf, cnn_lbl, cnn_conf):
         self.bbox = bbox; self.class_hint = hint; self.conf = conf
         self.missed = 0; self.age += 1
         if cnn_lbl: self.buf.append((cnn_lbl, cnn_conf))
         if self.age >= 2: self.state = "confirmed"   # era 3 — em movimento, 2 já filtra ruído de 1 frame
+
+    def consecutivo(self):
+        """Estrito: as últimas N_CONSECUTIVO leituras têm que ser TODAS iguais —
+        diferente de votar() (maioria no buffer inteiro). É o que o Portenta precisa
+        pra tratar como confirmação de verdade, não uma tendência estatística."""
+        if len(self.buf) < self.N_CONSECUTIVO: return None
+        ultimos = [lb for lb, _ in list(self.buf)[-self.N_CONSECUTIVO:]]
+        if len(set(ultimos)) == 1: return ultimos[0]
+        return None
+
+    def cor_consecutiva(self, cor_atual):
+        """Mesmo critério, só que pra cor do semáforo (vermelho/amarelo/verde),
+        que muda frame a frame e não vive no buf de classe."""
+        self.cor_buf.append(cor_atual)
+        if len(self.cor_buf) < self.N_CONSECUTIVO: return None
+        ultimos = list(self.cor_buf)[-self.N_CONSECUTIVO:]
+        if None not in ultimos and len(set(ultimos)) == 1: return ultimos[0]
+        return None
 
     def votar(self):
         """Maioria qualificada no buffer — um frame isolado nunca decide."""
@@ -1115,6 +1139,28 @@ def enviar(cmd, ser):
         try:
             ser.write((j+"\n").encode())
             _seq["pendente"] = _seq["n"]; _seq["t_envio"] = time.monotonic()
+        except Exception: pass
+
+
+def sinalizar_proximidade(tipo, ser):
+    """LOG 1 pro Portenta: 'tem uma sinaleira/ponto chegando, se prepare.'
+    Enviado UMA VEZ por aproximação — antes de qualquer confirmação de cor/PARE.
+    tipo: 'PARE' | 'SEM' | 'ENTREGA'"""
+    print(f"[SERIAL] proximidade -> {tipo}", flush=True)
+    if ser:
+        try: ser.write((f'{{"evt":"PROX","tipo":"{tipo}"}}\n').encode())
+        except Exception: pass
+
+
+def sinalizar_confirmacao(tipo, valor, ser):
+    """LOG 2 pro Portenta: 'confirmado, é isso mesmo — decide aí o que fazer.'
+    Enviado UMA VEZ por evento, depois de N_CONSECUTIVO frames concordando.
+    O Portenta passa a decidir parar/seguir com essa informação — o Python
+    não manda mais mot/srv calculado pra esse caso, só o fato confirmado.
+    tipo: 'PARE' | 'SEM' | 'ENTREGA'   valor: 'ok' | 'vermelho'/'amarelo'/'verde' | letra ABC"""
+    print(f"[SERIAL] confirmação -> {tipo}:{valor}", flush=True)
+    if ser:
+        try: ser.write((f'{{"evt":"CONF","tipo":"{tipo}","valor":"{valor}"}}\n').encode())
         except Exception: pass
 
 
@@ -1498,13 +1544,31 @@ def main(debug_abc=False, auto=False, fast=False, usar_yolo=False, cam_idx=None)
             # ── VISÃO: constatação de fatos, nenhuma decisão ──
             percep = dict(pare=False, semaforo=None, obstaculo=False, ponto=None)
             for trk in tracks:
+                # LOG 1 (proximidade): dispara assim que a bbox cresce o bastante,
+                # ANTES de qualquer confirmação de cor/classe — só avisa "tem
+                # sinaleira chegando". Uma vez só por track.
+                if (not trk.evt_prox_enviado and trk.area >= AREA_MIN_PROX
+                        and trk.class_hint in ("Stop", "Semaforo")):
+                    sinalizar_proximidade("PARE" if trk.class_hint == "Stop" else "SEM", _ser)
+                    trk.evt_prox_enviado = True
+
                 lbl, _ = trk.votar()
                 if not lbl or trk.state != "confirmed" or trk.area < AREA_MIN_EXEC: continue
                 if lbl == "Semaforo":
                     x1, y1, x2, y2 = trk.bbox
-                    percep["semaforo"] = estado_semaforo(frame_e[y1:y2, x1:x2])
+                    cor = estado_semaforo(frame_e[y1:y2, x1:x2])
+                    percep["semaforo"] = cor
+                    # LOG 2 (confirmação): só depois de N_CONSECUTIVO frames com a
+                    # MESMA cor seguida — não é maioria estatística, é sequência.
+                    cor_conf = trk.cor_consecutiva(cor)
+                    if cor_conf and trk.evt_conf_enviado != cor_conf:
+                        sinalizar_confirmacao("SEM", cor_conf, _ser)
+                        trk.evt_conf_enviado = cor_conf
                 elif lbl == "Stop":
                     percep["pare"] = True
+                    if trk.consecutivo() == "Stop" and trk.evt_conf_enviado != "ok":
+                        sinalizar_confirmacao("PARE", "ok", _ser)
+                        trk.evt_conf_enviado = "ok"
                 elif CLASS_TO_ACTION.get(lbl) == "OBSTACLE":
                     percep["obstaculo"] = True
 
@@ -1512,15 +1576,26 @@ def main(debug_abc=False, auto=False, fast=False, usar_yolo=False, cam_idx=None)
             if m0 is not None:
                 bx1, by1, bx2, by2 = m0["bbox"]
                 area_bbox = (bx2-bx1)*(by2-by1)
+                # LOG 1 (proximidade) do delivery: primeira vez que o ponto cresce
+                # o bastante pra valer aviso, mesmo antes de "chegar" de verdade.
+                if area_bbox >= AREA_MIN_PROX_ENTREGA and not _ultimo.get("prox_enviada"):
+                    sinalizar_proximidade("ENTREGA", _ser)
+                    _ultimo["prox_enviada"] = True
                 if area_bbox >= AREA_MIN_CHEGADA:
                     percep["ponto"] = m0["ponto"]
+                    # LOG 2 (confirmação) do delivery: chegou de fato no ponto.
+                    if _ultimo.get("conf_enviada") != m0["ponto"]:
+                        sinalizar_confirmacao("ENTREGA", m0["ponto"], _ser)
+                        _ultimo["conf_enviada"] = m0["ponto"]
                 if m0["ponto"] != _ultimo["ponto"]:
                     _ultimo["ponto"] = m0["ponto"]
+                    _ultimo["prox_enviada"] = False; _ultimo["conf_enviada"] = None
                     print(f"[ABC] ponto '{m0['ponto']}' — área={area_bbox:.0f} "
                           f"({'perto' if area_bbox >= AREA_MIN_CHEGADA else f'longe, min={AREA_MIN_CHEGADA}'})"
                           f" alvo={MISSAO.alvo()}", flush=True)
             elif _ultimo["ponto"] is not None:
                 _ultimo["ponto"] = None
+                _ultimo["prox_enviada"] = False; _ultimo["conf_enviada"] = None
 
             # ── COMANDOS DO PAINEL ──
             for cmd, arg in BT.poll():
