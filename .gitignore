@@ -1,11 +1,9 @@
-dataset_v3/
-yolo_dataset/
+yolo_localizacao/
+dataset_conf_v3/
+dataset_v4
 
 yolo8n.onnx
 yolo8n.pt
 
-logs/
-checkpoints/
-
-.DS_Store
-Thumbs.db
+treinar_cnn_confirmacao.py
+treinar_yolo.py
