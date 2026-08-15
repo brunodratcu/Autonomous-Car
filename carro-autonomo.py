@@ -69,6 +69,7 @@ NUM_CLASSES = len(CLASSES)
 CNN_CLASSES = ["Semaforo", "Stop", "Fundo"]
 
 CLASS_TO_ACTION = {"Cone":"OBSTACLE", "Carro":"OBSTACLE", "Pessoa":"OBSTACLE"}
+DEBUG_FUNIL = os.environ.get("DEBUG_FUNIL", "0") == "1"   # export DEBUG_FUNIL=1 pra ativar
 
 # Rastreio e votação temporal do ramo de trânsito
 TRACK_IOU_HIGH = 0.30
@@ -721,6 +722,16 @@ class YOLODetector:
         self.coco_mode = ((o1 - 4) == 80) if isinstance(o1, int) else True
         print(f"[YOLO] {self.sess.get_providers()[0]} | "
               f"{'COCO' if self.coco_mode else 'custom'} | {self.input_size}px", flush=True)
+        if not self.coco_mode and isinstance(o1, int):
+            nc_modelo = o1 - 4
+            if nc_modelo != len(CLASSES):
+                print(f"[YOLO][ERRO FATAL] modelo tem {nc_modelo} classes na saída, "
+                      f"mas CLASSES (classes.txt) tem {len(CLASSES)}: {CLASSES}. "
+                      f"Os nomes vão sair TROCADOS silenciosamente — corrija o classes.txt "
+                      f"antes de continuar (deve ter {nc_modelo} linha(s), nessa ordem exata).",
+                      flush=True)
+                raise RuntimeError(
+                    f"classes.txt incompatível: modelo={nc_modelo} classes, CLASSES={len(CLASSES)}")
 
     @staticmethod
     def _letterbox(img, size):
@@ -816,7 +827,14 @@ def carregar_classes():
     p = os.path.join(os.path.dirname(YOLO_MODEL), "classes.txt")
     if os.path.exists(p):
         with open(p) as f: cls = [l.strip() for l in f if l.strip()]
-        if cls: return cls
+        if cls:
+            print(f"[YOLO] classes.txt: {cls}", flush=True)
+            if len(cls) != 2 or "Semaforo" not in cls:
+                print(f"[YOLO][AVISO] esperava 2 classes (Stop, Semaforo) — "
+                      f"achou {len(cls)}: {cls}. Se isso veio do TRAIN_YOLO.py antigo "
+                      f"(8 classes), é um classes.txt órfão — apague ou regenere.", flush=True)
+            return cls
+    print(f"[YOLO] classes.txt não encontrado, usando default: {CLASSES}", flush=True)
     return CLASSES
 
 
@@ -856,15 +874,23 @@ def geometria_concorda(gray, det) -> bool:
     if esperadas is None: return True
     x1, y1, x2, y2 = det["bbox"]; m = 4       # folga: o box do YOLO corta a borda
     crop = gray[max(0,y1-m):min(gray.shape[0],y2+m), max(0,x1-m):min(gray.shape[1],x2+m)]
-    if crop.size == 0 or crop.shape[0] < 16 or crop.shape[1] < 16: return False
+    if crop.size == 0 or crop.shape[0] < 16 or crop.shape[1] < 16:
+        if DEBUG_FUNIL: print(f"[geo] {det.get('class_name')} crop inválido, descartado", flush=True)
+        return False
     _, b = cv2.threshold(crop, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     cnts, _ = cv2.findContours(cv2.morphologyEx(b, cv2.MORPH_CLOSE, K5),
                                cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    if not cnts: return False
+    if not cnts:
+        if DEBUG_FUNIL: print(f"[geo] {det.get('class_name')} sem contorno, descartado", flush=True)
+        return False
     c = max(cnts, key=cv2.contourArea)
     _, _, bw, bh = cv2.boundingRect(c)
     det["forma"] = classificar_forma(c, bw, bh)
-    return det["forma"] in esperadas
+    ok = det["forma"] in esperadas
+    if DEBUG_FUNIL and not ok:
+        print(f"[geo] YOLO disse {det.get('class_name')} (conf={det.get('conf',0):.2f}) "
+              f"mas forma={det['forma']}, descartado", flush=True)
+    return ok
 
 
 # ================================================================
@@ -888,9 +914,15 @@ class Track:
 
     def votar(self):
         """Maioria qualificada no buffer — um frame isolado nunca decide."""
-        if len(self.buf) < VOTE_MIN_DETS: return None, 0.0
+        if len(self.buf) < VOTE_MIN_DETS:
+            if DEBUG_FUNIL:
+                print(f"[voto] track#{self.id} buffer={len(self.buf)}/{VOTE_MIN_DETS} insuficiente", flush=True)
+            return None, 0.0
         top, n = Counter(lb for lb,_ in self.buf).most_common(1)[0]
-        if n/len(self.buf) < VOTE_FRAC: return None, 0.0
+        if n/len(self.buf) < VOTE_FRAC:
+            if DEBUG_FUNIL:
+                print(f"[voto] track#{self.id} maioria {n}/{len(self.buf)} < {VOTE_FRAC}, não confirmado", flush=True)
+            return None, 0.0
         return top, float(np.mean([c for lb,c in self.buf if lb == top]))
 
     @property
@@ -943,19 +975,35 @@ class ByteTrackLite:
     @staticmethod
     def _classificar(det, frame, cnn, ood, verif=None):
         """Portão final: CNN → verificador → OOD. Qualquer 'não' vira None."""
+        cn = det.get("class_name", "?")
         if det.get("coco", False): return det["class_name"], det["conf"]
         if det.get("geo") and det["class_name"] == "Semaforo":
             return "Semaforo", score_final(det, det["conf"])
-        if cnn is None: return None, 0.0
+        if cnn is None:
+            if DEBUG_FUNIL: print(f"[cnn] {cn}: CNN indisponível, descartado", flush=True)
+            return None, 0.0
         x1, y1, x2, y2 = det["bbox"]
         crop = frame[y1:y2, x1:x2]
-        if crop.size == 0 or (x2-x1) < 8 or (y2-y1) < 8: return None, 0.0
+        if crop.size == 0 or (x2-x1) < 8 or (y2-y1) < 8:
+            if DEBUG_FUNIL: print(f"[cnn] {cn}: crop pequeno demais, descartado", flush=True)
+            return None, 0.0
         scores = cnn.predict(prep_mono(crop))
         i = int(scores.argmax())
         nome = CNN_CLASSES[i] if i < len(CNN_CLASSES) else None
-        if nome in (None, "Fundo"): return None, 0.0
-        if verif is not None and not verif.e_placa(scores, nome, det)[0]: return None, 0.0
-        if ood and not ood.aceitar(nome, float(scores.max())): return None, 0.0
+        if nome in (None, "Fundo"):
+            if DEBUG_FUNIL:
+                print(f"[cnn] {cn}: CNN disse Fundo (scores={np.round(scores,2)}), descartado", flush=True)
+            return None, 0.0
+        if verif is not None:
+            ok, motivo, margem = verif.e_placa(scores, nome, det)
+            if not ok:
+                if DEBUG_FUNIL: print(f"[pgom] {nome}: verificador rejeitou ({motivo}, margem={margem:.2f})", flush=True)
+                return None, 0.0
+        if ood and not ood.aceitar(nome, float(scores.max())):
+            if DEBUG_FUNIL:
+                thr = ood._t.get(nome, OOD_DEFAULT)
+                print(f"[ood] {nome}: score={scores.max():.2f} < thr={thr:.2f}, descartado", flush=True)
+            return None, 0.0
         return nome, score_final(det, float(scores.max()))
 
 
@@ -1390,16 +1438,27 @@ def main(debug_abc=False, auto=False, fast=False, usar_yolo=False, cam_idx=None)
             frame_e = preprocessar(frame_raw)
             h, w = frame_e.shape[:2]
             dets = detectar_geometrico(frame_e)
+            n_geo = len(dets)
 
+            n_yolo_raw = n_yolo_ok = 0
             if yolo and fn % YOLO_EVERY == 0:
                 rx0, ry0, rx1, ry1 = ROI_DIN.janela(h, w)
                 sub = frame_e[ry0:ry1, rx0:rx1]
                 if sub.size:
-                    for d in yolo.detectar(sub):
+                    yolo_dets = yolo.detectar(sub)
+                    n_yolo_raw = len(yolo_dets)
+                    for d in yolo_dets:
                         x1, y1, x2, y2 = d["bbox"]
                         d["bbox"] = (x1+rx0, y1+ry0, x2+rx0, y2+ry0)
                         if geometria_concorda(frame_e, d):   # a geometria tem a palavra final
-                            dets.append(d)
+                            dets.append(d); n_yolo_ok += 1
+                    if DEBUG_FUNIL and n_yolo_raw == 0:
+                        print(f"[yolo] frame {fn}: nenhuma detecção (nada chegou até a CNN)", flush=True)
+                    elif DEBUG_FUNIL and n_yolo_ok < n_yolo_raw:
+                        print(f"[yolo] frame {fn}: {n_yolo_raw} bruto -> {n_yolo_ok} passou no [geo]", flush=True)
+            if DEBUG_FUNIL and n_geo == 0 and n_yolo_raw == 0 and fn % YOLO_EVERY == 0:
+                print(f"[funil] frame {fn}: nada detectado nem por geo nem por yolo "
+                      f"(perdeu ANTES da classificação — checar ROI/exposição/distância)", flush=True)
 
             # delivery não passa por PGOM/CNN — geometria + topologia + votação
             entregas = [d for d in dets if d["class_name"] == "Delivery"]
