@@ -57,9 +57,17 @@ COCO_MAP    = {11:"Stop", 0:"Pessoa", 2:"Carro", 7:"Carro", 5:"Carro", 3:"Carro"
 COCO_CONF_MIN = {"Stop":0.28, "Semaforo":0.40, "Carro":0.55, "Pessoa":0.62}
 COCO_AREA_MIN = {"Pessoa":2000, "Carro":1500}
 
-CLASSES     = ["Stop","Esquerda","Direita","SemRetorno","Verde","Cone","Carro","Pessoa","Fundo"]
-CNN_CLASSES = CLASSES
+# Contrato da YOLO customizada (localização: Pare + Semaforo).
+# Ordem = ordem do data.yaml usado no treino (yolo_localizacao/dataset.yaml).
+# É lido de models/classes.txt se existir; senão usa este default.
+CLASSES     = ["Stop", "Semaforo"]
 NUM_CLASSES = len(CLASSES)
+
+# Contrato da CNN de confirmação (treinar_cnn_confirmacao.py).
+# Ordem = CLASSES do trainer. Fixo aqui, não deve variar por treino de YOLO
+# de terceiros — evita que um classes.txt da YOLO sobrescreva o da CNN.
+CNN_CLASSES = ["Semaforo", "Stop", "Fundo"]
+
 CLASS_TO_ACTION = {"Cone":"OBSTACLE", "Carro":"OBSTACLE", "Pessoa":"OBSTACLE"}
 
 # Rastreio e votação temporal do ramo de trânsito
@@ -79,7 +87,7 @@ PAINEL_PORTA = 8000
 CAR_ID       = "171"
 WIFI_SSID    = "171garage"
 WIFI_PASS    = "garagem171"
-WIFI_GATEWAY = "192.168.1.100"         # gateway de fábrica do TL-MR3020
+WIFI_GATEWAY = "192.168.0.1"         # gateway de fábrica do TL-MR3020
 
 # ── Tempos da missão ───────────────────────────────────────────
 ESPERA_ENTREGA_S = 7.0               # parado retirando / entregando
@@ -800,6 +808,11 @@ def prep_mono(crop):
 
 
 def carregar_classes():
+    """Lê o classes.txt AO LADO do modelo YOLO (models/classes.txt) — nunca
+    o da CNN. Plug-and-play: qualquer novo treino de YOLO só precisa trocar
+    esse arquivo, sem tocar em código. Convenção interna: a placa de PARE
+    deve se chamar 'Stop' aqui (não 'Pare'), pra bater com FORMA_CLASSE,
+    COCO_MAP e o resto do pipeline que já usa esse nome."""
     p = os.path.join(os.path.dirname(YOLO_MODEL), "classes.txt")
     if os.path.exists(p):
         with open(p) as f: cls = [l.strip() for l in f if l.strip()]
@@ -1324,17 +1337,20 @@ def abrir_camera(idx):
 
 
 def main(debug_abc=False, auto=False, fast=False, usar_yolo=False, cam_idx=None):
-    global _ser, CNN_CLASSES, CAM_FLIP, LEITOR, BT
+    global _ser, CLASSES, NUM_CLASSES, CAM_FLIP, LEITOR, BT
     global VOTE_BUFFER, VOTE_MIN_DETS
 
     if fast:
         VOTE_BUFFER, VOTE_MIN_DETS = 6, 3
 
+    # classes.txt (se existir) só afeta a YOLO — a CNN é sempre CNN_CLASSES fixo.
+    CLASSES = carregar_classes(); NUM_CLASSES = len(CLASSES)
+
     cnn = ood = verif = None
     if os.path.exists(CNN_MODEL):
         try:
             cnn = CNNClassifier(CNN_MODEL); ood = OODRejector(OOD_FILE)
-            verif = VerificadorPlaca(); CNN_CLASSES = carregar_classes()
+            verif = VerificadorPlaca()
         except Exception as e:
             print(f"[CNN] indisponível: {e}", flush=True)
 
