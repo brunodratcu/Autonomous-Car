@@ -2,8 +2,8 @@ yolo_localizacao/
 dataset_conf_v3/
 dataset_v4/
 
-yolov8n.onnx
-yolov8n.pt
+./yolov8n.onnx
+./yolov8n.pt
 
 treinar_cnn_confirmacao.py
 treinar_yolo.py
