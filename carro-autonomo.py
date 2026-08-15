@@ -41,7 +41,8 @@ IMG_W       = 640
 SERIAL_PORT = "COM3"
 BAUD        = 115200
 
-YOLO_MODEL  = "./models/sign_detector.onnx"
+YOLO_MODEL  = "./models/sign_detector.onnx"   # custom: Stop + Semaforo (2 classes)
+COCO_MODEL  = "./models/yolov8n.onnx"         # COCO pré-treinado: Pessoa (+ Carro de apoio)
 CNN_MODEL   = "./models/sign_classifier.tflite"
 OOD_FILE    = "./models/ood_thresholds.json"
 
@@ -52,7 +53,7 @@ OOD_DEFAULT = 0.55
 YOLO_CONF   = 0.25
 YOLO_NMS    = 0.45
 YOLO_SIZE   = 640
-YOLO_EVERY  = 5                      # roda 1 frame em cada 5
+YOLO_EVERY  = 3                      # roda 1 frame em cada 3 (era 5 — rápido demais parado, lento em movimento)
 COCO_MAP    = {11:"Stop", 0:"Pessoa", 2:"Carro", 7:"Carro", 5:"Carro", 3:"Carro", 9:"Semaforo"}
 COCO_CONF_MIN = {"Stop":0.28, "Semaforo":0.40, "Carro":0.55, "Pessoa":0.62}
 COCO_AREA_MIN = {"Pessoa":2000, "Carro":1500}
@@ -76,8 +77,8 @@ TRACK_IOU_HIGH = 0.30
 TRACK_IOU_LOW  = 0.15
 TRACK_MAX_AGE  = 10
 CONF_HIGH_THR  = 0.45
-VOTE_BUFFER    = 10
-VOTE_MIN_DETS  = 5
+VOTE_BUFFER    = 6          # era 10 — a 15km/h não dá tempo de acumular tanto
+VOTE_MIN_DETS  = 3          # era 5 — 3 votos já é maioria qualificada com VOTE_FRAC
 VOTE_FRAC      = 0.60
 
 AREA_MIN_EXEC = 800                  # bbox mínima p/ um track valer decisão
@@ -707,7 +708,7 @@ def score_final(det, cnn_conf):
 class YOLODetector:
     """ONNX Runtime; aceita YOLOv8 COCO pré-treinado ou modelo próprio."""
 
-    def __init__(self, path):
+    def __init__(self, path, esperar_custom=False):
         import onnxruntime as ort
         opts = ort.SessionOptions()
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -720,8 +721,16 @@ class YOLODetector:
         self.input_size = hm if isinstance(hm, int) and isinstance(wm, int) else YOLO_SIZE
         o1 = self.sess.get_outputs()[0].shape[1]
         self.coco_mode = ((o1 - 4) == 80) if isinstance(o1, int) else True
-        print(f"[YOLO] {self.sess.get_providers()[0]} | "
+        print(f"[YOLO] {path} | {self.sess.get_providers()[0]} | "
               f"{'COCO' if self.coco_mode else 'custom'} | {self.input_size}px", flush=True)
+        if esperar_custom and self.coco_mode:
+            raise RuntimeError(
+                f"{path} é um modelo COCO (80 classes), esperava o custom Stop/Semaforo. "
+                f"Você apontou o arquivo errado — confira YOLO_MODEL.")
+        if not esperar_custom and not self.coco_mode:
+            raise RuntimeError(
+                f"{path} não é o modelo COCO esperado (achou {o1-4} classes, não 80). "
+                f"Confira COCO_MODEL.")
         if not self.coco_mode and isinstance(o1, int):
             nc_modelo = o1 - 4
             if nc_modelo != len(CLASSES):
@@ -910,7 +919,7 @@ class Track:
         self.bbox = bbox; self.class_hint = hint; self.conf = conf
         self.missed = 0; self.age += 1
         if cnn_lbl: self.buf.append((cnn_lbl, cnn_conf))
-        if self.age >= 3: self.state = "confirmed"
+        if self.age >= 2: self.state = "confirmed"   # era 3 — em movimento, 2 já filtra ruído de 1 frame
 
     def votar(self):
         """Maioria qualificada no buffer — um frame isolado nunca decide."""
@@ -1389,7 +1398,7 @@ def main(debug_abc=False, auto=False, fast=False, usar_yolo=False, cam_idx=None)
     global VOTE_BUFFER, VOTE_MIN_DETS
 
     if fast:
-        VOTE_BUFFER, VOTE_MIN_DETS = 6, 3
+        VOTE_BUFFER, VOTE_MIN_DETS = 4, 2     # --fast: ainda mais rápido, pra pista em movimento
 
     # classes.txt (se existir) só afeta a YOLO — a CNN é sempre CNN_CLASSES fixo.
     CLASSES = carregar_classes(); NUM_CLASSES = len(CLASSES)
@@ -1402,10 +1411,18 @@ def main(debug_abc=False, auto=False, fast=False, usar_yolo=False, cam_idx=None)
         except Exception as e:
             print(f"[CNN] indisponível: {e}", flush=True)
 
-    yolo = None; modo = "GEO"
+    yolo = yolo_coco = None; modo = "GEO"
     if usar_yolo and os.path.exists(YOLO_MODEL):
-        try: yolo = YOLODetector(YOLO_MODEL); modo = "GEO+YOLO"
-        except Exception as e: print(f"[YOLO] indisponível: {e}", flush=True)
+        try:
+            yolo = YOLODetector(YOLO_MODEL, esperar_custom=True); modo = "GEO+YOLO"
+        except Exception as e:
+            print(f"[YOLO] custom indisponível: {e}", flush=True)
+    if usar_yolo and os.path.exists(COCO_MODEL):
+        try:
+            yolo_coco = YOLODetector(COCO_MODEL, esperar_custom=False)
+            modo = modo + "+COCO"
+        except Exception as e:
+            print(f"[YOLO] coco indisponível: {e}", flush=True)
 
     LEITOR = LeitorLetras(debug=debug_abc)
     BT = PainelLocal()
@@ -1456,6 +1473,15 @@ def main(debug_abc=False, auto=False, fast=False, usar_yolo=False, cam_idx=None)
                         print(f"[yolo] frame {fn}: nenhuma detecção (nada chegou até a CNN)", flush=True)
                     elif DEBUG_FUNIL and n_yolo_ok < n_yolo_raw:
                         print(f"[yolo] frame {fn}: {n_yolo_raw} bruto -> {n_yolo_ok} passou no [geo]", flush=True)
+
+            if yolo_coco and fn % YOLO_EVERY == 0:
+                rx0, ry0, rx1, ry1 = ROI_DIN.janela(h, w)
+                sub = frame_e[ry0:ry1, rx0:rx1]
+                if sub.size:
+                    for d in yolo_coco.detectar(sub):
+                        x1, y1, x2, y2 = d["bbox"]
+                        d["bbox"] = (x1+rx0, y1+ry0, x2+rx0, y2+ry0)
+                        dets.append(d)   # coco=True já pula geometria/CNN em _classificar
             if DEBUG_FUNIL and n_geo == 0 and n_yolo_raw == 0 and fn % YOLO_EVERY == 0:
                 print(f"[funil] frame {fn}: nada detectado nem por geo nem por yolo "
                       f"(perdeu ANTES da classificação — checar ROI/exposição/distância)", flush=True)

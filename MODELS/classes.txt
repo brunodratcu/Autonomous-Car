@@ -1,9 +1,2 @@
 Stop
-Esquerda
-Direita
-SemRetorno
-Verde
-Cone
-Carro
-Pessoa
-Fundo
+Semaforo
