@@ -83,6 +83,8 @@ VOTE_FRAC      = 0.60
 
 AREA_MIN_EXEC = 800                  # bbox mínima p/ um track valer decisão
 AREA_MIN_PROX = 350                  # bbox mínima p/ avisar "aproximando" (menor que EXEC — avisa antes)
+AREA_PROX_NIVEIS = [350, 900, 1800]  # níveis crescentes — cada um cruzado reenvia PROX (proxy de "cm")
+AREA_CHEGADA_SINALEIRA = 3000        # limiar final p/ PARE/Semaforo — "executa agora" (calibrar na pista)
 ROI_Y0, ROI_Y1 = 0.05, 0.92          # faixa vertical útil do frame
 
 # ── Rede e painel — TP-Link TL-MR3020 em modo AP, sem internet ──
@@ -286,13 +288,38 @@ def peneira_roi(crop_gray, area_rel, exige_simbolo=True):
 
 
 def estado_semaforo(crop_gray):
-    """Sem cor: o farol aceso é o terço mais claro da caixa vertical."""
+    """Retifica o crop em 3 posições esperadas (topo/meio/base) e decide qual
+    LÂMPADA ACESA existe comparando as posições ENTRE SI — não contra a média
+    global do crop. Isso importa fisicamente: em escala de cinza, vermelho
+    saturado converte pra luminância BAIXA (Y=0.299R+0.587G+0.114B pesa pouco
+    o vermelho), então um vermelho aceso pode ficar mais escuro que o bezel
+    plástico claro ao redor — comparar contra o fundo global sistematicamente
+    perde o vermelho. Comparar irmã-contra-irmã (a posição acesa domina as
+    outras duas, que estão apagadas/pretas) é robusto a isso.
+    Área luminosa do núcleo confirma que não é ruído pontual."""
     if crop_gray is None or crop_gray.size == 0: return None
     if crop_gray.ndim == 3: crop_gray = cv2.cvtColor(crop_gray, cv2.COLOR_BGR2GRAY)
-    g = cv2.resize(crop_gray, (30, 90))
-    tercos = [float(g[0:30].mean()), float(g[30:60].mean()), float(g[60:90].mean())]
-    if max(tercos) - sorted(tercos)[1] < 8: return None
-    return ["vermelho", "amarelo", "verde"][int(np.argmax(tercos))]
+    g = cv2.resize(crop_gray, (30, 90)).astype(np.float32)
+
+    nucleos, areas = [], []
+    for i in range(3):
+        bloco = g[i*30:(i+1)*30]
+        cy, cx = 15, 15
+        nucleo = bloco[max(0,cy-8):cy+8, max(0,cx-8):cx+8]
+        borda_mask = np.ones_like(bloco, dtype=bool)
+        borda_mask[max(0,cy-8):cy+8, max(0,cx-8):cx+8] = False
+        anel = bloco[borda_mask]
+        b_central = float(nucleo.mean()) if nucleo.size else 0.0
+        b_anel = float(anel.mean()) if anel.size else b_central
+        nucleos.append(b_central)
+        areas.append(float((nucleo > (b_anel + 15)).mean()) if nucleo.size else 0.0)
+
+    i_top = int(np.argmax(nucleos))
+    ordenado = sorted(nucleos, reverse=True)
+    margem = ordenado[0] - ordenado[1]      # domina as OUTRAS 2 posições, não o fundo global
+    if margem < 10 or areas[i_top] < 0.05:  # 3 parecidas (apagado/ambíguo) ou sem área real acesa
+        return None
+    return ["vermelho", "amarelo", "verde"][i_top]
 
 
 # ================================================================
@@ -509,6 +536,52 @@ def gerar_placas_abc(pasta="./placas_abc", px=700):
 #      dois ramos (trânsito e delivery)
 # ================================================================
 
+def agrupar_farois_soltos(sub):
+    """A moldura do semáforo raramente forma um contorno fechado próprio —
+    o que o segmentador acha de verdade são as 3 ABERTURAS CIRCULARES soltas
+    (cada lâmpada, acesa ou apagada, é um blob isolado). Aqui a gente acha
+    esses círculos primeiro, agrupa os que estão empilhados na mesma coluna,
+    e sintetiza o retângulo do corpo do semáforo ao redor do grupo — em vez
+    de exigir que o retângulo já viesse pronto como um contorno único."""
+    h, w = sub.shape[:2]
+    blobs = []
+    for thr in (cv2.threshold(sub,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)[1],
+                cv2.threshold(sub,0,255,cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU)[1]):
+        cnts, _ = cv2.findContours(thr, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        for c in cnts:
+            a = cv2.contourArea(c)
+            if not (40 < a < 1400): continue
+            x, y, bw, bh = cv2.boundingRect(c)
+            if not (0.6 < bw/max(bh,1) < 1.7): continue          # é redondo?
+            if 4*np.pi*a/max(cv2.arcLength(c,True)**2, 1) < 0.55: continue
+            blobs.append((x, y, bw, bh))
+    if len(blobs) < 2: return []
+
+    blobs.sort(key=lambda b: b[1])          # de cima pra baixo
+    usados = [False]*len(blobs)
+    grupos = []
+    for i, b in enumerate(blobs):
+        if usados[i]: continue
+        cx, diam = b[0]+b[2]/2, max(b[2], b[3])
+        grupo = [b]; usados[i] = True
+        for j in range(i+1, len(blobs)):
+            if usados[j] or len(grupo) == 3: continue
+            b2 = blobs[j]; cx2 = b2[0]+b2[2]/2
+            # mesma coluna (x parecido) e espaçamento vertical plausível
+            if abs(cx2-cx) < diam*0.7 and 0 < (b2[1]-grupo[-1][1]) < diam*4:
+                grupo.append(b2); usados[j] = True
+        if 2 <= len(grupo) <= 3:
+            xs = [g[0] for g in grupo]; xe = [g[0]+g[2] for g in grupo]
+            ys = [g[1] for g in grupo]; ye = [g[1]+g[3] for g in grupo]
+            diam_med = float(np.mean([max(g[2],g[3]) for g in grupo]))
+            mx, my = int(diam_med*0.35), int(diam_med*0.5)   # margem: molde/corpo ao redor
+            x1r = max(0, min(xs)-mx); y1r = max(0, min(ys)-my)
+            x2r = min(w, max(xe)+mx); y2r = min(h, max(ye)+my)
+            if x2r > x1r and y2r > y1r:
+                grupos.append((x1r, y1r, x2r-x1r, y2r-y1r))
+    return grupos
+
+
 def detectar_geometrico(gray):
     """-> candidatos {'Stop','Semaforo','Delivery'}; Delivery traz 'ponto' e 'score'."""
     h, w = gray.shape[:2]
@@ -518,6 +591,13 @@ def detectar_geometrico(gray):
 
     cands = []
     n_letra = [0, 0]                    # orçamento separado: [circulo, "?"]
+
+    # DESATIVADO — o agrupador de faróis soltos causou regressão grave em
+    # teste real (inundou candidatos de "Semaforo" falso, atropelou PARE e
+    # Delivery). Revertido até calibrar com frame real da câmera, não foto
+    # de tela. A função agrupar_farois_soltos() continua definida abaixo,
+    # só não é mais chamada aqui.
+
     for m in segmentar(sub):
         # CHAIN_APPROX_NONE: harmonico_8 precisa da borda inteira, não só dos cantos
         cnts, _ = cv2.findContours(m, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
@@ -910,16 +990,20 @@ def geometria_concorda(gray, det) -> bool:
 
 class Track:
     _nid = 0
-    N_CONSECUTIVO = 3   # "uns três frames consecutivos" pedido pro Portenta confiar na cor/PARE
+    N_CONSECUTIVO = 3       # PARE: 3 consecutivos
+    COR_N_CONSECUTIVO = 4   # semáforo (vermelho/verde): 4 consecutivos — mais rigoroso
 
     def __init__(self, bbox, hint, conf):
         self.id = Track._nid; Track._nid += 1
         self.bbox = bbox; self.class_hint = hint; self.conf = conf
         self.buf = deque(maxlen=VOTE_BUFFER); self.age = 0; self.missed = 0
         self.state = "tentative"
-        self.evt_prox_enviado = False   # já avisou "aproximando" pro Portenta?
+        self.evt_prox_enviado = False   # legado — mantido por compat, não usado mais pra Stop/Semaforo
+        self.nivel_prox = 0             # quantos níveis de AREA_PROX_NIVEIS já foram avisados
+        self.evt_chegada_enviado = False
         self.evt_conf_enviado = None    # já confirmou (e qual valor) pro Portenta?
         self.cor_buf = deque(maxlen=5)  # histórico de cor do semáforo (separado do buf de classe)
+        self.stop_consumido = False     # já mandou parar por causa deste track? não repete até ele sumir
 
     def atualizar(self, bbox, hint, conf, cnn_lbl, cnn_conf):
         self.bbox = bbox; self.class_hint = hint; self.conf = conf
@@ -937,11 +1021,14 @@ class Track:
         return None
 
     def cor_consecutiva(self, cor_atual):
-        """Mesmo critério, só que pra cor do semáforo (vermelho/amarelo/verde),
-        que muda frame a frame e não vive no buf de classe."""
+        """Mesmo critério, só que pra cor do semáforo, que muda frame a frame
+        e não vive no buf de classe. Vale igual pras 3 cores (precisa de
+        COR_N_CONSECUTIVO iguais em sequência pra reportar) — o tratamento
+        especial do amarelo (não libera, não cancela vermelho) é regra da
+        Missão, não deste método."""
         self.cor_buf.append(cor_atual)
-        if len(self.cor_buf) < self.N_CONSECUTIVO: return None
-        ultimos = list(self.cor_buf)[-self.N_CONSECUTIVO:]
+        if len(self.cor_buf) < self.COR_N_CONSECUTIVO: return None
+        ultimos = list(self.cor_buf)[-self.COR_N_CONSECUTIVO:]
         if None not in ultimos and len(set(ultimos)) == 1: return ultimos[0]
         return None
 
@@ -1101,6 +1188,33 @@ class Missao:
 MISSAO = Missao()
 
 
+def pare_satisfeito(percep):
+    """Verdadeiro se não há PARE ativo agora, OU se já ficamos parados o
+    tempo mínimo com o PARE ativo — mesmo que o motivo de ter parado tenha
+    sido outro (ex.: semáforo vermelho no mesmo cruzamento). Sem isso, o
+    carro podia sair andando no verde sem nunca ter 'pago' o PARE ao lado."""
+    if not percep.get("pare"):
+        return True
+    if MISSAO.tempo_no_estado() >= 2.5:
+        trk = percep.get("pare_trk")
+        if trk is not None: trk.stop_consumido = True
+        return True
+    return False
+
+
+def semaforo_libera(est, percep):
+    """Amarelo NUNCA libera o carro de um PARADO_SEM, e nunca cancela um
+    vermelho anterior — é transição, não permissão. Só o verde libera
+    quando o motivo de ter parado foi o próprio semáforo. Nos outros
+    estados de parada (PARE, obstáculo), quem não foi causado pelo
+    semáforo só continua bloqueado se o semáforo estiver EM vermelho
+    agora — amarelo ali não segura o carro por conta própria."""
+    cor = percep.get("semaforo")
+    if cor == "vermelho": return False
+    if est == "PARADO_SEM": return cor == "verde"
+    return True
+
+
 # ================================================================
 #  [9] CONTROLE E SERIAL
 # ================================================================
@@ -1161,6 +1275,16 @@ def sinalizar_confirmacao(tipo, valor, ser):
     print(f"[SERIAL] confirmação -> {tipo}:{valor}", flush=True)
     if ser:
         try: ser.write((f'{{"evt":"CONF","tipo":"{tipo}","valor":"{valor}"}}\n').encode())
+        except Exception: pass
+
+
+def sinalizar_chegada(tipo, ser):
+    """LOG 3 pro Portenta: 'chegou perto o suficiente — executa agora.'
+    Separado da confirmação de cor/classe: é só sobre DISTÂNCIA (área do
+    bbox como proxy de 'cm'), dispara uma vez ao cruzar AREA_CHEGADA_SINALEIRA."""
+    print(f"[SERIAL] chegada -> {tipo}", flush=True)
+    if ser:
+        try: ser.write((f'{{"evt":"CHEG","tipo":"{tipo}"}}\n').encode())
         except Exception: pass
 
 
@@ -1544,49 +1668,65 @@ def main(debug_abc=False, auto=False, fast=False, usar_yolo=False, cam_idx=None)
             # ── VISÃO: constatação de fatos, nenhuma decisão ──
             percep = dict(pare=False, semaforo=None, obstaculo=False, ponto=None)
             for trk in tracks:
-                # LOG 1 (proximidade): dispara assim que a bbox cresce o bastante,
-                # ANTES de qualquer confirmação de cor/classe — só avisa "tem
-                # sinaleira chegando". Uma vez só por track.
-                if (not trk.evt_prox_enviado and trk.area >= AREA_MIN_PROX
-                        and trk.class_hint in ("Stop", "Semaforo")):
-                    sinalizar_proximidade("PARE" if trk.class_hint == "Stop" else "SEM", _ser)
-                    trk.evt_prox_enviado = True
+                # LOG 1 (proximidade): repete a cada nível de área cruzado —
+                # é o proxy de "cada N cm de aproximação" sem sensor de distância.
+                if trk.class_hint in ("Stop", "Semaforo"):
+                    while (trk.nivel_prox < len(AREA_PROX_NIVEIS)
+                           and trk.area >= AREA_PROX_NIVEIS[trk.nivel_prox]):
+                        sinalizar_proximidade("PARE" if trk.class_hint == "Stop" else "SEM", _ser)
+                        trk.nivel_prox += 1
+                    # LOG 3 (chegada): separado da confirmação de cor/classe —
+                    # só sobre distância. "Chegou perto, executa agora."
+                    if trk.area >= AREA_CHEGADA_SINALEIRA and not trk.evt_chegada_enviado:
+                        sinalizar_chegada("PARE" if trk.class_hint == "Stop" else "SEM", _ser)
+                        trk.evt_chegada_enviado = True
 
                 lbl, _ = trk.votar()
                 if not lbl or trk.state != "confirmed" or trk.area < AREA_MIN_EXEC: continue
                 if lbl == "Semaforo":
                     x1, y1, x2, y2 = trk.bbox
                     cor = estado_semaforo(frame_e[y1:y2, x1:x2])
-                    percep["semaforo"] = cor
                     # LOG 2 (confirmação): só depois de N_CONSECUTIVO frames com a
                     # MESMA cor seguida — não é maioria estatística, é sequência.
+                    # A MISSÃO só enxerga a cor CONFIRMADA, nunca a leitura crua —
+                    # é o que evita a missão reagir antes da hora.
                     cor_conf = trk.cor_consecutiva(cor)
-                    if cor_conf and trk.evt_conf_enviado != cor_conf:
-                        sinalizar_confirmacao("SEM", cor_conf, _ser)
-                        trk.evt_conf_enviado = cor_conf
+                    if cor_conf:
+                        percep["semaforo"] = cor_conf
+                        if trk.evt_conf_enviado != cor_conf:
+                            sinalizar_confirmacao("SEM", cor_conf, _ser)
+                            trk.evt_conf_enviado = cor_conf
                 elif lbl == "Stop":
-                    percep["pare"] = True
-                    if trk.consecutivo() == "Stop" and trk.evt_conf_enviado != "ok":
-                        sinalizar_confirmacao("PARE", "ok", _ser)
-                        trk.evt_conf_enviado = "ok"
+                    # Mesma lógica: a MISSÃO só vê "pare" quando os 3 consecutivos
+                    # bateram — e só UMA VEZ por track (stop_consumido), pra não
+                    # reabrir a decisão de parar enquanto a mesma placa segue no
+                    # campo de visão (ela nunca deixa de ser vista até o carro passar).
+                    if trk.consecutivo() == "Stop" and not trk.stop_consumido:
+                        percep["pare"] = True
+                        percep["pare_trk"] = trk    # pra marcar consumido só quando a missão executar
+                        if trk.evt_conf_enviado != "ok":
+                            sinalizar_confirmacao("PARE", "ok", _ser)
+                            trk.evt_conf_enviado = "ok"
                 elif CLASS_TO_ACTION.get(lbl) == "OBSTACLE":
                     percep["obstaculo"] = True
 
             m0 = LEITOR.votar(entregas)
+            alvo_atual = MISSAO.alvo()   # o Portenta não precisa saber que vimos B se o alvo é C
             if m0 is not None:
                 bx1, by1, bx2, by2 = m0["bbox"]
                 area_bbox = (bx2-bx1)*(by2-by1)
-                # LOG 1 (proximidade) do delivery: primeira vez que o ponto cresce
-                # o bastante pra valer aviso, mesmo antes de "chegar" de verdade.
-                if area_bbox >= AREA_MIN_PROX_ENTREGA and not _ultimo.get("prox_enviada"):
-                    sinalizar_proximidade("ENTREGA", _ser)
-                    _ultimo["prox_enviada"] = True
-                if area_bbox >= AREA_MIN_CHEGADA:
-                    percep["ponto"] = m0["ponto"]
-                    # LOG 2 (confirmação) do delivery: chegou de fato no ponto.
-                    if _ultimo.get("conf_enviada") != m0["ponto"]:
-                        sinalizar_confirmacao("ENTREGA", m0["ponto"], _ser)
-                        _ultimo["conf_enviada"] = m0["ponto"]
+                e_alvo = (alvo_atual is not None and m0["ponto"] == alvo_atual)
+                # só é "candidato à chegada" se a letra bater com o alvo da missão —
+                # ver B procurando C não gera evento nenhum, nem proximidade.
+                if e_alvo:
+                    if area_bbox >= AREA_MIN_PROX_ENTREGA and not _ultimo.get("prox_enviada"):
+                        sinalizar_proximidade("ENTREGA", _ser)
+                        _ultimo["prox_enviada"] = True
+                    if area_bbox >= AREA_MIN_CHEGADA:
+                        percep["ponto"] = m0["ponto"]
+                        if _ultimo.get("conf_enviada") != m0["ponto"]:
+                            sinalizar_confirmacao("ENTREGA", m0["ponto"], _ser)
+                            _ultimo["conf_enviada"] = m0["ponto"]
                 if m0["ponto"] != _ultimo["ponto"]:
                     _ultimo["ponto"] = m0["ponto"]
                     _ultimo["prox_enviada"] = False; _ultimo["conf_enviada"] = None
@@ -1637,13 +1777,8 @@ def main(debug_abc=False, auto=False, fast=False, usar_yolo=False, cam_idx=None)
                 # a chegada vale mesmo parado: o ponto costuma ficar junto de um cruzamento
                 if chegou:
                     _chegada(_ser)
-                elif est == "PARADO_SEM" and percep["semaforo"] == "verde":
-                    MISSAO.set_estado(MISSAO.retorno); seguir(_ser)
-                elif est == "PARADO_PARE" and MISSAO.tempo_no_estado() >= 2.5 \
-                        and not percep["obstaculo"] and percep["semaforo"] != "vermelho":
-                    MISSAO.set_estado(MISSAO.retorno); seguir(_ser)
-                elif est == "PARADO_OBST" and not percep["obstaculo"] \
-                        and percep["semaforo"] != "vermelho":
+                elif (not percep["obstaculo"] and semaforo_libera(est, percep)
+                        and pare_satisfeito(percep)):
                     MISSAO.set_estado(MISSAO.retorno); seguir(_ser)
 
             elif est == "RETIRANDO":
