@@ -109,7 +109,8 @@ LETRA_ESCALA    = 4.5                # fonte do molde e do PNG de impressão
 LETRA_ESPESSURA = 12
 
 AREA_MIN_LEITURA = 400               # contorno mínimo p/ tentar LER a letra
-AREA_MIN_CHEGADA = 9000              # bbox mínima p/ declarar "cheguei" (calibrar na pista)
+AREA_MIN_CHEGADA = 9000              # bbox mínima p/ declarar "cheguei" (fallback se ROI indisponível)
+FRACAO_CHEGADA_ROI = 0.40            # OU: letra domina >=40% da área do ROI — desacelera suave, não tranco
 AREA_MIN_PROX_ENTREGA = 3000         # bbox mínima p/ avisar "aproximando do ponto" (calibrar na pista)
 
 LETRA_SCORE_MIN   = 0.50             # casamento mínimo com o molde normalizado
@@ -1020,6 +1021,15 @@ class Track:
         if len(set(ultimos)) == 1: return ultimos[0]
         return None
 
+    def confianca_consecutivo(self):
+        """Confiança média das N_CONSECUTIVO leituras que confirmaram —
+        o Python sempre para no PARE (segurança não é negociável aqui), mas
+        informa ao Portenta se a confiança foi alta ou só razoável, pra ele
+        decidir localmente entre parada absoluta e parada mais cautelosa."""
+        if len(self.buf) < self.N_CONSECUTIVO: return 0.0
+        ultimos = list(self.buf)[-self.N_CONSECUTIVO:]
+        return float(np.mean([c for _, c in ultimos]))
+
     def cor_consecutiva(self, cor_atual):
         """Mesmo critério, só que pra cor do semáforo, que muda frame a frame
         e não vive no buf de classe. Vale igual pras 3 cores (precisa de
@@ -1704,14 +1714,23 @@ def main(debug_abc=False, auto=False, fast=False, usar_yolo=False, cam_idx=None)
                     if trk.consecutivo() == "Stop" and not trk.stop_consumido:
                         percep["pare"] = True
                         percep["pare_trk"] = trk    # pra marcar consumido só quando a missão executar
-                        if trk.evt_conf_enviado != "ok":
-                            sinalizar_confirmacao("PARE", "ok", _ser)
-                            trk.evt_conf_enviado = "ok"
+                        # o Python SEMPRE para no PARE — segurança não é negociável.
+                        # Só o VALOR informado ao Portenta muda: acima de 0.8 é
+                        # confiança absoluta, entre 0.5-0.8 é cautelosa. O Python
+                        # não interpreta isso como "talvez pare" — é sempre "para".
+                        conf_media = trk.confianca_consecutivo()
+                        valor = "ok_alta" if conf_media > 0.8 else "ok_cautelosa"
+                        if trk.evt_conf_enviado != valor:
+                            sinalizar_confirmacao("PARE", valor, _ser)
+                            trk.evt_conf_enviado = valor
                 elif CLASS_TO_ACTION.get(lbl) == "OBSTACLE":
                     percep["obstaculo"] = True
 
             m0 = LEITOR.votar(entregas)
             alvo_atual = MISSAO.alvo()   # o Portenta não precisa saber que vimos B se o alvo é C
+            rx0, ry0, rx1, ry1 = ROI_DIN.janela(h, w)
+            area_roi = max(1, (rx1-rx0) * (ry1-ry0))
+            area_chegada = max(AREA_MIN_CHEGADA, area_roi * FRACAO_CHEGADA_ROI)
             if m0 is not None:
                 bx1, by1, bx2, by2 = m0["bbox"]
                 area_bbox = (bx2-bx1)*(by2-by1)
@@ -1722,7 +1741,7 @@ def main(debug_abc=False, auto=False, fast=False, usar_yolo=False, cam_idx=None)
                     if area_bbox >= AREA_MIN_PROX_ENTREGA and not _ultimo.get("prox_enviada"):
                         sinalizar_proximidade("ENTREGA", _ser)
                         _ultimo["prox_enviada"] = True
-                    if area_bbox >= AREA_MIN_CHEGADA:
+                    if area_bbox >= area_chegada:
                         percep["ponto"] = m0["ponto"]
                         if _ultimo.get("conf_enviada") != m0["ponto"]:
                             sinalizar_confirmacao("ENTREGA", m0["ponto"], _ser)
@@ -1731,7 +1750,7 @@ def main(debug_abc=False, auto=False, fast=False, usar_yolo=False, cam_idx=None)
                     _ultimo["ponto"] = m0["ponto"]
                     _ultimo["prox_enviada"] = False; _ultimo["conf_enviada"] = None
                     print(f"[ABC] ponto '{m0['ponto']}' — área={area_bbox:.0f} "
-                          f"({'perto' if area_bbox >= AREA_MIN_CHEGADA else f'longe, min={AREA_MIN_CHEGADA}'})"
+                          f"({'perto' if area_bbox >= area_chegada else f'longe, min={area_chegada:.0f}'})"
                           f" alvo={MISSAO.alvo()}", flush=True)
             elif _ultimo["ponto"] is not None:
                 _ultimo["ponto"] = None
