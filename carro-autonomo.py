@@ -137,6 +137,14 @@ FRACAO_CHEGADA_ROI = 0.40            # OU: letra domina >=40% da área do ROI �
 AREA_MIN_PROX_ENTREGA = 3000         # bbox mínima p/ avisar "aproximando do ponto" (calibrar na pista)
 
 LETRA_SCORE_MIN   = 0.50             # casamento mínimo com o molde normalizado
+LETRA_SCORE_MIN_C = 0.20             # nb=0 só existe em "C" — nada mais pra confundir,
+                                      # então a régua alta (pensada pra separar A/B por
+                                      # aparência) é redundante aqui. C é a letra mais
+                                      # sensível a rotação de montagem (abertura tem
+                                      # direção; A/B são ~anéis, quase invariantes) —
+                                      # medido: score cai de 1.00 (0°) pra 0.30 (45°) só
+                                      # por rotação, com margem sempre saudável (nunca
+                                      # confunde com A/B em nenhum ângulo testado).
 LETRA_SCORE_FORTE = 0.62             # acima disto a letra vence forma duvidosa
 LETRA_MARGEM_MIN  = 0.06             # vantagem sobre a 2ª letra
 LETRA_TINTA_MIN   = 0.07             # fração de preto no miolo do disco
@@ -530,8 +538,18 @@ class LeitorLetras:
         self.votos = deque(maxlen=LETRA_VOTOS_N)
         self.debug = debug; self._fn = 0
 
-    def ler(self, sub, c, bbox):
-        """-> (letra|None, score). Em debug, diz sempre por que reprovou."""
+    def ler(self, sub, c, bbox, forma_circulo=False):
+        """-> (letra|None, score). Em debug, diz sempre por que reprovou.
+        forma_circulo=True: o contorno já passou pelo teste geométrico
+        ESTRITO de círculo (classificar_forma) antes de chegar aqui — só
+        nesse caso o piso reduzido de nb=0 (ver LETRA_SCORE_MIN_C) é seguro.
+        Sem essa garantia, nb=0 é o caso MAIS COMUM de ruído qualquer em
+        cena real (a maioria dos blobs sem forma definida não fecha um
+        laço), então tratá-lo como "só pode ser C" fora do "circulo"
+        estrito vira fábrica de falso-positivo — medido em log real de
+        18/08: dezenas de blobs pequenos com buracos=0 sem nenhuma relação
+        com a placa física, contra uma progressão de zoom limpa e única
+        para buracos=1/2 (A/B reais)."""
         x, y, bw, bh = bbox
         cru = sub[y:y+bh, x:x+bw]
         if cru.size == 0: return None, 0.0
@@ -558,8 +576,17 @@ class LeitorLetras:
                                     for L, mo in self.moldes.items()), reverse=True)
                     (s1, L_mol), (s2, _) = notas[0], notas[1]
                     mg = s1 - s2
-                    if   L_topo is None:            motivo = f"{nb} buracos"
-                    elif L_topo != L_mol:           motivo = f"discordam ({L_topo}/{L_mol})"
+                    score_c = next((sc for sc, L in notas if L == "C"), 0.0)
+                    if nb == 0 and forma_circulo:
+                        # 0 buracos + já passou no círculo estrito: aqui sim
+                        # é seguro assumir que só pode ser C (nada mais no
+                        # conjunto tem essa topologia) e usar o piso reduzido.
+                        if score_c >= LETRA_SCORE_MIN_C:
+                            letra, s1, motivo = "C", score_c, f"ok circulo (nb=0, score={score_c:.2f})"
+                        else:
+                            motivo = f"C: score {score_c:.2f} baixo até pro piso reduzido"
+                    elif L_topo is None:            motivo = f"{nb} buracos"
+                    elif L_topo != L_mol:           motivo = f"discordam ({L_topo}/{L_mol}) score_c={score_c:.2f}"
                     elif s1 < LETRA_SCORE_MIN:      motivo = f"score {s1:.2f}"
                     elif mg < LETRA_MARGEM_MIN:     motivo = f"margem {mg:.2f}"
                     else:                           letra, motivo = L_topo, "ok"
@@ -742,7 +769,7 @@ def detectar_geometrico(gray):
                     i = 0 if forma == "circulo" else 1
                     n_letra[i] += 1
                     if n_letra[i] > (LETRA_MAX_CIRC if i == 0 else LETRA_MAX_DUVIDA): continue
-                    ponto, score = LEITOR.ler(sub, c, (x, y, bw, bh))
+                    ponto, score = LEITOR.ler(sub, c, (x, y, bw, bh), forma_circulo=(forma == "circulo"))
                     if ponto is None: continue
                     if forma == "?" and score < LETRA_SCORE_FORTE: continue   # conteúdo vence forma duvidosa
                     hint, forma = "Delivery", "circulo"
