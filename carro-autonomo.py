@@ -34,7 +34,7 @@ import cv2
 import numpy as np
 import serial, serial.tools.list_ports
 import time, sys, os, json
-from collections import deque, Counter
+from collections import deque, Counter, defaultdict
 
 # ================================================================
 #  [0] CONFIGURAÇÃO
@@ -77,6 +77,7 @@ CNN_CLASSES = ["Semaforo", "Stop", "Fundo"]
 
 CLASS_TO_ACTION = {"Cone":"OBSTACLE", "Carro":"OBSTACLE", "Pessoa":"OBSTACLE"}
 DEBUG_FUNIL = os.environ.get("DEBUG_FUNIL", "0") == "1"   # export DEBUG_FUNIL=1 pra ativar
+PROFILE     = os.environ.get("PROFILE", "0") == "1"        # export PROFILE=1 pra medir ms/estágio
 
 # Rastreio e votação temporal do ramo de trânsito
 TRACK_IOU_HIGH = 0.30
@@ -540,6 +541,7 @@ class LeitorLetras:
             self.moldes[L] = _recorte_tinta(b)[0]
         self.votos = deque(maxlen=LETRA_VOTOS_N)
         self.debug = debug; self._fn = 0
+        self._rastreio = {}   # PROFILE only: histórico encontrado/perdido/voltou por letra
 
     def ler(self, sub, c, bbox, forma_circulo=False):
         """-> (letra|None, score). Em debug, diz sempre por que reprovou.
@@ -601,9 +603,10 @@ class LeitorLetras:
                       f"score={s1:.2f} margem={mg:.2f} -> {letra or motivo}", flush=True)
         return letra, s1
 
-    def votar(self, entregas):
+    def votar(self, entregas, fn=None):
         """Votação curta e espacial: não mistura A de um lugar com B/C de outro."""
         if not entregas:
+            self._rastrear_perda(fn, "sem detecção geométrica no frame")
             self.votos.clear()
             self._ultimo_centro = None
             return None
@@ -616,11 +619,39 @@ class LeitorLetras:
             dist = float(np.hypot(centro[0]-self._ultimo_centro[0], centro[1]-self._ultimo_centro[1]))
             escala = max(40.0, 0.55*max(x2-x1, y2-y1))
             if dist > escala:
+                self._rastrear_perda(fn, f"salto espacial ({dist:.0f}px > {escala:.0f}px)")
                 self.votos.clear()
         self._ultimo_centro = centro
+        if PROFILE and fn is not None:
+            self._rastrear_encontro(fn, melhor["ponto"])
         self.votos.append(melhor["ponto"])
         if list(self.votos).count(melhor["ponto"]) < LETRA_VOTOS_MIN: return None
         return melhor
+
+    def _rastrear_perda(self, fn, motivo):
+        """PROFILE only: guarda quando e por quê perdeu, pra imprimir a
+        história completa quando (e se) reencontrar. Não é IoU aqui — o
+        Delivery não usa tracker, então o motivo real é sempre um destes
+        dois: sem candidato geométrico no frame, ou salto espacial grande
+        demais pra ser o mesmo objeto."""
+        if not PROFILE or not self.votos: return
+        letra_perdida = self.votos[-1]
+        r = self._rastreio.setdefault(letra_perdida, {})
+        if r.get("perdido_fn") is None:   # só marca a PRIMEIRA vez, não repete a cada frame vazio
+            r["perdido_fn"] = fn if fn is not None else -1
+            r["perdido_t"] = time.monotonic()
+            r["motivo"] = motivo
+
+    def _rastrear_encontro(self, fn, ponto):
+        r = self._rastreio.setdefault(ponto, {})
+        if "desde_fn" not in r:
+            r["desde_fn"] = fn
+        if r.get("perdido_fn") is not None:
+            elapsed_ms = (time.monotonic() - r["perdido_t"]) * 1000
+            print(f"[PROFILE][track] {ponto} foi encontrado no frame {r['desde_fn']}, "
+                  f"perdeu o track no {r['perdido_fn']} por {r['motivo']}, "
+                  f"voltou no {fn} e por isso levou {elapsed_ms:.0f} ms", flush=True)
+            r["perdido_fn"] = None; r["perdido_t"] = None; r["desde_fn"] = fn
 
 
 def _molde_losango(px=700):
@@ -1214,6 +1245,7 @@ class ByteTrackLite:
 
     def __init__(self):
         self.tracks = []
+        self._rastreio = {}   # PROFILE only: histórico encontrado/perdido/voltou por classe
 
     @staticmethod
     def _iou(a, b):
@@ -1231,7 +1263,26 @@ class ByteTrackLite:
             mt.add(ti); md.add(di); casados.append((ti, di))
         return casados, [i for i in tracks_idx if i not in mt], [i for i in det_idx if i not in md]
 
-    def update(self, dets, frame, cnn, ood, verif=None):
+    def _rastrear_perda(self, fn, classe):
+        if not classe: return
+        r = self._rastreio.setdefault(classe, {})
+        if r.get("perdido_fn") is None:
+            r["perdido_fn"] = fn if fn is not None else -1
+            r["perdido_t"] = time.monotonic()
+
+    def _rastrear_encontro(self, fn, classe):
+        if not classe: return
+        r = self._rastreio.setdefault(classe, {})
+        if "desde_fn" not in r:
+            r["desde_fn"] = fn
+        if r.get("perdido_fn") is not None:
+            elapsed_ms = (time.monotonic() - r["perdido_t"]) * 1000
+            print(f"[PROFILE][track] {classe} foi encontrado no frame {r['desde_fn']}, "
+                  f"perdeu o track no {r['perdido_fn']} por IoU, "
+                  f"voltou no {fn} e por isso levou {elapsed_ms:.0f} ms", flush=True)
+            r["perdido_fn"] = None; r["perdido_t"] = None; r["desde_fn"] = fn
+
+    def update(self, dets, frame, cnn, ood, verif=None, fn=None):
         hi = [i for i,d in enumerate(dets) if d["conf"] >= CONF_HIGH_THR]
         lo = [i for i,d in enumerate(dets) if d["conf"] <  CONF_HIGH_THR]
         c1, resta_t, novos = self._match(list(range(len(self.tracks))), hi, dets, TRACK_IOU_HIGH)
@@ -1240,13 +1291,21 @@ class ByteTrackLite:
             lbl, conf = self._classificar(dets[di], frame, cnn, ood, verif)
             self.tracks[ti].atualizar(dets[di]["bbox"], dets[di]["class_name"],
                                       dets[di]["conf"], lbl, conf)
-        for ti in resta_t2: self.tracks[ti].missed += 1
+            if PROFILE and fn is not None:
+                self._rastrear_encontro(fn, self.tracks[ti].class_hint)
+        for ti in resta_t2:
+            self.tracks[ti].missed += 1
+            if PROFILE and fn is not None and self.tracks[ti].missed == 1:
+                # só no instante em que passa a estar perdido — não repete a cada frame vazio
+                self._rastrear_perda(fn, self.tracks[ti].class_hint)
         for di in novos:
             d = dets[di]
             lbl, conf = self._classificar(d, frame, cnn, ood, verif)
             t = Track(d["bbox"], d["class_name"], d["conf"])
             if lbl: t.buf.append((lbl, conf))
             self.tracks.append(t)
+            if PROFILE and fn is not None:
+                self._rastrear_encontro(fn, d["class_name"])
         self.tracks = [t for t in self.tracks if t.missed <= TRACK_MAX_AGE]
         return self.tracks
 
@@ -1854,20 +1913,26 @@ def main(debug_abc=False, auto=False, fast=False, usar_yolo=False, cam_idx=None)
     fps_t = time.monotonic(); fps_n = 0; fps = 0.0; fn = 0
     SKIP = 1 if fast else 2
     frame_e = None; tracks = []
+    _prof = defaultdict(float); _prof_n = 0; _prof_t = time.monotonic()
 
     while True:
+        _t_captura0 = time.perf_counter()
         ret, frame_raw = cap.read()
         if not ret:
             print("[CAM] frame perdido", flush=True); continue
+        if PROFILE: _prof["captura"] += time.perf_counter() - _t_captura0
         if CAM_FLIP is not None:
             frame_raw = cv2.flip(frame_raw, CAM_FLIP)
         fn += 1
         tick_buzzer(_ser); tick_heartbeat(_ser); ler_serial(_ser)
 
         if fn % SKIP == 0:
+            _t0 = time.perf_counter()
             frame_e = preprocessar(frame_raw)
+            if PROFILE: _prof["preprocess"] += time.perf_counter() - _t0
             h, w = frame_e.shape[:2]
             dets = detectar_geometrico(frame_e)
+            if PROFILE: _prof["geometrico"] += time.perf_counter() - _t0; _t0 = time.perf_counter()
             n_geo = len(dets)
 
             n_yolo_raw = n_yolo_ok = 0
@@ -1875,7 +1940,9 @@ def main(debug_abc=False, auto=False, fast=False, usar_yolo=False, cam_idx=None)
                 rx0, ry0, rx1, ry1 = ROI_DIN.janela(h, w)
                 sub = frame_e[ry0:ry1, rx0:rx1]
                 if sub.size:
+                    _t1 = time.perf_counter()
                     yolo_dets = yolo.detectar(sub)
+                    if PROFILE: _prof["yolo_sign"] += time.perf_counter() - _t1
                     n_yolo_raw = len(yolo_dets)
                     for d in yolo_dets:
                         x1, y1, x2, y2 = d["bbox"]
@@ -1891,7 +1958,10 @@ def main(debug_abc=False, auto=False, fast=False, usar_yolo=False, cam_idx=None)
                 rx0, ry0, rx1, ry1 = ROI_DIN.janela(h, w)
                 sub = frame_e[ry0:ry1, rx0:rx1]
                 if sub.size:
-                    for d in yolo_coco.detectar(sub):
+                    _t2 = time.perf_counter()
+                    coco_dets = yolo_coco.detectar(sub)
+                    if PROFILE: _prof["yolo_coco"] += time.perf_counter() - _t2
+                    for d in coco_dets:
                         x1, y1, x2, y2 = d["bbox"]
                         d["bbox"] = (x1+rx0, y1+ry0, x2+rx0, y2+ry0)
                         dets.append(d)   # coco=True já pula geometria/CNN em _classificar
@@ -1904,7 +1974,7 @@ def main(debug_abc=False, auto=False, fast=False, usar_yolo=False, cam_idx=None)
             dets     = [d for d in dets if d["class_name"] != "Delivery"]
             dets = [d for d in dets
                     if (d["bbox"][2]-d["bbox"][0])*(d["bbox"][3]-d["bbox"][1]) >= AREA_MIN_EXEC]
-            tracks = tracker.update(PGOM_M.update(dets), frame_e, cnn, ood, verif)
+            tracks = tracker.update(PGOM_M.update(dets), frame_e, cnn, ood, verif, fn)
             # A ROI dinâmica NÃO pode ser sequestrada por um retângulo falso de semáforo.
             # Só acompanha PARE/SEM/DIREITA quando a evidência é alta e o candidato
             # tem tamanho útil; Delivery continua sempre procurando na varredura atual.
@@ -2000,7 +2070,7 @@ def main(debug_abc=False, auto=False, fast=False, usar_yolo=False, cam_idx=None)
                 elif CLASS_TO_ACTION.get(lbl) == "OBSTACLE":
                     percep["obstaculo"] = True
 
-            m0 = LEITOR.votar(entregas)
+            m0 = LEITOR.votar(entregas, fn)
             if m0 is not None:
                 MISSAO.fallthrough_C(m0["ponto"])   # chegou em C sem nenhuma direita? o marcador decide
             alvo_atual = MISSAO.alvo()   # o Portenta não precisa saber que vimos B se o alvo é C
@@ -2103,6 +2173,14 @@ def main(debug_abc=False, auto=False, fast=False, usar_yolo=False, cam_idx=None)
         fps_n += 1
         if time.monotonic()-fps_t >= 1.0:
             fps = fps_n; fps_n = 0; fps_t = time.monotonic()
+
+        if PROFILE:
+            _prof_n += 1
+            if time.monotonic() - _prof_t >= 2.0:   # resumo a cada 2s — não polui o terminal
+                total = sum(_prof.values()) or 1e-9
+                partes = " | ".join(f"{k}={1000*v/_prof_n:.1f}ms" for k, v in _prof.items())
+                print(f"[PROFILE] fps_captura={fps:.0f} janela={_prof_n}f -> {partes}", flush=True)
+                _prof.clear(); _prof_n = 0; _prof_t = time.monotonic()
 
         k = cv2.waitKey(1) & 0xFF
         if k == ord('q'): break
