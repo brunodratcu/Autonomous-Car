@@ -24,10 +24,8 @@
     COMO CHAMAR:
 python carro-autonomo.py                    # roda direto na webcam
 python carro-autonomo.py --debug-abc        # calibrar AREA_MIN_CHEGADA
-python carro-autonomo.py --auto             # A→B sem depender do QR
 python carro-autonomo.py --cam-idx 2        # se a webcam não for o índice 1
 python carro-autonomo.py --fast --yolo      # todo frame + YOLO auxiliar
-python carro-autonomo.py --gerar-abc        # PNGs das placas para imprimir
 """
 
 import cv2
@@ -65,19 +63,16 @@ COCO_CONF_MIN = {"Stop":0.28, "Semaforo":0.40, "Carro":0.55, "Pessoa":0.62}
 COCO_AREA_MIN = {"Pessoa":2000, "Carro":1500}
 
 # Contrato da YOLO customizada (localização: Pare + Semaforo).
-# Ordem = ordem do data.yaml usado no treino (yolo_localizacao/dataset.yaml).
-# É lido de models/classes.txt se existir; senão usa este default.
+# Ordem = data.yaml do treino. Lido de models/classes.txt se existir.
 CLASSES     = ["Stop", "Semaforo"]
 NUM_CLASSES = len(CLASSES)
 
-# Contrato da CNN de confirmação (treinar_cnn_confirmacao.py).
-# Ordem = CLASSES do trainer. Fixo aqui, não deve variar por treino de YOLO
-# de terceiros — evita que um classes.txt da YOLO sobrescreva o da CNN.
+# Contrato da CNN de confirmação. Fixo — não deve variar por treino de YOLO.
 CNN_CLASSES = ["Semaforo", "Stop", "Fundo"]
 
 CLASS_TO_ACTION = {"Cone":"OBSTACLE", "Carro":"OBSTACLE", "Pessoa":"OBSTACLE"}
 DEBUG_FUNIL = os.environ.get("DEBUG_FUNIL", "0") == "1"   # export DEBUG_FUNIL=1 pra ativar
-PROFILE     = os.environ.get("PROFILE", "0") == "1"        # export PROFILE=1 pra medir ms/estágio
+PROFILE       = os.environ.get("PROFILE", "0") == "1"          # export PROFILE=1 pra medir ms/estágio
 
 # Rastreio e votação temporal do ramo de trânsito
 TRACK_IOU_HIGH = 0.30
@@ -98,9 +93,7 @@ STOP_IMEDIATO_AREA  = 900
 STOP_IMEDIATO_CIRC  = 0.82
 STOP_IMEDIATO_LADOS = (7, 8, 9)
 
-# Semáforo: retângulo estreito + lâmpadas alinhadas. Afrouxado de volta
-# (era AR_MAX=0.50/BH_MIN=65, calibrado só em foto sintética e nunca bateu
-# com o objeto físico real — log de 17/08 mostra zero confirmação geométrica).
+# Semáforo: retângulo estreito + lâmpadas alinhadas.
 SEM_AR_MAX       = 0.62
 SEM_BH_MIN       = 50
 
@@ -138,14 +131,9 @@ FRACAO_CHEGADA_ROI = 0.40            # OU: letra domina >=40% da área do ROI �
 AREA_MIN_PROX_ENTREGA = 3000         # bbox mínima p/ avisar "aproximando do ponto" (calibrar na pista)
 
 LETRA_SCORE_MIN   = 0.50             # casamento mínimo com o molde normalizado
-LETRA_SCORE_MIN_C = 0.20             # nb=0 só existe em "C" — nada mais pra confundir,
-                                      # então a régua alta (pensada pra separar A/B por
-                                      # aparência) é redundante aqui. C é a letra mais
-                                      # sensível a rotação de montagem (abertura tem
-                                      # direção; A/B são ~anéis, quase invariantes) —
-                                      # medido: score cai de 1.00 (0°) pra 0.30 (45°) só
-                                      # por rotação, com margem sempre saudável (nunca
-                                      # confunde com A/B em nenhum ângulo testado).
+LETRA_SCORE_MIN_C = 0.20             # nb=0 só existe em "C" — nada pra confundir,
+                                      # C é sensível a rotação de montagem (medido:
+                                      # score 1.00 a 0° cai pra 0.30 a 45°)
 LETRA_SCORE_FORTE = 0.62             # acima disto a letra vence forma duvidosa
 LETRA_MARGEM_MIN  = 0.06             # vantagem sobre a 2ª letra
 LETRA_TINTA_MIN   = 0.07             # fração de preto no miolo do disco
@@ -168,10 +156,7 @@ FORMA_H8_CIRCULO = 0.022             # ≤ isto → círculo   (medido: 0.0033�
 FORMA_H8_OCTOG   = 0.025             # ≥ isto → octógono  (medido: 0.0266–0.0335)
 FORMA_CIRC_OCTOG = 0.85              # octógono exige contorno bem formado
 
-# ── Losango (placa DIREITA) ─────────────────────────────────────
-# Quadrado alinhado ao eixo preenche quase 100% do bbox; o mesmo quadrado
-# a 45° (losango) preenche ~50% — é isso que separa sem depender de cor
-# (a placa chega em mono+CLAHE, o amarelo já virou cinza antes daqui).
+# Direita: losango mais quadrado + diagonais quase perpendiculares.
 FORMA_LOSANGO_AR_MIN      = DIREITA_AR_MIN
 FORMA_LOSANGO_AR_MAX      = DIREITA_AR_MAX
 FORMA_LOSANGO_PREENCH_MIN = DIREITA_PREENCH_MIN
@@ -283,14 +268,16 @@ def analisar_farois(crop_gray):
             if not (0.6 < w/max(h,1) < 1.7): continue
             if 4*np.pi*a/max(cv2.arcLength(c,True)**2, 1) > 0.55:
                 circulos.append((x + w/2, y + h/2))
-    if len(circulos) < 2: return len(circulos), False
+    if len(circulos) < 2:
+        return len(circulos), False
     circulos.sort(key=lambda p: p[1])
     empilhados = [circulos[0]]
     for p in circulos[1:]:
         if p[1] - empilhados[-1][1] > 15: empilhados.append(p)
+    alinhado = len(empilhados) >= 2 and (max(p[0] for p in empilhados) - min(p[0] for p in empilhados)) < 12
     if len(empilhados) < 2: return len(empilhados), False
     xs = [p[0] for p in empilhados]
-    return len(empilhados), (max(xs) - min(xs)) < 12
+    return len(empilhados), alinhado
 
 
 def _tem_farois(crop_gray):
@@ -371,9 +358,7 @@ def estado_semaforo(crop_gray):
 
 
 # ================================================================
-#  [2] CLASSIFICADOR DE FORMA — árbitro único da visão
-#      approxPolyDP dá 8 lados TANTO para círculo quanto para
-#      octógono; quem separa de verdade é o 8º harmônico do raio.
+#  [2] CLASSIFICADOR DE FORMA — 8º harmônico separa círculo/octógono
 # ================================================================
 
 def harmonico_8(c, N=64):
@@ -464,10 +449,7 @@ def score_simetria(crop_gray) -> float:
 
 
 # ================================================================
-#  [3] LEITURA DAS PLACAS A/B/C — dois juízes independentes
-#      TOPOLOGIA (A=1 buraco, B=2, C=0) não depende de fonte;
-#      MOLDE normalizado não depende de escala nem de centragem.
-#      Só passa quando os dois apontam a mesma letra.
+#  [3] LEITURA DAS PLACAS A/B/C — topologia (buracos) + molde normalizado
 # ================================================================
 
 _MASC_CIRC = None
@@ -654,46 +636,8 @@ class LeitorLetras:
             r["perdido_fn"] = None; r["perdido_t"] = None; r["desde_fn"] = fn
 
 
-def _molde_losango(px=700):
-    """Placa DIREITA: losango com símbolo Y de bifurcação — só cv2, sem PIL,
-    pra não trazer dependência nova pro executável único."""
-    margem = int(px*0.12); lado = px + 2*margem
-    canvas = np.full((lado, lado), 255, np.uint8)
-    c = lado//2; R = px//2
-    pts = np.array([[c, c-R], [c+R, c], [c, c+R], [c-R, c]], np.int32)
-    cv2.polylines(canvas, [pts], True, 0, max(4, px//60), cv2.LINE_AA)
-    w = max(6, px//14)
-    y_bot, y_top, fork_y = c+int(R*0.42), c-int(R*0.55), c-int(R*0.05)
-    dx, dy = c+int(R*0.42), c-int(R*0.42)
-    cv2.line(canvas, (c,y_bot), (c,y_top), 0, w, cv2.LINE_AA)
-    cv2.line(canvas, (c,fork_y), (dx,dy), 0, w, cv2.LINE_AA)
-    return canvas
-
-
-def gerar_placas_abc(pasta="./placas_abc", px=700):
-    """--gerar-abc → PNGs de impressão com a mesma fonte do molde."""
-    os.makedirs(pasta, exist_ok=True)
-    for L in LETRAS_PONTOS:
-        canvas = cv2.copyMakeBorder(_molde_letra(L, lado=px), 40, 110, 40, 40,
-                                    cv2.BORDER_CONSTANT, value=255)
-        cv2.putText(canvas, f"PONTO {L}", (46, canvas.shape[0]-34),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.5, 0, 3)
-        cv2.imwrite(os.path.join(pasta, f"ponto_{L}.png"), canvas)
-
-    direita = cv2.copyMakeBorder(_molde_losango(px=px), 10, 100, 10, 10,
-                                 cv2.BORDER_CONSTANT, value=255)
-    cv2.putText(direita, "DIREITA", (46, direita.shape[0]-34),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.5, 0, 3)
-    cv2.imwrite(os.path.join(pasta, "placa_direita.png"), direita)
-
-    print(f"[ABC] PNGs em {pasta}/ — imprima ~15cm de diâmetro (A/B/C) e ~18cm de\n"
-          f"      diagonal (DIREITA) em papel FOSCO, sem recortar rente à borda,\n"
-          f"      fixados na altura da câmera.", flush=True)
-
-
 # ================================================================
-#  [4] VARREDURA ÚNICA — uma passada de contornos alimenta os
-#      dois ramos (trânsito e delivery)
+#  [4] VARREDURA ÚNICA — uma passada de contornos alimenta trânsito e delivery
 # ================================================================
 
 def agrupar_farois_soltos(sub):
@@ -752,11 +696,7 @@ def detectar_geometrico(gray):
     cands = []
     n_letra = [0, 0]                    # orçamento separado: [circulo, "?"]
 
-    # DESATIVADO — o agrupador de faróis soltos causou regressão grave em
-    # teste real (inundou candidatos de "Semaforo" falso, atropelou PARE e
-    # Delivery). Revertido até calibrar com frame real da câmera, não foto
-    # de tela. A função agrupar_farois_soltos() continua definida abaixo,
-    # só não é mais chamada aqui.
+    # agrupar_farois_soltos() desativado — causou falso-positivo em teste real.
 
     for m in segmentar(sub):
         # CHAIN_APPROX_NONE: harmonico_8 precisa da borda inteira, não só dos cantos
@@ -786,10 +726,7 @@ def detectar_geometrico(gray):
 
             else:
                 if DEBUG_FUNIL and 0.20 < ar < SEM_AR_MAX and bh >= SEM_BH_MIN:
-                    # quase passou no portão de aspecto/altura mas os "faróis"
-                    # não bateram — mostra n/alinhado pra saber se é a
-                    # contagem (precisa 2-3) ou o alinhamento que reprova
-                    # na câmera real, sem precisar adivinhar do lado de cá.
+                    # quase passou no portão mas os "faróis" não bateram
                     _n, _al = analisar_farois(crop)
                     print(f"[sem?] bbox={bw}x{bh} ar={ar:.2f} faróis={_n} "
                           f"alinhado={_al} -> rejeitado (precisa 2-3 alinhados)", flush=True)
@@ -838,8 +775,7 @@ def detectar_geometrico(gray):
 
 
 # ================================================================
-#  [5] PGOM — acumula evidência geométrica ao longo dos frames.
-#      Só quem passa de PGOM_PROMOVE chega à CNN.
+#  [5] PGOM — acumula evidência geométrica; só quem passa PGOM_PROMOVE chega à CNN
 # ================================================================
 
 class Ficha:
@@ -957,8 +893,7 @@ def score_final(det, cnn_conf):
 
 
 # ================================================================
-#  [6] REDES AUXILIARES — YOLO (detecção), CNN (classificação fina),
-#      OOD (rejeição), Verificador (contrato forma↔classe)
+#  [6] REDES AUXILIARES — YOLO, CNN, OOD, Verificador forma↔classe
 # ================================================================
 
 class YOLODetector:
@@ -1315,10 +1250,7 @@ class ByteTrackLite:
         cn = det.get("class_name", "?")
         if det.get("coco", False): return det["class_name"], det["conf"]
         if det.get("geo") and det["class_name"] in ("Semaforo", "Direita"):
-            # bypass deliberado: CNN_CLASSES = [Semaforo, Stop, Fundo] não tem
-            # "Direita" — deixar cair no ramo abaixo faria o softmax de 3
-            # classes "decidir" um losango como Stop/Fundo silenciosamente.
-            # Direita é 100% geométrica, como o Semáforo já era.
+            # bypass: CNN_CLASSES não tem "Direita" — cairia como Stop/Fundo
             return det["class_name"], score_final(det, det["conf"])
         if cnn is None:
             if DEBUG_FUNIL: print(f"[cnn] {cn}: CNN indisponível, descartado", flush=True)
@@ -1349,8 +1281,7 @@ class ByteTrackLite:
 
 
 # ================================================================
-#  [8] MISSÃO — "o que isso significa?"
-#      VISÃO diz o que existe · MISSÃO decide · CONTROLE executa.
+#  [8] MISSÃO — visão diz o que existe, missão decide, controle executa.
 #      Prioridade absoluta: obstáculo > vermelho > PARE > rota.
 # ================================================================
 
@@ -1865,7 +1796,7 @@ def abrir_camera(idx):
     return cap
 
 
-def main(debug_abc=False, auto=False, fast=False, usar_yolo=False, cam_idx=None):
+def main(debug_abc=False, fast=False, usar_yolo=False, cam_idx=None):
     global _ser, CLASSES, NUM_CLASSES, CAM_FLIP, LEITOR, BT
     global VOTE_BUFFER, VOTE_MIN_DETS
 
@@ -1903,9 +1834,6 @@ def main(debug_abc=False, auto=False, fast=False, usar_yolo=False, cam_idx=None)
     cap = abrir_camera(CAM_IDX if cam_idx is None else cam_idx)
     _ser = conectar_serial()
 
-    if auto:
-        MISSAO.retirada, MISSAO.entrega, MISSAO.fase = "A", "B", "retirada"
-        MISSAO.set_estado("IND_RETIRADA"); seguir(_ser, com_buzzer=False)
     MISSAO.nova_sessao()
     print(f"[OK] detector={modo} · Q=sair SPACE=pausa 1/2/3=pontos "
           f"S=status D=desliga R=reset F=flip", flush=True)
@@ -1986,18 +1914,8 @@ def main(debug_abc=False, auto=False, fast=False, usar_yolo=False, cam_idx=None)
 
             # ── VISÃO: constatação de fatos, nenhuma decisão ──
             percep = dict(pare=False, semaforo=None, obstaculo=False, ponto=None)
-            # PARE: confirmação geométrica forte NÃO espera PGOM/CNN — mas
-            # precisa de pelo menos 2 acertos numa janela de 3 checks
-            # (não necessariamente seguidos) antes de confirmar. Um frame
-            # só (mão, reflexo, ruído pontual) não vale mais "PARE:ok" —
-            # foi assim que um dedo confirmou parada em teste real (log de
-            # 17/08). Mas EXIGIR consecutivos-sem-falha criou um problema
-            # novo: perto da placa o octógono pode tocar a borda do frame
-            # e o contorno cortar, fazendo circ/harmônico oscilar passa-
-            # falha-passa mesmo sendo a placa real — com "consecutivo
-            # estrito" isso nunca fecha bem na hora de parar (relatado em
-            # teste real: "hesita perto"). Janela de 3 tolera 1 frame
-            # perdido no meio sem abrir mão do piso de 2 acertos reais.
+            # PARE forte não espera PGOM/CNN: janela de 2 acertos em 3 checks
+            # (não exige consecutivo estrito, tolera 1 frame ruim perto da placa)
             stops_fortes = [d for d in dets
                             if d.get("class_name") == "Stop"
                             and d.get("forma") == "octogono"
@@ -2028,10 +1946,7 @@ def main(debug_abc=False, auto=False, fast=False, usar_yolo=False, cam_idx=None)
                 if lbl == "Semaforo":
                     x1, y1, x2, y2 = trk.bbox
                     cor = estado_semaforo(frame_e[y1:y2, x1:x2])
-                    # LOG 2 (confirmação): só depois de N_CONSECUTIVO frames com a
-                    # MESMA cor seguida — não é maioria estatística, é sequência.
-                    # A MISSÃO só enxerga a cor CONFIRMADA, nunca a leitura crua —
-                    # é o que evita a missão reagir antes da hora.
+                    # missão só vê a cor após N_CONSECUTIVO frames iguais seguidos
                     cor_conf = trk.cor_consecutiva(cor)
                     if cor_conf:
                         percep["semaforo"] = cor_conf
@@ -2039,30 +1954,18 @@ def main(debug_abc=False, auto=False, fast=False, usar_yolo=False, cam_idx=None)
                             sinalizar_confirmacao("SEM", cor_conf, _ser)
                             trk.evt_conf_enviado = cor_conf
                 elif lbl == "Stop":
-                    # Mesma lógica: a MISSÃO só vê "pare" quando os 3 consecutivos
-                    # bateram — e só UMA VEZ por track (stop_consumido), pra não
-                    # reabrir a decisão de parar enquanto a mesma placa segue no
-                    # campo de visão (ela nunca deixa de ser vista até o carro passar).
+                    # 3 consecutivos + só 1x por track (stop_consumido)
                     if trk.consecutivo() == "Stop" and not trk.stop_consumido and not _ultimo.get("stop_raw_latched"):
                         percep["pare"] = True
-                        percep["pare_trk"] = trk    # pra marcar consumido só quando a missão executar
-                        # o Python SEMPRE para no PARE — segurança não é negociável.
-                        # Só o VALOR informado ao Portenta muda: acima de 0.8 é
-                        # confiança absoluta, entre 0.5-0.8 é cautelosa. O Python
-                        # não interpreta isso como "talvez pare" — é sempre "para".
+                        percep["pare_trk"] = trk    # marca consumido só quando a missão executar
+                        # sempre para no PARE — só o valor informado muda (confiança)
                         conf_media = trk.confianca_consecutivo()
                         valor = "ok_alta" if conf_media > 0.8 else "ok_cautelosa"
                         if trk.evt_conf_enviado != valor:
                             sinalizar_confirmacao("PARE", valor, _ser)
                             trk.evt_conf_enviado = valor
                 elif lbl == "Direita":
-                    # Mesma régua do PARE: só conta quando 3 consecutivos concordam
-                    # e só UMA VEZ por track — "executou", não "viu de relance".
-                    # ORDEM QUE IMPORTA: a MISSÃO decide primeiro se essa virada é
-                    # necessária; o serial só sai DEPOIS, já carregando a decisão.
-                    # Nunca confirma "ok" genérico pro Portenta antes de saber se a
-                    # missão vai usar isso — senão o firmware vira em garfo que a
-                    # missão já tinha decidido ignorar.
+                    # missão decide ANTES de mandar pro serial (seguir/ignorar)
                     if trk.consecutivo() == "Direita" and not trk.direita_consumido:
                         usada = MISSAO.executou_direita()
                         sinalizar_confirmacao("DIR", "seguir" if usada else "ignorar", _ser)
@@ -2177,9 +2080,14 @@ def main(debug_abc=False, auto=False, fast=False, usar_yolo=False, cam_idx=None)
         if PROFILE:
             _prof_n += 1
             if time.monotonic() - _prof_t >= 2.0:   # resumo a cada 2s — não polui o terminal
-                total = sum(_prof.values()) or 1e-9
-                partes = " | ".join(f"{k}={1000*v/_prof_n:.1f}ms" for k, v in _prof.items())
-                print(f"[PROFILE] fps_captura={fps:.0f} janela={_prof_n}f -> {partes}", flush=True)
+                # fps equivalente por estágio: "se só existisse esse estágio,
+                # quantos frames por segundo ele sozinho aguentaria" — mais
+                # fácil de comparar direto com o fps da câmera do que ms puro.
+                partes = " | ".join(
+                    f"{k}={1000*v/_prof_n:.1f}ms(~{_prof_n/v:.0f}fps)" if v > 0 else f"{k}=0ms"
+                    for k, v in _prof.items()
+                )
+                print(f"[PROFILE] fps_real={fps:.0f} janela={_prof_n}f -> {partes}", flush=True)
                 _prof.clear(); _prof_n = 0; _prof_t = time.monotonic()
 
         k = cv2.waitKey(1) & 0xFF
@@ -2216,13 +2124,10 @@ def main(debug_abc=False, auto=False, fast=False, usar_yolo=False, cam_idx=None)
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-    if "--gerar-abc" in args:
-        gerar_placas_abc()
-    else:
-        cam_idx = None
-        if "--cam-idx" in args:
-            try: cam_idx = int(args[args.index("--cam-idx")+1])
-            except (IndexError, ValueError):
-                print("[ERRO] use: --cam-idx N"); sys.exit(1)
-        main(debug_abc="--debug-abc" in args, auto="--auto" in args,
-             fast="--fast" in args, usar_yolo="--yolo" in args, cam_idx=cam_idx)
+    cam_idx = None
+    if "--cam-idx" in args:
+        try: cam_idx = int(args[args.index("--cam-idx")+1])
+        except (IndexError, ValueError):
+            print("[ERRO] use: --cam-idx N"); sys.exit(1)
+    main(debug_abc="--debug-abc" in args, fast="--fast" in args,
+         usar_yolo="--yolo" in args, cam_idx=cam_idx)
