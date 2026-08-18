@@ -361,6 +361,9 @@ def estado_semaforo(crop_gray):
     i_top = int(np.argmax(nucleos))
     ordenado = sorted(nucleos, reverse=True)
     margem = ordenado[0] - ordenado[1]      # domina as OUTRAS 2 posições, não o fundo global
+    if DEBUG_FUNIL:
+        print(f"[sem-cor] nucleos(V/A/Vd)={[round(n,1) for n in nucleos]} "
+              f"areas={[round(a,2) for a in areas]} margem={margem:.1f}", flush=True)
     if margem < 10 or areas[i_top] < 0.05:  # 3 parecidas (apagado/ambíguo) ou sem área real acesa
         return None
     return ["vermelho", "amarelo", "verde"][i_top]
@@ -1337,28 +1340,51 @@ class Missao:
     def executou_direita(self):
         """Chamar SÓ quando a placa DIREITA foi CONFIRMADA (3 consecutivos),
         nunca na mera detecção — é a diferença entre 'vi' e 'fiz'. Conta
-        desvios executados na perna atual (retirada OU entrega, o que
-        estiver em aberto agora) e decide o destino:
-          1ª direita confirmada -> A
-          2ª direita confirmada -> B
-        Se nenhuma direita for executada, o destino vira C só quando o
+        desvios EXISTENTES na perna atual (retirada OU entrega, o que
+        estiver em aberto agora): 1º garfo -> A · 2º garfo -> B.
+
+        Dois modos, conforme o alvo já existir ou não:
+          - ALVO JÁ DEFINIDO (painel/QR escolheu B antes de sair, por
+            exemplo): cada direita só é 'seguir' se ESTE garfo específico
+            for o que leva até o alvo já escolhido — 1º garfo só serve
+            pra A, 2º só serve pra B. Bug anterior: qualquer alvo != None
+            fazia TODA direita virar 'ignorar', mesmo a que era a certa.
+          - ALVO AINDA NÃO DEFINIDO (modo auto, sem pré-seleção): a
+            PRIMEIRA direita confirmada decide o alvo (vira 'seguir' na
+            hora). Continua como antes.
+        Se nenhuma direita bater com o alvo, o destino vira C só quando o
         próprio marcador C for lido (ver fallthrough em main()) — não por
-        contagem, porque 'não vi direita' pode ser câmera perdendo a placa,
-        não necessariamente ausência real dela."""
+        contagem, porque 'não vi direita' pode ser câmera perdendo a
+        placa, não ausência real dela.
+
+        Retorna True/False: a missão PRECISOU dessa virada ou não. É a
+        MISSÃO quem decide antes de qualquer coisa ir pro serial — nunca
+        o contrário. O chamador usa isto pra escolher "seguir"/"ignorar"
+        no evento CONF DIR; nunca manda pro Portenta antes de saber."""
         self.direitas += 1
         attr = "retirada" if self.fase == "retirada" else "entrega"
-        if getattr(self, attr) is not None:
-            return   # destino desta perna já decidido — desvio extra não deve reabrir a escolha
-        if self.direitas == 1:
-            destino = "A"
-        elif self.direitas == 2:
-            destino = "B"
-        else:
+        alvo_atual = getattr(self, attr)
+
+        destino_deste_garfo = "A" if self.direitas == 1 else ("B" if self.direitas == 2 else None)
+        if destino_deste_garfo is None:
             print(f"[MISSAO][ALERTA] direitas={self.direitas} além do previsto "
                   f"(rota só prevê até 2 desvios por perna)", flush=True)
-            return
-        setattr(self, attr, destino)
-        print(f"[MISSAO] direita #{self.direitas} confirmada -> {attr}={destino}", flush=True)
+            return False
+
+        if alvo_atual is not None:
+            # alvo já existia (pré-selecionado OU decidido por uma direita
+            # anterior nesta mesma perna) — só usa ESTE garfo se ele for
+            # exatamente o que leva até esse alvo.
+            usar = (destino_deste_garfo == alvo_atual)
+            if usar:
+                print(f"[MISSAO] direita #{self.direitas} confirmada -> "
+                      f"bate com {attr}={alvo_atual} já definido", flush=True)
+            return usar
+
+        # sem alvo prévio: a primeira direita confirmada decide o alvo
+        setattr(self, attr, destino_deste_garfo)
+        print(f"[MISSAO] direita #{self.direitas} confirmada -> {attr}={destino_deste_garfo}", flush=True)
+        return True
 
     def fallthrough_C(self, ponto_lido):
         """Chega no bolsão C sem ter executado nenhuma direita: o próprio
@@ -1419,7 +1445,9 @@ def semaforo_libera(est, percep):
 CMD  = dict(mot=0, srv=127, buz=0, led=0, brk=0, dir=0, spd=0)
 _seq = dict(n=0, pendente=None, t_envio=0.0)
 _buz = dict(ate=0.0)
-_ultimo = dict(acao=None, ponto=None, stop_raw_latched=False, stop_raw_streak=0)
+_hb  = dict(ultimo=0.0)
+_ultimo = dict(acao=None, ponto=None, stop_raw_latched=False)
+_stop_janela = deque(maxlen=3)   # últimos 3 checks: 1=octógono forte, 0=não
 
 
 def conectar_serial():
@@ -1510,6 +1538,24 @@ def buzinar(ser, dur_s):
 def tick_buzzer(ser):
     if _buz["ate"] and time.monotonic() >= _buz["ate"]:
         _buz["ate"] = 0.0; CMD.update(buz=0); enviar(CMD, ser)
+
+
+HEARTBEAT_S = 0.15   # < que o watchdog do firmware (300ms) com folga de sobra
+
+def tick_heartbeat(ser):
+    """enviar(CMD) só dispara em MUDANÇA de estado (parar/seguir/buzina) —
+    numa reta longa sem placa nenhuma, isso pode passar minutos em
+    silêncio. Sem isto, o watchdog de segurança do firmware (que existe
+    justamente pra parar o carro se o Python travar/cair o cabo) não
+    teria como distinguir 'reta tranquila' de 'processo morto' — e
+    dispararia parada falsa em toda reta comprida, ou (pior, se
+    afrouxado pra compensar) deixaria de proteger de verdade. Reenvia o
+    MESMO estado atual em intervalo fixo — não muda comportamento
+    nenhum, só mantém o firmware sabendo que o Python está vivo."""
+    agora = time.monotonic()
+    if agora - _hb["ultimo"] >= HEARTBEAT_S:
+        _hb["ultimo"] = agora
+        enviar(CMD, ser)
 
 
 def parar(ser, motivo=""):
@@ -1816,7 +1862,7 @@ def main(debug_abc=False, auto=False, fast=False, usar_yolo=False, cam_idx=None)
         if CAM_FLIP is not None:
             frame_raw = cv2.flip(frame_raw, CAM_FLIP)
         fn += 1
-        tick_buzzer(_ser); ler_serial(_ser)
+        tick_buzzer(_ser); tick_heartbeat(_ser); ler_serial(_ser)
 
         if fn % SKIP == 0:
             frame_e = preprocessar(frame_raw)
@@ -1871,24 +1917,25 @@ def main(debug_abc=False, auto=False, fast=False, usar_yolo=False, cam_idx=None)
             # ── VISÃO: constatação de fatos, nenhuma decisão ──
             percep = dict(pare=False, semaforo=None, obstaculo=False, ponto=None)
             # PARE: confirmação geométrica forte NÃO espera PGOM/CNN — mas
-            # precisa de pelo menos 2 frames PROCESSADOS seguidos com a MESMA
-            # evidência forte antes de confirmar. Um frame só (mão, reflexo,
-            # ruído pontual que passou no harmônico de octógono por acaso)
-            # não vale mais "PARE:ok" — foi assim que um dedo perto da câmera
-            # confirmou parada em teste real (log de 17/08). 2 frames a
-            # SKIP=2 ainda é bem mais rápido que os 3-consecutivos do
-            # ramo CNN, então a vantagem de latência do atalho continua.
+            # precisa de pelo menos 2 acertos numa janela de 3 checks
+            # (não necessariamente seguidos) antes de confirmar. Um frame
+            # só (mão, reflexo, ruído pontual) não vale mais "PARE:ok" —
+            # foi assim que um dedo confirmou parada em teste real (log de
+            # 17/08). Mas EXIGIR consecutivos-sem-falha criou um problema
+            # novo: perto da placa o octógono pode tocar a borda do frame
+            # e o contorno cortar, fazendo circ/harmônico oscilar passa-
+            # falha-passa mesmo sendo a placa real — com "consecutivo
+            # estrito" isso nunca fecha bem na hora de parar (relatado em
+            # teste real: "hesita perto"). Janela de 3 tolera 1 frame
+            # perdido no meio sem abrir mão do piso de 2 acertos reais.
             stops_fortes = [d for d in dets
                             if d.get("class_name") == "Stop"
                             and d.get("forma") == "octogono"
                             and d.get("lados",0) in STOP_IMEDIATO_LADOS
                             and d.get("circ",0.0) >= STOP_IMEDIATO_CIRC
                             and d.get("area",0.0) >= STOP_IMEDIATO_AREA]
-            if stops_fortes:
-                _ultimo["stop_raw_streak"] = _ultimo.get("stop_raw_streak", 0) + 1
-            else:
-                _ultimo["stop_raw_streak"] = 0
-            if _ultimo["stop_raw_streak"] >= 2:
+            _stop_janela.append(1 if stops_fortes else 0)
+            if sum(_stop_janela) >= 2:
                 percep["pare"] = True
                 if not _ultimo.get("stop_raw_latched"):
                     sinalizar_confirmacao("PARE", "ok", _ser)
@@ -1941,9 +1988,14 @@ def main(debug_abc=False, auto=False, fast=False, usar_yolo=False, cam_idx=None)
                 elif lbl == "Direita":
                     # Mesma régua do PARE: só conta quando 3 consecutivos concordam
                     # e só UMA VEZ por track — "executou", não "viu de relance".
+                    # ORDEM QUE IMPORTA: a MISSÃO decide primeiro se essa virada é
+                    # necessária; o serial só sai DEPOIS, já carregando a decisão.
+                    # Nunca confirma "ok" genérico pro Portenta antes de saber se a
+                    # missão vai usar isso — senão o firmware vira em garfo que a
+                    # missão já tinha decidido ignorar.
                     if trk.consecutivo() == "Direita" and not trk.direita_consumido:
-                        sinalizar_confirmacao("DIR", "ok", _ser)
-                        MISSAO.executou_direita()
+                        usada = MISSAO.executou_direita()
+                        sinalizar_confirmacao("DIR", "seguir" if usada else "ignorar", _ser)
                         trk.direita_consumido = True
                 elif CLASS_TO_ACTION.get(lbl) == "OBSTACLE":
                     percep["obstaculo"] = True
