@@ -1244,6 +1244,7 @@ class Track:
         self.state = "tentative"
         self.evt_prox_enviado = False   # legado — mantido por compat, não usado mais pra Stop/Semaforo
         self.nivel_prox = 0             # quantos níveis de AREA_PROX_NIVEIS já foram avisados
+        self.geo_prox_contado = False   # PROX_CANDIDATO já contado pra métrica? (1x por track, mesmo sem virar serial)
         self.evt_chegada_enviado = False
         self.evt_conf_enviado = None    # já confirmou (e qual valor) pro Portenta?
         self.cor_buf = deque(maxlen=5)  # histórico de cor do semáforo (separado do buf de classe)
@@ -1619,6 +1620,7 @@ _buz = dict(ate=0.0)
 _hb  = dict(ultimo=0.0)
 _ultimo = dict(acao=None, ponto=None)
 _trava = {"Semaforo": None, "Stop": None}   # só 1 candidato de cada classe seguido por vez
+_METRICAS = dict(prox_candidato=0, prox_confirmado=0, confirmacoes=0)   # PROX_CANDIDATO/CONFIRMADO/CONF — pra medir quanto ruído geométrico nunca chega a virar serial
 
 
 def conectar_serial():
@@ -2153,22 +2155,34 @@ def main(debug_abc=False, fast=False, usar_yolo=False, cam_idx=None):
             for trk in tracks:
                 if not _e_o_travado(trk):
                     continue   # não é o travado da classe — não avisa proximidade dele
-                # LOG 1 (proximidade): repete a cada nível de área cruzado —
-                # é o proxy de "cada N cm de aproximação" sem sensor de distância.
-                # Exige state=="confirmed" (track sobreviveu >=2 frames) — sem
-                # isso, um candidato geométrico de UM frame só (nunca visto de
-                # novo, nunca chegou a passar pela CNN) já disparava PROX pro
-                # Portenta. Retreinar a CNN não filtra isso: PROX acontece
-                # ANTES da CNN entrar em cena, então é ruído puramente
-                # geométrico vazando — precisa de continuidade mínima, não
-                # threshold de rede neural.
+                # Dois níveis de PROX, não um só:
+                #   PROX_CANDIDATO = geometria + track sobrevivendo (state==confirmed)
+                #                    — só debug, nunca sai pro serial.
+                #   PROX_CONFIRMADO = PROX_CANDIDATO + pelo menos 1 leitura PLAUSÍVEL
+                #                    (buf tem >=1 entrada — só entra ali quando a CNN,
+                #                    ou o bypass geométrico do Semáforo/Direita, já
+                #                    disse "isto parece a classe certa", nunca Fundo).
+                #                    Só esse nível manda serial de verdade.
+                # Isto preserva a antecipação (não exige 3 consecutivos como a
+                # confirmação) mas corta o ruído que é 100% geométrico e nunca
+                # teve nenhuma leitura plausível — a maior fatia do log real.
                 if trk.class_hint in ("Stop", "Semaforo", "Direita") and trk.state == "confirmed":
-                    tipo_evt = {"Stop": "PARE", "Semaforo": "SEM", "Direita": "DIR"}[trk.class_hint]
-                    # Um único PROX por track. Os três níveis antigos geravam
-                    # três mensagens idênticas no Portenta e confundiam o log.
-                    if trk.nivel_prox == 0 and trk.area >= AREA_MIN_PROX:
-                        sinalizar_proximidade(tipo_evt, _ser)
-                        trk.nivel_prox = 1
+                    if not trk.geo_prox_contado and trk.area >= AREA_MIN_PROX:
+                        trk.geo_prox_contado = True
+                        _METRICAS["prox_candidato"] += 1
+                        if DEBUG_FUNIL:
+                            print(f"[prox-candidato] track#{trk.id} {trk.class_hint} "
+                                  f"area={trk.area:.0f} buf={len(trk.buf)} "
+                                  f"-> {'confirmado' if len(trk.buf)>=1 else 'só geometria, não sai pro serial'}",
+                                  flush=True)
+                    if len(trk.buf) >= 1:
+                        tipo_evt = {"Stop": "PARE", "Semaforo": "SEM", "Direita": "DIR"}[trk.class_hint]
+                        # Um único PROX por track. Os três níveis antigos geravam
+                        # três mensagens idênticas no Portenta e confundiam o log.
+                        if trk.nivel_prox == 0 and trk.area >= AREA_MIN_PROX:
+                            sinalizar_proximidade(tipo_evt, _ser)
+                            trk.nivel_prox = 1
+                            _METRICAS["prox_confirmado"] += 1
 
                 lbl, _ = trk.votar()
                 if not lbl or trk.state != "confirmed" or trk.area < AREA_MIN_EXEC: continue
@@ -2182,6 +2196,7 @@ def main(debug_abc=False, fast=False, usar_yolo=False, cam_idx=None):
                         if trk.evt_conf_enviado != cor_conf:
                             sinalizar_confirmacao("SEM", cor_conf, _ser)
                             trk.evt_conf_enviado = cor_conf
+                            _METRICAS["confirmacoes"] += 1
                 elif lbl == "Stop":
                     # ÚNICA porta de confirmação de PARE agora: 3 consecutivos
                     # via CNN+Track, só 1x por track (stop_consumido).
@@ -2194,6 +2209,7 @@ def main(debug_abc=False, fast=False, usar_yolo=False, cam_idx=None):
                         if trk.evt_conf_enviado != valor:
                             sinalizar_confirmacao("PARE", valor, _ser)
                             trk.evt_conf_enviado = valor
+                            _METRICAS["confirmacoes"] += 1
                 elif lbl == "Direita":
                     # missão decide ANTES de mandar pro serial (seguir/ignorar)
                     if trk.consecutivo() == "Direita" and not trk.direita_consumido:
@@ -2349,6 +2365,9 @@ def main(debug_abc=False, fast=False, usar_yolo=False, cam_idx=None):
     BT.fechar()
     if _ser: _ser.close()
     cap.release(); cv2.destroyAllWindows()
+    print(f"[METRICAS] PROX geométricos={_METRICAS['prox_candidato']} "
+          f"PROX semânticos={_METRICAS['prox_confirmado']} "
+          f"confirmações={_METRICAS['confirmacoes']}", flush=True)
     print("[OK] encerrado.", flush=True)
 
 
