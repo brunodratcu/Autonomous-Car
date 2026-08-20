@@ -52,6 +52,7 @@ OOD_FILE    = "./models/ood_thresholds.json"
 
 CNN_SIZE    = 96
 OOD_DEFAULT = 0.55
+OOD_STOP_MIN = 0.60   # override só pro Stop — o arquivo tinha 0.90, alto demais
 
 # YOLO (auxiliar — a geometria sempre tem a palavra final)
 YOLO_CONF   = 0.25
@@ -72,6 +73,7 @@ CNN_CLASSES = ["Semaforo", "Stop", "Fundo"]
 
 CLASS_TO_ACTION = {"Cone":"OBSTACLE", "Carro":"OBSTACLE", "Pessoa":"OBSTACLE"}
 DEBUG_FUNIL = os.environ.get("DEBUG_FUNIL", "0") == "1"   # export DEBUG_FUNIL=1 pra ativar
+DEBUG_SAVE_CNN = os.environ.get("DEBUG_SAVE_CNN", "0") == "1"   # export DEBUG_SAVE_CNN=1 pra salvar os crops que entram na CNN (só Stop)
 PROFILE       = os.environ.get("PROFILE", "0") == "1"          # export PROFILE=1 pra medir ms/estágio
 
 # Rastreio e votação temporal do ramo de trânsito
@@ -79,9 +81,10 @@ TRACK_IOU_HIGH = 0.30
 TRACK_IOU_LOW  = 0.15
 TRACK_MAX_AGE  = 10
 CONF_HIGH_THR  = 0.45
-VOTE_BUFFER    = 6          # era 10 — a 15km/h não dá tempo de acumular tanto
-VOTE_MIN_DETS  = 3          # era 5 — 3 votos já é maioria qualificada com VOTE_FRAC
-VOTE_FRAC      = 0.60
+VOTE_BUFFER    = 4          # janela curta: só conta observações válidas (matches),
+                             # tolera lacunas (frame perdido) sem exigir consecutivo estrito
+VOTE_MIN_DETS  = 3          # 3 de 4 é maioria qualificada
+VOTE_FRAC      = 0.75
 
 AREA_MIN_EXEC = 800                  # bbox mínima p/ um track valer decisão
 AREA_MIN_PROX = 350                  # bbox mínima p/ avisar "aproximando" (menor que EXEC — avisa antes)
@@ -89,9 +92,6 @@ AREA_PROX_NIVEIS = [350, 900, 1800]  # níveis crescentes — cada um cruzado re
 AREA_CHEGADA_SINALEIRA = 3000        # legado: chegada física do tráfego (não usada como decisão)
 
 # Confirmação rápida do PARE: a geometria forte pode parar imediatamente.
-STOP_IMEDIATO_AREA  = 900
-STOP_IMEDIATO_CIRC  = 0.82
-STOP_IMEDIATO_LADOS = (7, 8, 9)
 
 # Semáforo: retângulo estreito + lâmpadas alinhadas.
 SEM_AR_MAX       = 0.62
@@ -102,7 +102,12 @@ DIREITA_AR_MIN   = 0.88
 DIREITA_AR_MAX   = 1.14
 DIREITA_PREENCH_MIN = 0.46
 DIREITA_PREENCH_MAX = 0.58
-ROI_Y0, ROI_Y1 = 0.05, 0.92          # faixa vertical útil do frame
+ROI_Y0, ROI_Y1 = 0.0, 0.62           # faixa vertical útil — câmera na altura do
+                                      # capô: sinaleiras ficam nos 0-55% do topo
+                                      # do frame (medido em foto real), abaixo
+                                      # disso é sempre chão. 0.62 dá margem pro
+                                      # ROI dinâmico crescer quando a placa se
+                                      # aproxima (fica maior/mais baixa no frame).
 
 # ── Rede e painel — TP-Link TL-MR3020 em modo AP, sem internet ──
 PAINEL_PORTA = 8000
@@ -245,7 +250,12 @@ class ROIDinamico:
         cx, cy = (xs0+xs1)/2, (ys0+ys1)/2
         bw = max(xs1-xs0, 80)*ROI_EXPAND; bh = max(ys1-ys0, 80)*ROI_EXPAND
         x0 = int(max(0, cx-bw)); x1 = int(min(w, cx+bw))
-        y0 = int(max(h*ROI_Y0, cy-bh)); y1 = int(min(h*ROI_Y1, cy+bh))
+        # perseguindo um alvo já travado: NÃO usa o teto estático (ROI_Y1) —
+        # esse teto é só um atalho pra varredura cheia (achar candidato novo
+        # mais rápido, pulando o chão). Um alvo perto de verdade pode crescer
+        # além dele; travar aqui corta o recorte e desalinha o terço da
+        # lâmpada com a posição real. Só os limites físicos do frame valem.
+        y0 = int(max(0, cy-bh)); y1 = int(min(h, cy+bh))
         if x1-x0 < 64 or y1-y0 < 64:
             return (0, int(h*ROI_Y0), w, int(h*ROI_Y1))
         return (x0, y0, x1, y1)
@@ -253,39 +263,66 @@ class ROIDinamico:
 ROI_DIN = ROIDinamico()
 
 
-def analisar_farois(crop_gray):
-    """Semáforo = 2–3 manchas redondas empilhadas e alinhadas na vertical."""
-    if crop_gray.size == 0: return 0, False
-    g = cv2.resize(crop_gray, (36, 100))
-    circulos = []
-    for thr in (cv2.threshold(g,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)[1],
-                cv2.threshold(g,0,255,cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU)[1]):
-        cnts, _ = cv2.findContours(thr, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-        for c in cnts:
-            a = cv2.contourArea(c)
-            if not (40 < a < 1200): continue
-            x, y, w, h = cv2.boundingRect(c)
-            if not (0.6 < w/max(h,1) < 1.7): continue
-            if 4*np.pi*a/max(cv2.arcLength(c,True)**2, 1) > 0.55:
-                circulos.append((x + w/2, y + h/2))
-    if len(circulos) < 2:
-        return len(circulos), False
-    circulos.sort(key=lambda p: p[1])
-    empilhados = [circulos[0]]
-    for p in circulos[1:]:
-        if p[1] - empilhados[-1][1] > 15: empilhados.append(p)
-    alinhado = len(empilhados) >= 2 and (max(p[0] for p in empilhados) - min(p[0] for p in empilhados)) < 12
-    if len(empilhados) < 2: return len(empilhados), False
-    xs = [p[0] for p in empilhados]
-    return len(empilhados), alinhado
+def _preenchimento_mancha(bloco_u8):
+    """Taxa de preenchimento do MAIOR blob claro dentro do bloco inteiro do
+    terço (não uma janela fixa pequena — isso corta lâmpadas grandes/perto
+    e faz até uma real parecer quadrada). Círculo preenche menos a própria
+    caixa delimitadora que um retângulo/quina (medido: círculo ~0.6-0.8,
+    quina/retângulo reto ~0.9+ quando não fica colado na borda do recorte)."""
+    if bloco_u8.size == 0: return 1.0
+    _, b = cv2.threshold(bloco_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    cnts, _ = cv2.findContours(b, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts: return 1.0
+    c = max(cnts, key=cv2.contourArea)
+    a = cv2.contourArea(c)
+    x, y, bw, bh = cv2.boundingRect(c)
+    if bw*bh == 0: return 1.0
+    # blob colado nas 4 bordas do bloco = provavelmente cortado, não é uma
+    # mancha isolada de verdade — trata como suspeito (preenchimento alto)
+    return a / (bw*bh)
 
+
+def _nucleos_semaforo(crop_gray):
+    """Núcleo central de cada terço (topo/meio/base) contra o anel ao redor —
+    usado tanto pra CONFIRMAR forma quanto pra LER cor. Um semáforo real só
+    tem UMA lâmpada acesa por vez; as outras duas ficam escuras de verdade
+    (mesma tonalidade da carcaça), não "meio claras" — por isso não dá pra
+    exigir 2-3 círculos visíveis simultâneos (só funciona com maquete de
+    plástico difuso que fica clara mesmo apagada; medido com o objeto real:
+    só a lâmpada acesa aparece, as outras somem no preto da carcaça). Mas a
+    mancha vencedora precisa ter FORMA de lâmpada (circularidade), senão
+    qualquer objeto escuro com brilho pontual assimétrico passa como semáforo."""
+    if crop_gray is None or crop_gray.size == 0: return None, None, 0.0, 0, 0.0
+    if crop_gray.ndim == 3: crop_gray = cv2.cvtColor(crop_gray, cv2.COLOR_BGR2GRAY)
+    g_u8 = cv2.resize(crop_gray, (30, 90))
+    g = g_u8.astype(np.float32)
+    nucleos, areas, circs = [], [], []
+    for i in range(3):
+        bloco = g[i*30:(i+1)*30]
+        bloco_u8 = g_u8[i*30:(i+1)*30]
+        cy, cx = 15, 15
+        nucleo = bloco[max(0,cy-8):cy+8, max(0,cx-8):cx+8]
+        borda_mask = np.ones_like(bloco, dtype=bool)
+        borda_mask[max(0,cy-8):cy+8, max(0,cx-8):cx+8] = False
+        anel = bloco[borda_mask]
+        b_central = float(nucleo.mean()) if nucleo.size else 0.0
+        b_anel = float(anel.mean()) if anel.size else b_central
+        nucleos.append(b_central)
+        areas.append(float((nucleo > (b_anel + 15)).mean()) if nucleo.size else 0.0)
+        circs.append(_preenchimento_mancha(bloco_u8))
+    i_top = int(np.argmax(nucleos))
+    margem = sorted(nucleos, reverse=True)[0] - sorted(nucleos, reverse=True)[1]
+    return nucleos, areas, margem, i_top, circs[i_top]
+
+
+PREENCH_LAMPADA_MAX = 0.82   # medido no bloco inteiro: lâmpada real ~0.75, quina/retângulo ~0.90+
 
 def _tem_farois(crop_gray):
-    n, alinhado = analisar_farois(crop_gray)
-    # 2 ou 3: exigir os 3 sempre descartava o semáforo real quando uma
-    # lâmpada perdia contraste (ângulo/distância/blur) — regressão medida
-    # em teste real (log de 17/08: SEM nunca confirmado pela geometria).
-    return 2 <= n <= 3 and alinhado
+    """Confirma 'isto é um semáforo aceso': existe UMA posição nitidamente
+    mais clara que as outras duas, E a mancha clara tem forma de lâmpada."""
+    nucleos, areas, margem, i_top, circ = _nucleos_semaforo(crop_gray)
+    if nucleos is None: return False
+    return margem >= 10 and areas[i_top] >= 0.05 and circ <= PREENCH_LAMPADA_MAX
 
 
 def _tem_simbolo(crop_gray):
@@ -320,39 +357,13 @@ def peneira_roi(crop_gray, area_rel, exige_simbolo=True):
 
 
 def estado_semaforo(crop_gray):
-    """Retifica o crop em 3 posições esperadas (topo/meio/base) e decide qual
-    LÂMPADA ACESA existe comparando as posições ENTRE SI — não contra a média
-    global do crop. Isso importa fisicamente: em escala de cinza, vermelho
-    saturado converte pra luminância BAIXA (Y=0.299R+0.587G+0.114B pesa pouco
-    o vermelho), então um vermelho aceso pode ficar mais escuro que o bezel
-    plástico claro ao redor — comparar contra o fundo global sistematicamente
-    perde o vermelho. Comparar irmã-contra-irmã (a posição acesa domina as
-    outras duas, que estão apagadas/pretas) é robusto a isso.
-    Área luminosa do núcleo confirma que não é ruído pontual."""
-    if crop_gray is None or crop_gray.size == 0: return None
-    if crop_gray.ndim == 3: crop_gray = cv2.cvtColor(crop_gray, cv2.COLOR_BGR2GRAY)
-    g = cv2.resize(crop_gray, (30, 90)).astype(np.float32)
-
-    nucleos, areas = [], []
-    for i in range(3):
-        bloco = g[i*30:(i+1)*30]
-        cy, cx = 15, 15
-        nucleo = bloco[max(0,cy-8):cy+8, max(0,cx-8):cx+8]
-        borda_mask = np.ones_like(bloco, dtype=bool)
-        borda_mask[max(0,cy-8):cy+8, max(0,cx-8):cx+8] = False
-        anel = bloco[borda_mask]
-        b_central = float(nucleo.mean()) if nucleo.size else 0.0
-        b_anel = float(anel.mean()) if anel.size else b_central
-        nucleos.append(b_central)
-        areas.append(float((nucleo > (b_anel + 15)).mean()) if nucleo.size else 0.0)
-
-    i_top = int(np.argmax(nucleos))
-    ordenado = sorted(nucleos, reverse=True)
-    margem = ordenado[0] - ordenado[1]      # domina as OUTRAS 2 posições, não o fundo global
+    """Qual lâmpada está acesa — mesmo núcleo usado por _tem_farois."""
+    nucleos, areas, margem, i_top, circ = _nucleos_semaforo(crop_gray)
+    if nucleos is None: return None
     if DEBUG_FUNIL:
         print(f"[sem-cor] nucleos(V/A/Vd)={[round(n,1) for n in nucleos]} "
-              f"areas={[round(a,2) for a in areas]} margem={margem:.1f}", flush=True)
-    if margem < 10 or areas[i_top] < 0.05:  # 3 parecidas (apagado/ambíguo) ou sem área real acesa
+              f"areas={[round(a,2) for a in areas]} margem={margem:.1f} circ={circ:.2f}", flush=True)
+    if margem < 10 or areas[i_top] < 0.05 or circ > PREENCH_LAMPADA_MAX:
         return None
     return ["vermelho", "amarelo", "verde"][i_top]
 
@@ -446,6 +457,72 @@ def score_simetria(crop_gray) -> float:
     g = cv2.resize(crop_gray, (48,48)).astype(np.float32)
     diff = float(np.mean(np.abs(g - cv2.flip(g, 1))))/255.0
     return float(np.clip(1.0 - diff*2.2, 0, 1))
+
+
+# ── PARE: score geométrico ponderado, não AND rígido de limiares ───
+# circ>=0.85 sozinho descartava PARE real quando a placa estava
+# inclinada/perto da borda/com iluminação ruim/segmentação pegando
+# fundo junto — medido: octógono real (bbox estável entre frames,
+# claramente a mesma placa) preso em circ~0.15-0.3 por perímetro
+# serrilhado, mesmo com H8 e proporção plausíveis. Cada evidência
+# pesa e se compensa; nenhuma sozinha derruba o candidato.
+PARE_PESO_H8          = 0.40
+PARE_PESO_LADOS       = 0.20
+PARE_PESO_CONVEXO     = 0.15
+PARE_PESO_PERSPECTIVA = 0.15
+PARE_PESO_SIMETRIA    = 0.10
+PARE_SCORE_MIN        = 0.68   # era 0.75 — isto agora é porta de CANDIDATO, não de confirmação
+PARE_AREA_MIN         = 500    # era 700
+
+H8_PARE_ALVO    = 0.040   # H8 típico de octógono real (medido: limpo 0.027-0.033, danificado 0.033-0.060)
+H8_PARE_LARGURA = 0.035   # fora dessa faixa não é "mais octógono", é outra coisa
+
+def score_pare(c, h8, poly, area, crop_gray):
+    """-> score 0-1. >=PARE_SCORE_MIN é candidato forte a PARE."""
+    # h8 é uma FAIXA, não uma rampa aberta: h8 baixo demais não parece
+    # octógono, mas h8 ALTO DEMAIS também não é "mais octógono" — é uma
+    # forma mais irregular ainda (medido em mobília real: h8 chegou a
+    # 0.275, quase 10x o octógono real, e um piso sem teto dava nota
+    # máxima igual — abria falso-positivo em massa, veja stress test).
+    h8_score = 0.0 if h8 is None else max(0.0, 1.0 - abs(h8 - H8_PARE_ALVO)/H8_PARE_LARGURA)
+    lados = len(poly)
+    # score gradual, não precipício: 8 lados é o ideal, cada lado de
+    # distância tira 0.15 — 11 lados ainda vale 0.55, não zero. Um AND
+    # rígido aqui reproduziria o mesmo problema que tirou o circ.
+    lados_score = max(0.0, 1.0 - abs(lados - 8) * 0.15)
+    hull_a = cv2.contourArea(cv2.convexHull(c))
+    convexo = area/max(hull_a, 1)
+    convexo_score = min(1.0, max(0.0, (convexo - 0.6)/0.4))   # 0.6->0 , 1.0->1
+    persp_score = score_perspectiva_octogono(poly)
+    simet_score = score_simetria(crop_gray)
+    return (PARE_PESO_H8*h8_score + PARE_PESO_LADOS*lados_score +
+            PARE_PESO_CONVEXO*convexo_score + PARE_PESO_PERSPECTIVA*persp_score +
+            PARE_PESO_SIMETRIA*simet_score)
+
+
+PARE_AR_MIN, PARE_AR_MAX = 0.55, 1.45     # solto — a confirmação de verdade é CNN+OOD+3 frames
+PARE_LADOS_MIN, PARE_LADOS_MAX = 6, 11
+PARE_H8_MAX = 0.075
+
+def pare_candidato(ar, lados, h8, area, score):
+    """Porta de CANDIDATO, não de confirmação — decide só 'vale a pena gastar
+    uma inferência de CNN nisso?'. A confirmação de verdade é CNN Stop +
+    OOD + 3 frames consecutivos, rio abaixo. Um portão apertado aqui matava
+    candidato real antes mesmo de a CNN opinar: no log real, um objeto do
+    mesmo tamanho (~44-47 x 64-69, ar~0.66-0.73) apareceu dezenas de vezes
+    com score geométrico de até 0.82, sempre reprovado só pelo AR — a
+    segmentação claramente não está pegando o octógono inteiro (ar esperado
+    ~1.0), mas isso é problema de contorno, não motivo pra nunca deixar a
+    CNN examinar a imagem real."""
+    if area < PARE_AREA_MIN:
+        return False
+    # evidência geométrica forte: aceita mesmo com aspecto atípico
+    if score >= 0.78 and PARE_LADOS_MIN <= lados <= PARE_LADOS_MAX and (h8 is not None and h8 <= PARE_H8_MAX):
+        return True
+    # evidência normal: exige aspecto pelo menos plausível
+    if score >= PARE_SCORE_MIN and PARE_AR_MIN <= ar <= PARE_AR_MAX:
+        return True
+    return False
 
 
 # ================================================================
@@ -716,25 +793,47 @@ def detectar_geometrico(gray):
             approx = cv2.approxPolyDP(c, 0.02*peri, True)
             poly = approx.reshape(-1,2).tolist()
 
+            h8 = harmonico_8(c)
+            pare_score = score_pare(c, h8, poly, a, crop)
+
             if eh_losango(c, poly, bw, bh):
                 # checado ANTES de tudo: é barato e o losango não deve cair
                 # no harmônico octógono/círculo, que não foi feito pra ele.
                 hint, forma, ponto, score = "Direita", "losango", None, 0.0
+
+            elif pare_candidato(ar, len(poly), h8, a, pare_score):
+                # PARE tem prioridade sobre o portão de Semáforo. Isto é
+                # porta de CANDIDATO (vale gastar CNN?), não de confirmação
+                # — a confirmação real é CNN Stop + OOD + 3 frames
+                # consecutivos, rio abaixo no Track.
+                hint, forma, ponto, score = "Stop", "octogono", None, pare_score
 
             elif 0.20 < ar < SEM_AR_MAX and bh >= SEM_BH_MIN and _tem_farois(crop):
                 hint, forma, ponto, score = "Semaforo", "?", None, 0.0
 
             else:
                 if DEBUG_FUNIL and 0.20 < ar < SEM_AR_MAX and bh >= SEM_BH_MIN:
-                    # quase passou no portão mas os "faróis" não bateram
-                    _n, _al = analisar_farois(crop)
-                    print(f"[sem?] bbox={bw}x{bh} ar={ar:.2f} faróis={_n} "
-                          f"alinhado={_al} -> rejeitado (precisa 2-3 alinhados)", flush=True)
-                forma = classificar_forma(c, bw, bh, peri, a, circ)
-                if forma == "octogono":
-                    hint, ponto, score = "Stop", None, 0.0
-
-                elif forma in ("circulo", "?") and a >= AREA_MIN_LEITURA:
+                    # quase passou no portão mas nenhuma posição acendeu com forma de lâmpada
+                    _nuc, _ar_, _mg, _it, _circ = _nucleos_semaforo(crop)
+                    print(f"[sem?] bbox={bw}x{bh} ar={ar:.2f} "
+                          f"nucleos={[round(x,1) for x in _nuc]} margem={_mg:.1f} circ={_circ:.2f} "
+                          f"-> rejeitado (precisa margem>=10, area>=0.05, preench<={PREENCH_LAMPADA_MAX})", flush=True)
+                if DEBUG_FUNIL and 0.55 <= ar <= 1.6 and a >= GEO_AREA_MIN*2:
+                    # candidato razoavelmente quadrado/redondo que NÃO virou
+                    # PARE — mostra o score e os dois caminhos possíveis de aceite.
+                    lados_n = len(poly)
+                    forte = pare_score >= 0.78 and PARE_LADOS_MIN <= lados_n <= PARE_LADOS_MAX and (h8 is not None and h8 <= PARE_H8_MAX)
+                    normal = pare_score >= PARE_SCORE_MIN and PARE_AR_MIN <= ar <= PARE_AR_MAX
+                    motivos = []
+                    if a < PARE_AREA_MIN: motivos.append(f"area<{PARE_AREA_MIN}")
+                    if not forte and not normal:
+                        motivos.append(f"nem forte (score>=0.78+lados+h8) nem normal (score>={PARE_SCORE_MIN}+ar)")
+                    print(f"[pare?] bbox={bw}x{bh} ar={ar:.2f} circ={circ:.2f} h8={h8} "
+                          f"lados={lados_n} score={pare_score:.2f} "
+                          f"-> reprovado: {', '.join(motivos) or 'sem motivo? (checar)'}", flush=True)
+                forma_geral = classificar_forma(c, bw, bh, peri, a, circ)
+                forma = forma_geral
+                if forma in ("circulo", "?") and a >= AREA_MIN_LEITURA:
                     # orçamento separado: o "?" é abundante em frame sujo e,
                     # com teto único, consumia as vagas antes do círculo real
                     i = 0 if forma == "circulo" else 1
@@ -752,12 +851,21 @@ def detectar_geometrico(gray):
             persp = score_perspectiva_octogono(poly) if hint == "Stop" else 1.0
             simet = score_simetria(crop)             if hint == "Stop" else 1.0
             d = {"bbox": (x+x0, y+y0, x+x0+bw, y+y0+bh), "class_name": hint, "class_id": -1,
-                 "conf": float(solid), "geo": True, "lados": len(approx), "circ": float(circ),
+                 "conf": float(solid), "geo": (hint != "Stop"), "lados": len(approx), "circ": float(circ),
                  "ar": float(ar), "area": float(a), "simbolo": True, "poly": poly, "forma": forma,
                  "convex": float(a/max(cv2.contourArea(cv2.convexHull(c)),1)),
                  "persp": float(persp), "simet": float(simet)}
+            # PARE pula o PGOM (geo=False -> vira "outros", passa direto,
+            # igual Delivery já fazia). PARE agora tem porta rígida própria
+            # (pare_geometricamente_valido) antes mesmo de chegar aqui —
+            # o filtro de fingerprint/persistência do PGOM virou redundante
+            # pra essa classe e só atrasava a confirmação. Semáforo e
+            # Direita continuam passando pelo PGOM normalmente — nenhuma
+            # mudança pros dois, que já estão calibrados.
             if hint == "Delivery":
                 d["ponto"] = ponto; d["score"] = float(score)
+            if hint == "Stop":
+                d["score_pare"] = float(pare_score)
             cands.append(d)
 
     # dedup por IoU sobre a UNIÃO — por contenção a folha branca engoliria o disco
@@ -1018,6 +1126,28 @@ def prep_mono(crop):
     return np.stack([g,g,g], axis=-1).astype(np.float32)/255.0
 
 
+_debug_cnn_dir = "./debug_cnn"
+_debug_cnn_n = [0]
+
+def _salvar_crop_cnn(crop, classe_geo, classe_cnn, scores):
+    """Salva o recorte EXATO que entrou na CNN (mesmo pipeline: cinza+CLAHE
+    redimensionado) — pra auditar visualmente por que a CNN disse Fundo em
+    algo que a geometria achou plausível. Nome do arquivo carrega o
+    resultado, igual à convenção já usada em debug_sem/."""
+    try:
+        if not os.path.isdir(_debug_cnn_dir): os.makedirs(_debug_cnn_dir, exist_ok=True)
+        _debug_cnn_n[0] += 1
+        g = _CLAHE.apply(cv2.resize(crop if crop.ndim==2 else cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY),
+                                     (CNN_SIZE, CNN_SIZE)))
+        conf_fundo = float(scores[CNN_CLASSES.index("Fundo")]) if "Fundo" in CNN_CLASSES else 0.0
+        nome = (f"{_debug_cnn_dir}/cnn_{_debug_cnn_n[0]:04d}_{classe_geo}_"
+                f"{classe_cnn or 'Fundo'}_{conf_fundo:.2f}.png")
+        cv2.imwrite(nome, g)
+    except Exception as e:
+        if DEBUG_FUNIL: print(f"[cnn] falha ao salvar crop: {e}", flush=True)
+
+
+
 def carregar_classes():
     """Lê o classes.txt AO LADO do modelo YOLO (models/classes.txt) — nunca
     o da CNN. Plug-and-play: qualquer novo treino de YOLO só precisa trocar
@@ -1190,11 +1320,44 @@ class ByteTrackLite:
         return inter/(aA+aB-inter+1e-9)
 
     def _match(self, tracks_idx, det_idx, dets, iou_min):
+        # mesma classe é obrigatória — sem isso, um track de Semáforo podia
+        # "virar" Stop (ou vice-versa) só por sobreposição de caixa, sem
+        # nunca ter sido reclassificado de verdade. class_hint tem que
+        # significar algo estável, não o que colidiu por acaso este frame.
         pares = sorted(((self._iou(self.tracks[ti].bbox, dets[di]["bbox"]), ti, di)
-                        for ti in tracks_idx for di in det_idx), reverse=True)
+                        for ti in tracks_idx for di in det_idx
+                        if self.tracks[ti].class_hint == dets[di]["class_name"]), reverse=True)
         mt, md, casados = set(), set(), []
         for iou, ti, di in pares:
             if iou < iou_min or ti in mt or di in md: continue
+            mt.add(ti); md.add(di); casados.append((ti, di))
+        return casados, [i for i in tracks_idx if i not in mt], [i for i in det_idx if i not in md]
+
+    def _match_distancia(self, tracks_idx, det_idx, dets, frac_max=0.6):
+        """Recupera a MESMA identidade quando o IoU falha por mudança de
+        tamanho — objeto se aproximando: o centro fica quase parado, mas a
+        área cresce muito, e o IoU despenca a zero mesmo sendo o mesmo
+        objeto. Só casa DENTRO da mesma classe, por distância entre centros
+        normalizada pelo maior dos dois tamanhos (não um pixel fixo, que
+        não escala com o quão perto o objeto já está)."""
+        def centro(bb): return ((bb[0]+bb[2])/2.0, (bb[1]+bb[3])/2.0)
+        def diagonal(bb): return ((bb[2]-bb[0])**2 + (bb[3]-bb[1])**2) ** 0.5
+        pares = []
+        for ti in tracks_idx:
+            trk = self.tracks[ti]
+            ct = centro(trk.bbox); dt = diagonal(trk.bbox)
+            for di in det_idx:
+                d = dets[di]
+                if d["class_name"] != trk.class_hint: continue
+                cd = centro(d["bbox"]); dd = diagonal(d["bbox"])
+                dist = ((ct[0]-cd[0])**2 + (ct[1]-cd[1])**2) ** 0.5
+                limite = frac_max * max(dt, dd, 40.0)
+                if dist <= limite:
+                    pares.append((dist, ti, di))
+        pares.sort()
+        mt, md, casados = set(), set(), []
+        for dist, ti, di in pares:
+            if ti in mt or di in md: continue
             mt.add(ti); md.add(di); casados.append((ti, di))
         return casados, [i for i in tracks_idx if i not in mt], [i for i in det_idx if i not in md]
 
@@ -1222,18 +1385,25 @@ class ByteTrackLite:
         lo = [i for i,d in enumerate(dets) if d["conf"] <  CONF_HIGH_THR]
         c1, resta_t, novos = self._match(list(range(len(self.tracks))), hi, dets, TRACK_IOU_HIGH)
         c2, resta_t2, _    = self._match(resta_t, lo, dets, TRACK_IOU_LOW)
-        for ti, di in c1 + c2:
+        # Terceira passada: IoU falhou pros dois lados, tenta recuperar a
+        # MESMA identidade por distância de centro (só entre tracks que
+        # sobraram e candidatos de alta confiança que também sobraram) —
+        # sem isto, um objeto se aproximando rápido vira track novo a cada
+        # poucos frames só porque a caixa cresceu, e o buffer de votação
+        # nunca acumula evidência de verdade.
+        c3, resta_t3, novos3 = self._match_distancia(resta_t2, novos, dets)
+        for ti, di in c1 + c2 + c3:
             lbl, conf = self._classificar(dets[di], frame, cnn, ood, verif)
             self.tracks[ti].atualizar(dets[di]["bbox"], dets[di]["class_name"],
                                       dets[di]["conf"], lbl, conf)
             if PROFILE and fn is not None:
                 self._rastrear_encontro(fn, self.tracks[ti].class_hint)
-        for ti in resta_t2:
+        for ti in resta_t3:
             self.tracks[ti].missed += 1
             if PROFILE and fn is not None and self.tracks[ti].missed == 1:
                 # só no instante em que passa a estar perdido — não repete a cada frame vazio
                 self._rastrear_perda(fn, self.tracks[ti].class_hint)
-        for di in novos:
+        for di in novos3:
             d = dets[di]
             lbl, conf = self._classificar(d, frame, cnn, ood, verif)
             t = Track(d["bbox"], d["class_name"], d["conf"])
@@ -1263,20 +1433,31 @@ class ByteTrackLite:
         scores = cnn.predict(prep_mono(crop))
         i = int(scores.argmax())
         nome = CNN_CLASSES[i] if i < len(CNN_CLASSES) else None
+        if DEBUG_FUNIL:
+            sc = {c: round(float(s),2) for c, s in zip(CNN_CLASSES, scores)}
+            print(f"[cnn] {cn} bbox={x1},{y1},{x2},{y2}\n"
+                  f"      area={det.get('area',0):.0f} ar={det.get('ar',0):.2f} lados={det.get('lados','?')}\n"
+                  f"      geo={det.get('score_pare', det.get('conf',0)):.2f}\n"
+                  f"      CNN={sc} -> {nome or '(inválido)'}", flush=True)
+        if DEBUG_SAVE_CNN and cn == "Stop":
+            _salvar_crop_cnn(crop, cn, nome, scores)
         if nome in (None, "Fundo"):
-            if DEBUG_FUNIL:
-                print(f"[cnn] {cn}: CNN disse Fundo (scores={np.round(scores,2)}), descartado", flush=True)
             return None, 0.0
         if verif is not None:
             ok, motivo, margem = verif.e_placa(scores, nome, det)
             if not ok:
                 if DEBUG_FUNIL: print(f"[pgom] {nome}: verificador rejeitou ({motivo}, margem={margem:.2f})", flush=True)
                 return None, 0.0
-        if ood and not ood.aceitar(nome, float(scores.max())):
-            if DEBUG_FUNIL:
-                thr = ood._t.get(nome, OOD_DEFAULT)
-                print(f"[ood] {nome}: score={scores.max():.2f} < thr={thr:.2f}, descartado", flush=True)
-            return None, 0.0
+        if ood:
+            # Stop tem limiar próprio, mais baixo que o do arquivo (0.90 no
+            # log real — matava candidato razoável, ex: score=0.67). Não
+            # mexe no arquivo (afetaria Semáforo também); sobrepõe só aqui,
+            # só pra essa classe.
+            thr = OOD_STOP_MIN if nome == "Stop" else ood._t.get(nome, OOD_DEFAULT)
+            if float(scores.max()) < thr:
+                if DEBUG_FUNIL:
+                    print(f"[ood] {nome}: score={scores.max():.2f} < thr={thr:.2f}, descartado", flush=True)
+                return None, 0.0
         return nome, score_final(det, float(scores.max()))
 
 
@@ -1436,8 +1617,8 @@ CMD  = dict(mot=0, srv=127, buz=0, led=0, brk=0, dir=0, spd=0)
 _seq = dict(n=0, pendente=None, t_envio=0.0)
 _buz = dict(ate=0.0)
 _hb  = dict(ultimo=0.0)
-_ultimo = dict(acao=None, ponto=None, stop_raw_latched=False)
-_stop_janela = deque(maxlen=3)   # últimos 3 checks: 1=octógono forte, 0=não
+_ultimo = dict(acao=None, ponto=None)
+_trava = {"Semaforo": None, "Stop": None}   # só 1 candidato de cada classe seguido por vez
 
 
 def conectar_serial():
@@ -1753,7 +1934,14 @@ def desenhar(frame_e, tracks, fps, modo):
     for trk in tracks[:5]:
         lbl, cm = trk.votar()
         if lbl:
-            t(f"#{trk.id} {lbl} {cm*100:.0f}%", ln, COR_CLASSE.get(lbl,(180,180,180))); ln += 1
+            # * marca o travado (o único cuja confirmação realmente vira
+            # serial pro Portenta) — os outros têm evidência própria mas
+            # não são processados enquanto a trava não soltar. Sem essa
+            # marca, a tela mostra vários "confirmados" e não dá pra saber
+            # qual deles é o que está de fato mandando comando.
+            travado = _trava.get(trk.class_hint) == trk.id
+            marca = "*" if travado else " "
+            t(f"{marca}#{trk.id} {lbl} {cm*100:.0f}%", ln, COR_CLASSE.get(lbl,(180,180,180))); ln += 1
     t("── ÚLTIMO ──", 18, (60,60,60))
     t(f" {_ultimo['acao'] or '-'}", 19, COR_ACAO.get(_ultimo["acao"], (160,160,160)))
 
@@ -1903,34 +2091,68 @@ def main(debug_abc=False, fast=False, usar_yolo=False, cam_idx=None):
             dets = [d for d in dets
                     if (d["bbox"][2]-d["bbox"][0])*(d["bbox"][3]-d["bbox"][1]) >= AREA_MIN_EXEC]
             tracks = tracker.update(PGOM_M.update(dets), frame_e, cnn, ood, verif, fn)
-            # A ROI dinâmica NÃO pode ser sequestrada por um retângulo falso de semáforo.
-            # Só acompanha PARE/SEM/DIREITA quando a evidência é alta e o candidato
-            # tem tamanho útil; Delivery continua sempre procurando na varredura atual.
+
+            # TRAVA: só UM candidato de cada classe (Semáforo, Stop) é seguido/
+            # lido por vez — nunca soma vários no ROI dinâmico nem processa
+            # vários ao mesmo tempo. Sem isso, vários retângulos "confirmados"
+            # simultâneos faziam a janela de ROI virar união de todos (voltando
+            # a cobrir a sala inteira) e cada um gritava leitura/evento a cada
+            # frame — o oposto de focar. Trava no maior candidato de cada
+            # classe; solta só quando ele some dos tracks atuais (não troca de
+            # alvo a cada frame). Mesma regra pras duas classes — o problema de
+            # múltiplos candidatos simultâneos não é exclusivo do semáforo.
+            ids_atuais = {t.id for t in tracks}
+            for classe in ("Semaforo", "Stop"):
+                if _trava[classe] not in ids_atuais:
+                    _trava[classe] = None
+                if _trava[classe] is None:
+                    candidatos = [t for t in tracks if t.class_hint == classe
+                                  and t.state == "confirmed" and t.area >= AREA_MIN_EXEC]
+                    if candidatos:
+                        escolhido = max(candidatos, key=lambda t: t.area)
+                        _trava[classe] = escolhido.id
+                        if DEBUG_FUNIL:
+                            print(f"[trava] {classe} travou no track#{escolhido.id} "
+                                  f"(area={escolhido.area:.0f}, entre {len(candidatos)} candidatos)", flush=True)
+
+            def _e_o_travado(trk):
+                if trk.class_hint not in _trava: return True   # Direita etc. não trava
+                return trk.id == _trava[trk.class_hint]
+
+            # A ROI dinâmica NÃO pode ser sequestrada por um retângulo falso.
+            # Foca assim que o candidato entra em VERIFICAÇÃO (state=="confirmed",
+            # já ganhou a votação de forma) — não espera a cor já ter sido
+            # confirmada e mandada pro serial.
             for trk in tracks:
-                acompanha = (trk.class_hint in ("Stop", "Direita") or
-                             (trk.class_hint == "Semaforo" and trk.evt_conf_enviado is not None))
+                if not _e_o_travado(trk):
+                    continue   # não é o travado da classe — ignora pro ROI, mesmo "confirmed"
+                acompanha = trk.class_hint in ("Stop", "Direita", "Semaforo")
                 if acompanha and trk.state == "confirmed" and trk.area >= 1400:
                     ROI_DIN.registrar(trk.bbox)
 
             # ── VISÃO: constatação de fatos, nenhuma decisão ──
             percep = dict(pare=False, semaforo=None, obstaculo=False, ponto=None)
-            # PARE forte não espera PGOM/CNN: janela de 2 acertos em 3 checks
-            # (não exige consecutivo estrito, tolera 1 frame ruim perto da placa)
-            stops_fortes = [d for d in dets
-                            if d.get("class_name") == "Stop"
-                            and d.get("forma") == "octogono"
-                            and d.get("lados",0) in STOP_IMEDIATO_LADOS
-                            and d.get("circ",0.0) >= STOP_IMEDIATO_CIRC
-                            and d.get("area",0.0) >= STOP_IMEDIATO_AREA]
-            _stop_janela.append(1 if stops_fortes else 0)
-            if sum(_stop_janela) >= 2:
-                percep["pare"] = True
-                if not _ultimo.get("stop_raw_latched"):
-                    sinalizar_confirmacao("PARE", "ok", _ser)
-                    _ultimo["stop_raw_latched"] = True
-            else:
-                _ultimo["stop_raw_latched"] = False
+            # PARE tem UMA porta de entrada: geometria -> score_pare -> CNN
+            # -> Track -> 3 confirmações. Existia um segundo caminho aqui
+            # (stops_fortes/_stop_janela) que confirmava PARE:ok direto pro
+            # serial com só 2 de 3 checks de geometria crua — sem passar
+            # pela CNN, sem PGOM, sem votação. Removido: no log real, os
+            # falsos positivos eram objetos PERSISTENTES em quadro (mesmo
+            # bbox ~39x40 repetindo dezenas de frames, não um flash único),
+            # e a CNN rejeitava candidatos parecidos como "Fundo" bem ao
+            # lado — o bypass nunca via essa rejeição. "2 de 3" não filtra
+            # ruído persistente, só ruído de flash único.
+            if DEBUG_FUNIL:
+                fortes = [d for d in dets
+                          if d.get("class_name") == "Stop" and d.get("forma") == "octogono"
+                          and d.get("score_pare", 0.0) >= 0.85 and d.get("area",0.0) >= 900]
+                for d in fortes:
+                    x1,y1,x2,y2 = d["bbox"]
+                    print(f"[pare-forte] bbox={x2-x1}x{y2-y1} score={d.get('score_pare'):.2f} "
+                          f"-> só alimenta o Track, não confirma sozinho", flush=True)
             for trk in tracks:
+                if not _e_o_travado(trk):
+                    continue   # não é o travado da classe — não avisa proximidade dele
                 # LOG 1 (proximidade): repete a cada nível de área cruzado —
                 # é o proxy de "cada N cm de aproximação" sem sensor de distância.
                 if trk.class_hint in ("Stop", "Semaforo", "Direita"):
@@ -1954,8 +2176,9 @@ def main(debug_abc=False, fast=False, usar_yolo=False, cam_idx=None):
                             sinalizar_confirmacao("SEM", cor_conf, _ser)
                             trk.evt_conf_enviado = cor_conf
                 elif lbl == "Stop":
-                    # 3 consecutivos + só 1x por track (stop_consumido)
-                    if trk.consecutivo() == "Stop" and not trk.stop_consumido and not _ultimo.get("stop_raw_latched"):
+                    # ÚNICA porta de confirmação de PARE agora: 3 consecutivos
+                    # via CNN+Track, só 1x por track (stop_consumido).
+                    if trk.consecutivo() == "Stop" and not trk.stop_consumido:
                         percep["pare"] = True
                         percep["pare_trk"] = trk    # marca consumido só quando a missão executar
                         # sempre para no PARE — só o valor informado muda (confiança)
