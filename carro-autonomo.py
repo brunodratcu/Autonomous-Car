@@ -2155,7 +2155,14 @@ def main(debug_abc=False, fast=False, usar_yolo=False, cam_idx=None):
                     continue   # não é o travado da classe — não avisa proximidade dele
                 # LOG 1 (proximidade): repete a cada nível de área cruzado —
                 # é o proxy de "cada N cm de aproximação" sem sensor de distância.
-                if trk.class_hint in ("Stop", "Semaforo", "Direita"):
+                # Exige state=="confirmed" (track sobreviveu >=2 frames) — sem
+                # isso, um candidato geométrico de UM frame só (nunca visto de
+                # novo, nunca chegou a passar pela CNN) já disparava PROX pro
+                # Portenta. Retreinar a CNN não filtra isso: PROX acontece
+                # ANTES da CNN entrar em cena, então é ruído puramente
+                # geométrico vazando — precisa de continuidade mínima, não
+                # threshold de rede neural.
+                if trk.class_hint in ("Stop", "Semaforo", "Direita") and trk.state == "confirmed":
                     tipo_evt = {"Stop": "PARE", "Semaforo": "SEM", "Direita": "DIR"}[trk.class_hint]
                     # Um único PROX por track. Os três níveis antigos geravam
                     # três mensagens idênticas no Portenta e confundiam o log.
